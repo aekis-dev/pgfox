@@ -355,6 +355,9 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 		return
 	}
 
+	logger := p.logger.WithField("backend", conn.RemoteAddr())
+	logger.Debug("Attempting to release backend connection")
+
 	// Find the appropriate database manager
 	var dbManager *DatabaseManager
 
@@ -372,7 +375,7 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	p.databasesMu.RUnlock()
 
 	if dbManager == nil {
-		p.logger.Warn("No database manager found for connection, closing",
+		logger.Warn("No database manager found for connection, closing",
 			"db", conn.dbName, "target", conn.targetName)
 		conn.Close()
 		return
@@ -386,10 +389,11 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	conn.mu.Unlock()
 
 	if isListening {
-		p.logger.Debug("Not returning listening connection to pool, closing",
+		logger.Debug("Not returning listening connection to pool, closing",
 			"db", conn.dbName)
 		conn.Close()
 		atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
+		atomic.AddInt64(&dbManager.stats.ActiveConnections, -1)
 		return
 	}
 
@@ -398,12 +402,21 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	case dbManager.backendPool <- conn:
 		atomic.AddInt64(&dbManager.stats.ActiveConnections, -1)
 		atomic.AddInt64(&dbManager.stats.IdleConnections, 1)
-		p.logger.Debug("Returned connection to pool", "db", conn.dbName)
+		logger.Debug("Successfully returned connection to pool",
+			"db", conn.dbName,
+			"pool_size", len(dbManager.backendPool),
+			"total_connections", atomic.LoadInt64(&dbManager.stats.TotalConnections),
+			"active_connections", atomic.LoadInt64(&dbManager.stats.ActiveConnections),
+			"idle_connections", atomic.LoadInt64(&dbManager.stats.IdleConnections))
 	default:
 		// Pool is full, close the connection
-		p.logger.Debug("Pool full, closing connection", "db", conn.dbName)
+		logger.Debug("Pool full, closing connection",
+			"db", conn.dbName,
+			"pool_capacity", cap(dbManager.backendPool),
+			"pool_size", len(dbManager.backendPool))
 		conn.Close()
 		atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
+		atomic.AddInt64(&dbManager.stats.ActiveConnections, -1)
 	}
 }
 

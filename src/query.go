@@ -61,16 +61,15 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 		return p.handleNotify(client, query)
 	}
 
-	// Log queries that might contain notifications but weren't detected
-	if strings.Contains(queryUpper, "NOTIFY") {
-		logger.Debug("Query contains NOTIFY but not detected as notification", "query_upper", queryUpper)
-	}
+	// Determine transaction state changes BEFORE getting backend
+	isTransactionStart := strings.HasPrefix(queryUpper, "BEGIN") || strings.HasPrefix(queryUpper, "START TRANSACTION")
+	isTransactionEnd := strings.HasPrefix(queryUpper, "COMMIT") || strings.HasPrefix(queryUpper, "ROLLBACK")
 
-	// Get backend connection
-	backend := client.GetBackendConnection()
-	if backend == nil {
-		logger.Error("No backend connection available for client")
-		return sendErrorResponse(client, "FATAL", "08003", "connection does not exist")
+	// Get or create backend connection based on pool mode
+	backend, shouldRelease, err := p.getBackendForClient(client)
+	if err != nil {
+		logger.WithError(err).Error("Failed to get backend connection")
+		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
 	}
 
 	// Set read timeout for this query operation
@@ -84,6 +83,9 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	// Forward query to backend
 	if err := p.forwardQueryToBackend(backend, query); err != nil {
 		logger.WithError(err).Error("Failed to forward query to backend")
+		if shouldRelease {
+			p.releaseBackendConnection(backend)
+		}
 		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
@@ -92,12 +94,18 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 		logger.WithError(err).Error("Failed to forward backend response")
 		// Check if this is a timeout error and provide better error message
 		if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
+			if shouldRelease {
+				p.releaseBackendConnection(backend)
+			}
 			return sendErrorResponse(client, "ERROR", "57014", "query timeout")
+		}
+		if shouldRelease {
+			p.releaseBackendConnection(backend)
 		}
 		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
-	// Update transaction state based on query
+	// Update transaction state based on query AFTER successful execution
 	p.updateTransactionState(client, query)
 
 	// Update statistics
@@ -106,7 +114,135 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	}
 	atomic.AddInt64(&p.stats.TotalQueries, 1)
 
+	// FIXED: Improved release logic
+	logger.Debug("Determining connection release strategy",
+		"should_release", shouldRelease,
+		"is_transaction_start", isTransactionStart,
+		"is_transaction_end", isTransactionEnd,
+		"client_in_transaction", client.IsInTransaction(),
+		"client_is_listening", client.IsListening())
+
+	if shouldRelease {
+		// This is a pooled connection, handle release logic
+		if isTransactionStart {
+			// For BEGIN commands, convert pooled connection to dedicated
+			logger.Debug("Transaction started - converting pooled connection to dedicated")
+			client.SetBackendConnection(backend)
+			backend.SetClientRef(client)
+			// Don't release - connection is now dedicated to client
+		} else {
+			// For non-transaction commands, release back to pool
+			logger.Debug("Releasing pooled backend connection after query")
+			p.releaseBackendConnection(backend)
+		}
+	} else {
+		// This is a dedicated connection
+		if isTransactionEnd {
+			// For COMMIT/ROLLBACK on dedicated connections, return to pool if not listening
+			if !client.IsListening() {
+				logger.Debug("Transaction ended - releasing dedicated connection to pool")
+				client.SetBackendConnection(nil)
+				backend.SetClientRef(nil)
+				p.releaseBackendConnection(backend)
+			} else {
+				logger.Debug("Transaction ended but client is listening - keeping dedicated connection")
+			}
+		} else {
+			logger.Debug("Keeping dedicated backend connection")
+		}
+	}
+
 	return nil
+}
+
+// getBackendForClient gets the appropriate backend connection for a client
+func (p *WildcardPooler) getBackendForClient(client *ClientConnection) (*BackendConnection, bool, error) {
+	logger := client.Logger()
+
+	// Check what pool mode we're using for this database
+	dbManager, err := p.getDatabaseManager(client.GetDatabase(), client.GetUser())
+	if err != nil {
+		return nil, false, err
+	}
+
+	poolMode := dbManager.config.PoolMode
+	if poolMode == "" {
+		poolMode = p.config.Server.DefaultPoolMode
+	}
+
+	logger.Debug("Determining backend connection strategy",
+		"pool_mode", poolMode,
+		"in_transaction", client.IsInTransaction(),
+		"is_listening", client.IsListening(),
+		"has_existing_backend", client.GetBackendConnection() != nil)
+
+	// For session mode, always use dedicated connection
+	if poolMode == "session" {
+		backend := client.GetBackendConnection()
+		if backend == nil {
+			// Create new dedicated connection
+			logger.Debug("Creating dedicated backend connection for session mode")
+			backend, err = p.acquireBackendConnection(client.GetDatabase())
+			if err != nil {
+				return nil, false, err
+			}
+			client.SetBackendConnection(backend)
+			backend.SetClientRef(client)
+		}
+		logger.Debug("Using dedicated backend connection", "backend_addr", backend.RemoteAddr())
+		return backend, false, nil // Never release session mode connections
+	}
+
+	// For listening clients, always use dedicated connection regardless of pool mode
+	if client.IsListening() {
+		backend := client.GetBackendConnection()
+		if backend == nil {
+			logger.Debug("Creating dedicated backend connection for listening client")
+			backend, err = p.acquireBackendConnection(client.GetDatabase())
+			if err != nil {
+				return nil, false, err
+			}
+			client.SetBackendConnection(backend)
+			backend.SetClientRef(client)
+		}
+		logger.Debug("Using dedicated backend connection for listener")
+		return backend, false, nil // Never release listener connections
+	}
+
+	// For transaction mode
+	if poolMode == "transaction" {
+		// If client is in a transaction, use dedicated connection
+		if client.IsInTransaction() {
+			backend := client.GetBackendConnection()
+			if backend == nil {
+				logger.Debug("Creating dedicated backend connection for active transaction")
+				backend, err = p.acquireBackendConnection(client.GetDatabase())
+				if err != nil {
+					return nil, false, err
+				}
+				client.SetBackendConnection(backend)
+				backend.SetClientRef(client)
+			}
+			logger.Debug("Using dedicated backend connection for transaction")
+			return backend, false, nil // Don't release during transaction
+		}
+
+		// Outside of transactions, use pooled connections
+		logger.Debug("Acquiring pooled backend connection for transaction mode (not in transaction)")
+		backend, err := p.acquireBackendConnection(client.GetDatabase())
+		if err != nil {
+			return nil, false, err
+		}
+		return backend, true, nil // Release after use when not in transaction
+	}
+
+	// For statement mode, always use pooled connections
+	logger.Debug("Acquiring pooled backend connection for statement mode")
+	backend, err := p.acquireBackendConnection(client.GetDatabase())
+	if err != nil {
+		return nil, false, err
+	}
+	return backend, true, nil // Release after use
 }
 
 // handleExtendedQuery handles extended query protocol (Parse/Bind/Execute/Sync)
@@ -136,21 +272,13 @@ func (p *WildcardPooler) handleExtendedQuery(client *ClientConnection, msgType b
 	// Handle responses based on message type
 	switch msgType {
 	case Parse:
-		// Parse expects ParseComplete (1) or ErrorResponse (E)
 		return p.forwardSingleResponse(client, backend, "ParseComplete")
-
 	case Bind:
-		// Bind expects BindComplete (2) or ErrorResponse (E)
 		return p.forwardSingleResponse(client, backend, "BindComplete")
-
 	case Execute:
-		// Execute can return multiple messages until CommandComplete or ErrorResponse
 		return p.forwardExecuteResponse(client, backend)
-
 	case Sync:
-		// Sync expects ReadyForQuery (Z)
 		return p.forwardUntilReady(client, backend)
-
 	default:
 		logger.Warn("Unknown extended query message type", "type", string(msgType))
 		return p.forwardSingleResponse(client, backend, "Unknown")
@@ -335,15 +463,22 @@ func (p *WildcardPooler) containsPgNotify(queryUpper string) bool {
 // updateTransactionState updates the client's transaction state based on the query
 func (p *WildcardPooler) updateTransactionState(client *ClientConnection, query string) {
 	queryUpper := strings.ToUpper(strings.TrimSpace(query))
+	logger := client.Logger()
 
 	// Check for transaction commands
 	if strings.HasPrefix(queryUpper, "BEGIN") ||
 		strings.HasPrefix(queryUpper, "START TRANSACTION") {
+
 		client.SetInTransaction(true)
+		logger.Debug("Transaction started")
+
 	} else if strings.HasPrefix(queryUpper, "COMMIT") ||
 		strings.HasPrefix(queryUpper, "ROLLBACK") {
+
 		client.SetInTransaction(false)
+		logger.Debug("Transaction ended")
 	}
+	// Note: We removed the automatic connection clearing here since it's now handled in handleQuery
 }
 
 // forwardQueryToBackend sends a query to the backend
@@ -403,84 +538,157 @@ func (p *WildcardPooler) acquireBackendConnection(dbName string) (*BackendConnec
 		return nil, err
 	}
 
+	logger := p.logger.WithDatabase(dbName)
+
+	// Log pool status before attempting acquisition
+	totalConns := atomic.LoadInt64(&dbManager.stats.TotalConnections)
+	activeConns := atomic.LoadInt64(&dbManager.stats.ActiveConnections)
+	idleConns := atomic.LoadInt64(&dbManager.stats.IdleConnections)
+
+	logger.Debug("Attempting to acquire backend connection",
+		"total_connections", totalConns,
+		"active_connections", activeConns,
+		"idle_connections", idleConns,
+		"max_connections", dbManager.config.MaxConnections,
+		"pool_capacity", cap(dbManager.backendPool),
+		"pool_size", len(dbManager.backendPool))
+
 	select {
 	case conn := <-dbManager.backendPool:
 		conn.SetInUse(true)
 		atomic.AddInt64(&dbManager.stats.ActiveConnections, 1)
 		atomic.AddInt64(&dbManager.stats.IdleConnections, -1)
+		logger.Debug("Successfully acquired pooled connection",
+			"active_connections", atomic.LoadInt64(&dbManager.stats.ActiveConnections),
+			"idle_connections", atomic.LoadInt64(&dbManager.stats.IdleConnections))
 		return conn, nil
 	default:
 		// Try to create a new connection if we haven't reached the limit
-		if atomic.LoadInt64(&dbManager.stats.TotalConnections) < int64(dbManager.config.MaxConnections) {
+		if totalConns < int64(dbManager.config.MaxConnections) {
+			logger.Debug("Creating new backend connection",
+				"current_total", totalConns,
+				"max_allowed", dbManager.config.MaxConnections)
+
 			conn, err := dbManager.createBackendConnection()
-			if err == nil {
-				conn.SetInUse(true)
-				atomic.AddInt64(&dbManager.stats.TotalConnections, 1)
-				atomic.AddInt64(&dbManager.stats.ActiveConnections, 1)
-				return conn, nil
+			if err != nil {
+				logger.WithError(err).Error("Failed to create new backend connection")
+				return nil, fmt.Errorf("failed to create new connection: %w", err)
 			}
+
+			conn.SetInUse(true)
+			atomic.AddInt64(&dbManager.stats.TotalConnections, 1)
+			atomic.AddInt64(&dbManager.stats.ActiveConnections, 1)
+			logger.Debug("Successfully created new backend connection",
+				"total_connections", atomic.LoadInt64(&dbManager.stats.TotalConnections),
+				"active_connections", atomic.LoadInt64(&dbManager.stats.ActiveConnections))
+			return conn, nil
 		}
-		return nil, fmt.Errorf("no available backend connections for database %s", dbName)
+
+		logger.Error("Connection pool exhausted",
+			"total_connections", totalConns,
+			"max_connections", dbManager.config.MaxConnections,
+			"active_connections", activeConns,
+			"idle_connections", idleConns,
+			"pool_size", len(dbManager.backendPool))
+		return nil, fmt.Errorf("no available backend connections for database %s (pool exhausted: %d/%d active)",
+			dbName, activeConns, dbManager.config.MaxConnections)
 	}
 }
 
-// getDatabaseManager finds or creates a database manager for the requested database
 func (p *WildcardPooler) getDatabaseManager(dbName, user string) (*DatabaseManager, error) {
+	logger := p.logger.WithDatabase(dbName).WithUser(user)
+
 	// First check static databases
 	p.databasesMu.RLock()
 	if dbManager, exists := p.staticDatabases[dbName]; exists {
+		logger.Debug("Found static database manager")
 		p.databasesMu.RUnlock()
 		return dbManager, nil
 	}
 	p.databasesMu.RUnlock()
 
-	// Check dynamic databases
+	// Check dynamic databases for each wildcard target
 	for _, target := range p.wildcardTargets {
 		key := fmt.Sprintf("%s:%s", target.Name, dbName)
+		logger.Debug("Checking dynamic database key", "key", key)
 
 		p.databasesMu.RLock()
 		if dbManager, exists := p.dynamicDatabases[key]; exists {
+			logger.Debug("Found dynamic database manager", "key", key)
 			p.databasesMu.RUnlock()
 			return dbManager, nil
 		}
 		p.databasesMu.RUnlock()
 	}
 
+	logger.Debug("No existing database manager found, checking if on-demand creation is enabled",
+		"create_on_demand", p.config.AutoDiscovery.CreatePoolsOnDemand)
+
 	// If on-demand creation is enabled, try to create the database pool
 	if p.config.AutoDiscovery.CreatePoolsOnDemand {
 		return p.createDatabaseOnDemand(dbName, user)
 	}
 
+	// If on-demand creation is disabled, but we have wildcard targets,
+	// we should still try to create a pool if the database exists
+	if len(p.wildcardTargets) > 0 {
+		logger.Info("On-demand creation disabled but wildcard targets available, attempting to create pool anyway")
+		return p.createDatabaseOnDemand(dbName, user)
+	}
+
+	logger.Error("No database manager available and no wildcard targets configured")
 	return nil, fmt.Errorf("database not found: %s", dbName)
 }
 
-// createDatabaseOnDemand creates a database pool on-demand
 func (p *WildcardPooler) createDatabaseOnDemand(dbName, user string) (*DatabaseManager, error) {
 	logger := p.logger.WithDatabase(dbName).WithUser(user)
-	logger.Debug("Creating database pool on demand")
+	logger.Info("Creating database pool on demand")
+
+	if len(p.wildcardTargets) == 0 {
+		logger.Error("No wildcard targets configured for on-demand database creation")
+		return nil, fmt.Errorf("no wildcard targets available for database %s", dbName)
+	}
 
 	// Try each wildcard target to see if the database exists
-	for _, target := range p.wildcardTargets {
-		// Check user mapping
+	var lastErr error
+	for i, target := range p.wildcardTargets {
+		targetLogger := logger.WithTarget(target.Name)
+		targetLogger.Debug("Trying wildcard target", "attempt", i+1, "total", len(p.wildcardTargets))
+
+		// Check user mapping - resolve credentials first
 		dbUser, _ := p.resolveUserCredentials(target, user, dbName)
 		if dbUser == "" {
-			continue // No valid user mapping for this target
+			targetLogger.Debug("No valid user mapping for this target")
+			continue
+		}
+
+		targetLogger.Debug("Resolved credentials", "db_user", dbUser)
+
+		// Check if database should be included based on filters
+		if !p.shouldIncludeDatabase(target, dbName) {
+			targetLogger.Debug("Database excluded by filters")
+			continue
 		}
 
 		// Check if database exists on this target
 		exists, err := p.checkDatabaseExists(target, dbName)
 		if err != nil {
-			logger.WithError(err).Warn("Failed to check database existence", "target", target.Name)
+			targetLogger.WithError(err).Warn("Failed to check database existence")
+			lastErr = err
 			continue
 		}
+
 		if !exists {
-			logger.Debug("Database does not exist on target", "target", target.Name, "database", dbName)
-			continue // Database doesn't exist on this target
+			targetLogger.Debug("Database does not exist on target")
+			continue
 		}
 
-		// Database exists, create the pool
+		targetLogger.Info("Database exists on target, creating pool")
+
+		// Database exists and passes filters, create the pool
 		if err := p.addDynamicDatabase(target, dbName); err != nil {
-			logger.WithError(err).Warn("Failed to create on-demand pool", "target", target.Name)
+			targetLogger.WithError(err).Warn("Failed to create on-demand pool")
+			lastErr = err
 			continue
 		}
 
@@ -490,26 +698,44 @@ func (p *WildcardPooler) createDatabaseOnDemand(dbName, user string) (*DatabaseM
 		dbManager := p.dynamicDatabases[key]
 		p.databasesMu.RUnlock()
 
+		if dbManager == nil {
+			targetLogger.Error("Database manager not found after creation")
+			lastErr = fmt.Errorf("database manager creation failed")
+			continue
+		}
+
 		atomic.AddInt64(&p.stats.DatabasesCreated, 1)
-		logger.Info("Created on-demand pool", "target", target.Name)
+		targetLogger.Info("Successfully created on-demand pool")
 		return dbManager, nil
 	}
 
+	// If we get here, no wildcard target worked
+	if lastErr != nil {
+		logger.WithError(lastErr).Error("Failed to create on-demand database pool")
+		return nil, fmt.Errorf("failed to create pool for database %s: %w", dbName, lastErr)
+	}
+
+	logger.Error("Database not found on any wildcard target")
 	return nil, fmt.Errorf("database %s not found on any wildcard target", dbName)
 }
 
-// resolveUserCredentials resolves user credentials based on mapping rules
 func (p *WildcardPooler) resolveUserCredentials(target *WildcardTarget, clientUser, dbName string) (string, string) {
+	logger := p.logger.WithTarget(target.Name).WithUser(clientUser).WithDatabase(dbName)
+
 	// Check user mappings
-	for _, mapping := range target.UserMappings {
+	for i, mapping := range target.UserMappings {
+		logger.Debug("Checking user mapping", "mapping_index", i, "mapping_client_user", mapping.ClientUser)
+
 		if mapping.ClientUser == clientUser || mapping.ClientUser == "*" {
 			// TODO: Implement database filter regex matching
 			if mapping.DatabaseFilter == "" || mapping.DatabaseFilter == "*" {
+				logger.Debug("User mapping matched", "db_user", mapping.DatabaseUser)
 				return mapping.DatabaseUser, mapping.DatabasePass
 			}
 		}
 	}
 
 	// Fall back to default credentials
+	logger.Debug("Using default credentials", "default_user", target.DefaultUser)
 	return target.DefaultUser, target.DefaultPassword
 }

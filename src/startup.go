@@ -131,6 +131,7 @@ func (p *WildcardPooler) handleStartupMessage(client *ClientConnection) error {
 	logger.Info("Client pool mode determined", "pool_mode", poolMode, "session_mode", poolMode == "session")
 
 	// For session mode, establish backend connection now
+	// For transaction/statement mode, connections are acquired per query/transaction
 	if poolMode == "session" {
 		backend, err := p.acquireBackendConnection(startupMsg.Database)
 		if err != nil {
@@ -142,6 +143,8 @@ func (p *WildcardPooler) handleStartupMessage(client *ClientConnection) error {
 		backend.SetClientRef(client)
 		logger.Debug("Session mode backend connection established",
 			"backend_addr", backend.RemoteAddr())
+	} else {
+		logger.Debug("Transaction/statement mode - backend connections will be acquired per query")
 	}
 
 	// Send authentication OK (simplified authentication)
