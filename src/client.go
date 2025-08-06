@@ -242,7 +242,7 @@ func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
 	c.lastActivity = time.Now()
 
 	// Validate message parameters
-	if len(body) > 1024*1024 { // 1MB limit
+	if len(body) > 1024*1024*10 { // 10MB limit
 		return fmt.Errorf("message body too large: %d bytes", len(body))
 	}
 
@@ -267,9 +267,6 @@ func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
 	if err := c.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush message type=%c len=%d to client: %w", msgType, length, err)
 	}
-
-	// Debug logging
-	fmt.Printf("DEBUG: Sent message type=%c len=%d to client %s\n", msgType, length, c.RemoteAddr())
 
 	return nil
 }
@@ -296,7 +293,7 @@ func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid message length %d for type %c from client (must be >= 4)", length, msgType)
 	}
 
-	if length > 1024*1024 { // 1MB limit
+	if length > 1024*1024 { // 1MB limit for client messages
 		return 0, nil, fmt.Errorf("message length %d too large for type %c from client", length, msgType)
 	}
 
@@ -313,20 +310,6 @@ func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
 	c.mu.Lock()
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
-
-	// Debug logging
-	fmt.Printf("DEBUG: Read message type=%c len=%d from client %s\n", msgType, length, c.RemoteAddr())
-
-	if msgType == 'Q' && len(body) > 0 {
-		query := string(body)
-		if len(query) > 0 && query[len(query)-1] == 0 {
-			query = query[:len(query)-1]
-		}
-		if len(query) > 100 {
-			query = query[:100] + "..."
-		}
-		fmt.Printf("DEBUG: Client query: %s\n", query)
-	}
 
 	return msgType, body, nil
 }

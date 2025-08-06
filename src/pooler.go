@@ -349,30 +349,6 @@ func (p *WildcardPooler) cleanupClientListeners(client *ClientConnection) {
 	}
 }
 
-// registerListener registers a client as a listener for a channel
-func (p *WildcardPooler) registerListener(channel string, client *ClientConnection) {
-	p.listenersMu.Lock()
-	defer p.listenersMu.Unlock()
-
-	if p.listeners[channel] == nil {
-		p.listeners[channel] = make(map[*ClientConnection]bool)
-	}
-	p.listeners[channel][client] = true
-}
-
-// unregisterListener unregisters a client from a channel
-func (p *WildcardPooler) unregisterListener(channel string, client *ClientConnection) {
-	p.listenersMu.Lock()
-	defer p.listenersMu.Unlock()
-
-	if clients, exists := p.listeners[channel]; exists {
-		delete(clients, client)
-		if len(clients) == 0 {
-			delete(p.listeners, channel)
-		}
-	}
-}
-
 // releaseBackendConnection returns a backend connection to its pool
 func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	if conn == nil {

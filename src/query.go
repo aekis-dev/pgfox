@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // handleClientMessage handles messages from clients
@@ -18,7 +20,6 @@ func (p *WildcardPooler) handleClientMessage(client *ClientConnection) error {
 	}
 
 	logger := client.Logger().WithField("msg_type", string(msgType)).WithField("body_len", len(body))
-	logger.Debug("Received client message")
 
 	switch msgType {
 	case Query:
@@ -26,11 +27,9 @@ func (p *WildcardPooler) handleClientMessage(client *ClientConnection) error {
 		if len(query) > 0 && query[len(query)-1] == 0 {
 			query = query[:len(query)-1] // Remove null terminator
 		}
-		logger.Debug("Handling query", "query", query)
 		return p.handleQuery(client, query)
 
 	case Parse, Bind, Execute, Sync:
-		logger.Debug("Handling extended query protocol")
 		return p.handleExtendedQuery(client, msgType, body)
 
 	case Terminate:
@@ -39,7 +38,6 @@ func (p *WildcardPooler) handleClientMessage(client *ClientConnection) error {
 
 	default:
 		logger.Debug("Forwarding unhandled message type to backend")
-		// For unknown message types, try to forward them directly to backend
 		return p.forwardUnknownMessage(client, msgType, body)
 	}
 }
@@ -57,6 +55,15 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 		return p.handleUnlisten(client, query)
 	} else if strings.HasPrefix(queryUpper, "NOTIFY ") {
 		return p.handleNotify(client, query)
+	} else if p.containsPgNotify(queryUpper) {
+		// Handle pg_notify() function calls (commonly used by ORMs like Odoo)
+		logger.Info("Detected pg_notify function call", "query", query)
+		return p.handleNotify(client, query)
+	}
+
+	// Log queries that might contain notifications but weren't detected
+	if strings.Contains(queryUpper, "NOTIFY") {
+		logger.Debug("Query contains NOTIFY but not detected as notification", "query_upper", queryUpper)
 	}
 
 	// Get backend connection
@@ -64,6 +71,14 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	if backend == nil {
 		logger.Error("No backend connection available for client")
 		return sendErrorResponse(client, "FATAL", "08003", "connection does not exist")
+	}
+
+	// Set read timeout for this query operation
+	if conn, ok := backend.conn.(net.Conn); ok {
+		// Set a reasonable timeout for query operations (30 seconds)
+		deadline := time.Now().Add(30 * time.Second)
+		conn.SetReadDeadline(deadline)
+		defer conn.SetReadDeadline(time.Time{}) // Clear deadline after operation
 	}
 
 	// Forward query to backend
@@ -75,7 +90,11 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	// Forward complete response from backend to client
 	if err := p.forwardCompleteBackendResponse(client, backend); err != nil {
 		logger.WithError(err).Error("Failed to forward backend response")
-		return err
+		// Check if this is a timeout error and provide better error message
+		if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
+			return sendErrorResponse(client, "ERROR", "57014", "query timeout")
+		}
+		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
 	// Update transaction state based on query
@@ -99,6 +118,13 @@ func (p *WildcardPooler) handleExtendedQuery(client *ClientConnection, msgType b
 	if backend == nil {
 		logger.Error("No backend connection available for extended query")
 		return sendErrorResponse(client, "FATAL", "08003", "connection does not exist")
+	}
+
+	// Set timeout for extended query operations
+	if conn, ok := backend.conn.(net.Conn); ok {
+		deadline := time.Now().Add(30 * time.Second)
+		conn.SetReadDeadline(deadline)
+		defer conn.SetReadDeadline(time.Time{}) // Clear deadline after operation
 	}
 
 	// Forward message to backend
@@ -141,6 +167,13 @@ func (p *WildcardPooler) forwardUnknownMessage(client *ClientConnection, msgType
 		return sendErrorResponse(client, "FATAL", "08003", "connection does not exist")
 	}
 
+	// Set timeout
+	if conn, ok := backend.conn.(net.Conn); ok {
+		deadline := time.Now().Add(30 * time.Second)
+		conn.SetReadDeadline(deadline)
+		defer conn.SetReadDeadline(time.Time{})
+	}
+
 	// Forward the message as-is
 	if err := backend.WriteMessage(msgType, body); err != nil {
 		logger.WithError(err).Error("Failed to forward unknown message")
@@ -157,11 +190,21 @@ func (p *WildcardPooler) forwardSingleResponse(client *ClientConnection, backend
 
 	msgType, body, err := backend.ReadMessage()
 	if err != nil {
+		if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
+			logger.WithError(err).Warn("Timeout reading single response")
+			return sendErrorResponse(client, "ERROR", "57014", "query timeout")
+		}
 		logger.WithError(err).Error("Failed to read backend response")
-		return err
+		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
-	logger.Debug("Forwarding single response", "msg_type", string(msgType), "body_len", len(body))
+	// Handle notifications that arrive during single response
+	if msgType == NotificationResponse { // 'A'
+		logger.Info("Received notification during single response processing")
+		p.handleNotificationResponse(body)
+		// After handling notification, try to read the actual response
+		return p.forwardSingleResponse(client, backend, expectedType)
+	}
 
 	if err := client.WriteMessage(msgType, body); err != nil {
 		logger.WithError(err).Error("Failed to forward response to client")
@@ -178,18 +221,20 @@ func (p *WildcardPooler) forwardExecuteResponse(client *ClientConnection, backen
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
+			if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
+				logger.WithError(err).Warn("Timeout reading execute response")
+				return sendErrorResponse(client, "ERROR", "57014", "query timeout")
+			}
 			logger.WithError(err).Error("Failed to read execute response")
-			return err
+			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 		}
-
-		logger.Debug("Forwarding execute response", "msg_type", string(msgType), "body_len", len(body))
 
 		if err := client.WriteMessage(msgType, body); err != nil {
 			logger.WithError(err).Error("Failed to forward execute response")
 			return err
 		}
 
-		// Execute sequence ends with CommandComplete, EmptyQueryResponse, or ErrorResponse
+		// Execute sequence ends with these message types
 		switch msgType {
 		case 'C': // CommandComplete
 			return nil
@@ -211,11 +256,13 @@ func (p *WildcardPooler) forwardUntilReady(client *ClientConnection, backend *Ba
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
+			if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
+				logger.WithError(err).Warn("Timeout waiting for ready")
+				return sendErrorResponse(client, "ERROR", "57014", "query timeout")
+			}
 			logger.WithError(err).Error("Failed to read response waiting for ready")
-			return err
+			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 		}
-
-		logger.Debug("Forwarding message waiting for ready", "msg_type", string(msgType), "body_len", len(body))
 
 		if err := client.WriteMessage(msgType, body); err != nil {
 			logger.WithError(err).Error("Failed to forward message waiting for ready")
@@ -235,11 +282,13 @@ func (p *WildcardPooler) forwardCompleteBackendResponse(client *ClientConnection
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
+			if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
+				logger.WithError(err).Warn("Timeout reading complete response")
+				return fmt.Errorf("query timeout")
+			}
 			logger.WithError(err).Error("Failed to read complete response")
 			return err
 		}
-
-		logger.Debug("Forwarding complete response", "msg_type", string(msgType), "body_len", len(body))
 
 		if err := client.WriteMessage(msgType, body); err != nil {
 			logger.WithError(err).Error("Failed to forward complete response")
@@ -251,6 +300,36 @@ func (p *WildcardPooler) forwardCompleteBackendResponse(client *ClientConnection
 			return nil
 		}
 	}
+}
+
+// containsPgNotify checks if a query contains a pg_notify function call
+func (p *WildcardPooler) containsPgNotify(queryUpper string) bool {
+	// Remove extra whitespace and normalize
+	normalized := strings.ReplaceAll(queryUpper, " ", "")
+
+	// Check for various forms of pg_notify:
+	// - pg_notify(...)
+	// - "pg_notify"(...)  (quoted function name)
+	// - pg_notify (...)   (with space)
+	patterns := []string{
+		"PG_NOTIFY(",
+		"\"PG_NOTIFY\"(",
+		"'PG_NOTIFY'(",
+		"`PG_NOTIFY`(",
+	}
+
+	for _, pattern := range patterns {
+		if strings.Contains(normalized, pattern) {
+			return true
+		}
+		// Also check with spaces
+		spaced := strings.ReplaceAll(pattern, "(", " (")
+		if strings.Contains(queryUpper, spaced) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // updateTransactionState updates the client's transaction state based on the query

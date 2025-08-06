@@ -210,20 +210,6 @@ func (b *BackendConnection) WriteMessage(msgType byte, body []byte) error {
 		return fmt.Errorf("failed to flush message type=%c len=%d: %w", msgType, length, err)
 	}
 
-	// Debug logging for problematic messages
-	if msgType == 'Q' && len(body) > 0 {
-		query := string(body)
-		if len(query) > 0 && query[len(query)-1] == 0 {
-			query = query[:len(query)-1]
-		}
-		if len(query) > 100 {
-			query = query[:100] + "..."
-		}
-		fmt.Printf("DEBUG: Sent query to backend: %s (len=%d)\n", query, len(body))
-	} else {
-		fmt.Printf("DEBUG: Sent message type=%c len=%d to backend\n", msgType, len(body))
-	}
-
 	return nil
 }
 
@@ -249,7 +235,7 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid message length %d for type %c (must be >= 4)", length, msgType)
 	}
 
-	if length > 1024*1024 { // 1MB limit
+	if length > 1024*1024*10 { // 10MB limit for large result sets
 		return 0, nil, fmt.Errorf("message length %d too large for type %c", length, msgType)
 	}
 
@@ -260,15 +246,6 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 		if _, err := io.ReadFull(b.reader, body); err != nil {
 			return 0, nil, fmt.Errorf("failed to read message body (%d bytes) for type %c: %w", bodyLength, msgType, err)
 		}
-	}
-
-	// Debug logging
-	fmt.Printf("DEBUG: Read message type=%c len=%d from backend\n", msgType, length)
-
-	// Special debug for error messages
-	if msgType == 'E' {
-		errorMsg := parseErrorMessage(body)
-		fmt.Printf("DEBUG: Backend error: %s\n", errorMsg)
 	}
 
 	return msgType, body, nil
