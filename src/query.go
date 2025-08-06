@@ -20,6 +20,7 @@ func (p *WildcardPooler) handleClientMessage(client *ClientConnection) error {
 	}
 
 	logger := client.Logger().WithField("msg_type", string(msgType)).WithField("body_len", len(body))
+	logger.Debug("Received client message")
 
 	switch msgType {
 	case Query:
@@ -27,24 +28,27 @@ func (p *WildcardPooler) handleClientMessage(client *ClientConnection) error {
 		if len(query) > 0 && query[len(query)-1] == 0 {
 			query = query[:len(query)-1] // Remove null terminator
 		}
-		return p.handleQuery(client, query)
+
+		// Submit to worker pool for async execution
+		return p.workerPool.SubmitQuery(client, query)
 
 	case Parse, Bind, Execute, Sync:
-		return p.handleExtendedQuery(client, msgType, body)
+		// Submit to worker pool for async execution
+		return p.workerPool.SubmitExtendedQuery(client, msgType, body)
 
 	case Terminate:
 		logger.Debug("Client terminating connection")
 		return io.EOF
 
 	default:
-		logger.Debug("Forwarding unhandled message type to backend")
-		return p.forwardUnknownMessage(client, msgType, body)
+		logger.Debug("Forwarding unhandled message type to worker pool")
+		return p.workerPool.SubmitExtendedQuery(client, msgType, body)
 	}
 }
 
 // handleQuery handles a query from the client
-func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) error {
-	logger := client.Logger().WithField("query", query)
+func (p *WildcardPooler) executeQuery(client *ClientConnection, query string) error {
+	logger := client.Logger().WithField("query", query).WithField("worker", "async")
 
 	// Check if this is a LISTEN/UNLISTEN/NOTIFY command
 	queryUpper := strings.ToUpper(strings.TrimSpace(query))
@@ -56,7 +60,6 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	} else if strings.HasPrefix(queryUpper, "NOTIFY ") {
 		return p.handleNotify(client, query)
 	} else if p.containsPgNotify(queryUpper) {
-		// Handle pg_notify() function calls (commonly used by ORMs like Odoo)
 		logger.Info("Detected pg_notify function call", "query", query)
 		return p.handleNotify(client, query)
 	}
@@ -74,10 +77,9 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 
 	// Set read timeout for this query operation
 	if conn, ok := backend.conn.(net.Conn); ok {
-		// Set a reasonable timeout for query operations (30 seconds)
 		deadline := time.Now().Add(30 * time.Second)
 		conn.SetReadDeadline(deadline)
-		defer conn.SetReadDeadline(time.Time{}) // Clear deadline after operation
+		defer conn.SetReadDeadline(time.Time{})
 	}
 
 	// Forward query to backend
@@ -92,7 +94,6 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	// Forward complete response from backend to client
 	if err := p.forwardCompleteBackendResponse(client, backend); err != nil {
 		logger.WithError(err).Error("Failed to forward backend response")
-		// Check if this is a timeout error and provide better error message
 		if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
 			if shouldRelease {
 				p.releaseBackendConnection(backend)
@@ -114,7 +115,7 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 	}
 	atomic.AddInt64(&p.stats.TotalQueries, 1)
 
-	// FIXED: Improved release logic
+	// Connection release logic
 	logger.Debug("Determining connection release strategy",
 		"should_release", shouldRelease,
 		"is_transaction_start", isTransactionStart,
@@ -123,22 +124,16 @@ func (p *WildcardPooler) handleQuery(client *ClientConnection, query string) err
 		"client_is_listening", client.IsListening())
 
 	if shouldRelease {
-		// This is a pooled connection, handle release logic
 		if isTransactionStart {
-			// For BEGIN commands, convert pooled connection to dedicated
 			logger.Debug("Transaction started - converting pooled connection to dedicated")
 			client.SetBackendConnection(backend)
 			backend.SetClientRef(client)
-			// Don't release - connection is now dedicated to client
 		} else {
-			// For non-transaction commands, release back to pool
 			logger.Debug("Releasing pooled backend connection after query")
 			p.releaseBackendConnection(backend)
 		}
 	} else {
-		// This is a dedicated connection
 		if isTransactionEnd {
-			// For COMMIT/ROLLBACK on dedicated connections, return to pool if not listening
 			if !client.IsListening() {
 				logger.Debug("Transaction ended - releasing dedicated connection to pool")
 				client.SetBackendConnection(nil)
@@ -245,9 +240,9 @@ func (p *WildcardPooler) getBackendForClient(client *ClientConnection) (*Backend
 	return backend, true, nil // Release after use
 }
 
-// handleExtendedQuery handles extended query protocol (Parse/Bind/Execute/Sync)
-func (p *WildcardPooler) handleExtendedQuery(client *ClientConnection, msgType byte, body []byte) error {
-	logger := client.Logger().WithField("msg_type", string(msgType))
+// executeExtendedQuery handles extended query protocol (Parse/Bind/Execute/Sync)
+func (p *WildcardPooler) executeExtendedQuery(client *ClientConnection, msgType byte, body []byte) error {
+	logger := client.Logger().WithField("msg_type", string(msgType)).WithField("worker", "async")
 
 	// Get backend connection
 	backend := client.GetBackendConnection()
@@ -260,7 +255,7 @@ func (p *WildcardPooler) handleExtendedQuery(client *ClientConnection, msgType b
 	if conn, ok := backend.conn.(net.Conn); ok {
 		deadline := time.Now().Add(30 * time.Second)
 		conn.SetReadDeadline(deadline)
-		defer conn.SetReadDeadline(time.Time{}) // Clear deadline after operation
+		defer conn.SetReadDeadline(time.Time{})
 	}
 
 	// Forward message to backend
@@ -285,9 +280,9 @@ func (p *WildcardPooler) handleExtendedQuery(client *ClientConnection, msgType b
 	}
 }
 
-// forwardUnknownMessage forwards unknown message types directly
-func (p *WildcardPooler) forwardUnknownMessage(client *ClientConnection, msgType byte, body []byte) error {
-	logger := client.Logger().WithField("msg_type", string(msgType))
+// executeUnknownMessage forwards unknown message types directly
+func (p *WildcardPooler) executeUnknownMessage(client *ClientConnection, msgType byte, body []byte) error {
+	logger := client.Logger().WithField("msg_type", string(msgType)).WithField("worker", "async")
 
 	backend := client.GetBackendConnection()
 	if backend == nil {

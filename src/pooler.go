@@ -28,6 +28,7 @@ type WildcardPooler struct {
 	discoveryCache   map[string]*DatabaseDiscoveryInfo
 	discoveryCacheMu sync.RWMutex
 	logger           *Logger
+	workerPool       *WorkerPool
 }
 
 // DatabaseManager manages connections for a specific database
@@ -64,6 +65,10 @@ type GlobalStats struct {
 	DatabasesDiscovered int64
 	DatabasesCreated    int64
 	DatabasesRemoved    int64
+
+	ActiveWorkers  int64
+	QueuedTasks    int64
+	CompletedTasks int64
 }
 
 // DatabaseStats contains per-database statistics
@@ -75,6 +80,18 @@ type DatabaseStats struct {
 	ErrorCount        int64
 	BytesReceived     int64
 	BytesSent         int64
+}
+
+func (p *WildcardPooler) initializeWorkerPool() {
+	workerCount := p.config.Server.WorkerPoolSize
+	queueSize := p.config.Server.TaskQueueSize
+
+	p.workerPool = NewWorkerPool(p, workerCount, queueSize)
+	p.workerPool.Start()
+
+	p.logger.Info("Initialized worker pool",
+		"worker_count", workerCount,
+		"queue_size", queueSize)
 }
 
 // NewWildcardPooler creates a new wildcard pooler
@@ -111,6 +128,8 @@ func NewWildcardPooler(config Config, logger *Logger) (*WildcardPooler, error) {
 			continue
 		}
 	}
+
+	pooler.initializeWorkerPool()
 
 	// Start database discovery if enabled
 	if config.AutoDiscovery.Enabled && !config.AutoDiscovery.CreatePoolsOnDemand {
@@ -173,6 +192,10 @@ func (p *WildcardPooler) shutdown() error {
 	// Stop accepting new connections
 	if p.listener != nil {
 		p.listener.Close()
+	}
+
+	if p.workerPool != nil {
+		p.workerPool.Stop()
 	}
 
 	// Cancel all background workers
@@ -321,7 +344,7 @@ func (p *WildcardPooler) addStaticDatabase(name string, config DatabaseConfig) e
 
 // Stats returns current pooler statistics
 func (p *WildcardPooler) Stats() GlobalStats {
-	return GlobalStats{
+	stats := GlobalStats{
 		TotalClients:        atomic.LoadInt64(&p.stats.TotalClients),
 		ActiveClients:       atomic.LoadInt64(&p.stats.ActiveClients),
 		StaticDatabases:     atomic.LoadInt64(&p.stats.StaticDatabases),
@@ -333,6 +356,14 @@ func (p *WildcardPooler) Stats() GlobalStats {
 		DatabasesCreated:    atomic.LoadInt64(&p.stats.DatabasesCreated),
 		DatabasesRemoved:    atomic.LoadInt64(&p.stats.DatabasesRemoved),
 	}
+
+	if p.workerPool != nil {
+		stats.ActiveWorkers = int64(p.workerPool.workerCount)
+		stats.QueuedTasks = int64(len(p.workerPool.taskQueue))
+		stats.CompletedTasks = atomic.LoadInt64(&p.workerPool.completedTasks)
+	}
+
+	return stats
 }
 
 // cleanupClientListeners removes a client from all listener registrations

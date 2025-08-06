@@ -36,6 +36,7 @@ func NewMetricsServer(pooler *WildcardPooler, addr, path string, logger *Logger)
 	mux.HandleFunc("/databases", ms.handleDatabases)
 	mux.HandleFunc("/listeners", ms.handleListeners)
 	mux.HandleFunc("/discovery", ms.handleDiscovery)
+	mux.HandleFunc("/workers", ms.handleWorkers) // NEW endpoint
 
 	return ms
 }
@@ -113,6 +114,18 @@ func (ms *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP pgjoint_databases_removed_total Total number of database pools removed\n")
 	fmt.Fprintf(w, "# TYPE pgjoint_databases_removed_total counter\n")
 	fmt.Fprintf(w, "pgjoint_databases_removed_total %d\n", stats.DatabasesRemoved)
+
+	fmt.Fprintf(w, "# HELP pgjoint_workers_active Current number of active worker goroutines\n")
+	fmt.Fprintf(w, "# TYPE pgjoint_workers_active gauge\n")
+	fmt.Fprintf(w, "pgjoint_workers_active %d\n", stats.ActiveWorkers)
+
+	fmt.Fprintf(w, "# HELP pgjoint_tasks_queued Current number of queued tasks\n")
+	fmt.Fprintf(w, "# TYPE pgjoint_tasks_queued gauge\n")
+	fmt.Fprintf(w, "pgjoint_tasks_queued %d\n", stats.QueuedTasks)
+
+	fmt.Fprintf(w, "# HELP pgjoint_tasks_completed_total Total number of completed tasks\n")
+	fmt.Fprintf(w, "# TYPE pgjoint_tasks_completed_total counter\n")
+	fmt.Fprintf(w, "pgjoint_tasks_completed_total %d\n", stats.CompletedTasks)
 
 	// Per-database metrics
 	ms.pooler.databasesMu.RLock()
@@ -218,6 +231,10 @@ func (ms *MetricsServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		"discovery": ms.pooler.getDiscoveryStats(),
 		"listeners": ms.pooler.getListenerStats(),
 		"timestamp": time.Now().UTC(),
+	}
+
+	if ms.pooler.workerPool != nil {
+		stats["worker_pool"] = ms.pooler.workerPool.GetStats()
 	}
 
 	// Add database stats
@@ -420,4 +437,35 @@ func (ms *MetricsServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(info)
+}
+
+func (ms *MetricsServer) handleWorkers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	var workerStats interface{}
+	if ms.pooler.workerPool != nil {
+		workerStats = ms.pooler.workerPool.GetStats()
+	} else {
+		workerStats = map[string]interface{}{
+			"enabled": false,
+			"message": "Worker pool not initialized",
+		}
+	}
+
+	response := map[string]interface{}{
+		"worker_pool": workerStats,
+		"config": map[string]interface{}{
+			"worker_pool_size": ms.pooler.config.Server.WorkerPoolSize,
+			"task_queue_size":  ms.pooler.config.Server.TaskQueueSize,
+			"query_timeout":    ms.pooler.config.Server.QueryTimeout,
+		},
+		"timestamp": time.Now().UTC(),
+	}
+
+	json.NewEncoder(w).Encode(response)
 }

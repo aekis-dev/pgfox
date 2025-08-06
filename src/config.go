@@ -26,6 +26,10 @@ type ServerConfig struct {
 	DefaultPoolMode   string        `yaml:"default_pool_mode"`
 	ConnectionTimeout time.Duration `yaml:"connection_timeout"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+
+	WorkerPoolSize int           `yaml:"worker_pool_size"` // Number of worker goroutines (0 = auto)
+	TaskQueueSize  int           `yaml:"task_queue_size"`  // Size of task queue buffer (0 = auto)
+	QueryTimeout   time.Duration `yaml:"query_timeout"`    // Timeout for individual queries
 }
 
 // DatabaseConfig contains database-specific configuration
@@ -160,6 +164,24 @@ func (c *Config) setDefaults() error {
 	}
 	if c.Server.IdleTimeout == 0 {
 		c.Server.IdleTimeout = 10 * time.Minute
+	}
+	// Worker pool defaults
+	if c.Server.WorkerPoolSize == 0 {
+		// Auto-calculate: 1 worker per 20 max connections
+		c.Server.WorkerPoolSize = c.Server.MaxConnections / 20
+		if c.Server.WorkerPoolSize < 10 {
+			c.Server.WorkerPoolSize = 10 // Minimum 10 workers
+		}
+		if c.Server.WorkerPoolSize > 100 {
+			c.Server.WorkerPoolSize = 100 // Maximum 100 workers
+		}
+	}
+	if c.Server.TaskQueueSize == 0 {
+		// Auto-calculate: 4 tasks per worker
+		c.Server.TaskQueueSize = c.Server.WorkerPoolSize * 4
+	}
+	if c.Server.QueryTimeout == 0 {
+		c.Server.QueryTimeout = 60 * time.Second
 	}
 
 	// Auto discovery defaults
