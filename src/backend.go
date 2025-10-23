@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -64,7 +65,8 @@ func (b *BackendConnection) SetInUse(inUse bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.inUse = inUse
-	if inUse {
+	if !inUse {
+		// Update last used time when released
 		b.lastUsedAt = time.Now()
 	}
 }
@@ -251,49 +253,6 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 	return msgType, body, nil
 }
 
-// Ping tests if the backend connection is alive
-func (b *BackendConnection) Ping() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Send a simple query to test the connection
-	query := "SELECT 1"
-	queryMsg := make([]byte, len(query)+1)
-	copy(queryMsg, query)
-	queryMsg[len(query)] = 0 // Null terminator
-
-	if err := b.writer.WriteByte('Q'); err != nil {
-		return err
-	}
-
-	if err := writeUint32(b.writer, uint32(len(queryMsg)+4)); err != nil {
-		return err
-	}
-
-	if _, err := b.writer.Write(queryMsg); err != nil {
-		return err
-	}
-
-	if err := b.writer.Flush(); err != nil {
-		return err
-	}
-
-	// Read response until ReadyForQuery
-	for {
-		msgType, _, err := b.ReadMessage()
-		if err != nil {
-			return err
-		}
-
-		// Stop when we get ReadyForQuery
-		if msgType == 'Z' {
-			break
-		}
-	}
-
-	return nil
-}
-
 // RemoteAddr returns the backend's remote address
 func (b *BackendConnection) RemoteAddr() net.Addr {
 	b.mu.Lock()
@@ -312,4 +271,44 @@ func (b *BackendConnection) LocalAddr() net.Addr {
 		return b.conn.LocalAddr()
 	}
 	return nil
+}
+
+// IsAlive checks if the connection is still alive
+func (b *BackendConnection) IsAlive() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.conn == nil {
+		return false
+	}
+
+	// Quick non-blocking check
+	netConn, ok := b.conn.(net.Conn)
+	if !ok {
+		return false
+	}
+
+	// Set immediate deadline
+	if err := netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
+		return false
+	}
+	defer netConn.SetReadDeadline(time.Time{})
+
+	// Try to read one byte
+	one := make([]byte, 1)
+	n, err := netConn.Read(one)
+
+	if err == nil && n > 0 {
+		// Unexpected data - put it back and consider connection alive
+		b.reader = bufio.NewReader(io.MultiReader(bytes.NewReader(one), netConn))
+		return true
+	}
+
+	// Check if timeout (good - no data means alive)
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+
+	// Any other error = closed
+	return false
 }

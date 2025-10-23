@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,64 +14,50 @@ import (
 
 // WildcardPooler manages dynamic database discovery and pooling
 type WildcardPooler struct {
-	config           Config
-	listener         net.Listener
-	staticDatabases  map[string]*DatabaseManager
-	dynamicDatabases map[string]*DatabaseManager
-	wildcardTargets  []*WildcardTarget
-	clients          map[net.Conn]*ClientConnection
-	clientsMu        sync.RWMutex
-	databasesMu      sync.RWMutex
-	listeners        map[string]map[*ClientConnection]bool
-	listenersMu      sync.RWMutex
-	stats            GlobalStats
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	discoveryCache   map[string]*DatabaseDiscoveryInfo
-	discoveryCacheMu sync.RWMutex
-	logger           *Logger
-	workerPool       *WorkerPool
+	config   Config
+	listener net.Listener
+
+	// Unified storage: target_name -> database_name -> username -> manager
+	targets   map[string]map[string]map[string]*DatabaseManager
+	targetsMu sync.RWMutex
+
+	targetConfigs []*Target // Reference to config targets
+
+	clients                map[net.Conn]*ClientConnection
+	clientsMu              sync.RWMutex
+	listeners              map[string]map[*ClientConnection]bool
+	listenersMu            sync.RWMutex
+	notificationMonitors   map[string]*NotificationMonitor
+	notificationMonitorsMu sync.RWMutex
+	stats                  GlobalStats
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
+	logger                 *Logger
 }
 
-// DatabaseManager manages connections for a specific database
+// DatabaseManager manages connections for a specific database with specific user credentials
 type DatabaseManager struct {
-	config         DatabaseConfig
-	wildcardTarget *WildcardTarget
-	backendPool    chan *BackendConnection
-	healthChecker  *HealthChecker
-	stats          DatabaseStats
-	lastUsed       time.Time
-	isStatic       bool
-	mu             sync.RWMutex
-}
+	config      DatabaseConfig
+	target      *Target // Reference to the target this manager belongs to
+	backendPool chan *BackendConnection
+	stats       DatabaseStats
 
-// DatabaseDiscoveryInfo contains cached database discovery information
-type DatabaseDiscoveryInfo struct {
-	DatabaseName string
-	Exists       bool
-	Owner        string
-	Size         int64
-	LastChecked  time.Time
-	Target       *WildcardTarget
+	// Client credentials - required for all database managers
+	username string
+	password string
+
+	mu sync.RWMutex
 }
 
 // GlobalStats contains global pooler statistics
 type GlobalStats struct {
-	TotalClients        int64
-	ActiveClients       int64
-	StaticDatabases     int64
-	DynamicDatabases    int64
-	HealthyDatabases    int64
-	TotalQueries        int64
-	NotificationsSent   int64
-	DatabasesDiscovered int64
-	DatabasesCreated    int64
-	DatabasesRemoved    int64
-
-	ActiveWorkers  int64
-	QueuedTasks    int64
-	CompletedTasks int64
+	TotalClients          int64
+	ActiveClients         int64
+	TotalDatabases        int64 // Total unique (target, database, user) combinations
+	TotalQueries          int64
+	NotificationsSent     int64
+	IdleConnectionsClosed int64
 }
 
 // DatabaseStats contains per-database statistics
@@ -82,16 +71,18 @@ type DatabaseStats struct {
 	BytesSent         int64
 }
 
-func (p *WildcardPooler) initializeWorkerPool() {
-	workerCount := p.config.Server.WorkerPoolSize
-	queueSize := p.config.Server.TaskQueueSize
-
-	p.workerPool = NewWorkerPool(p, workerCount, queueSize)
-	p.workerPool.Start()
-
-	p.logger.Info("Initialized worker pool",
-		"worker_count", workerCount,
-		"queue_size", queueSize)
+// DatabaseConfig is used internally to configure a database manager
+type DatabaseConfig struct {
+	Name           string
+	Host           string
+	Port           int
+	User           string
+	Password       string
+	SSLMode        string
+	SSLCAFile      string
+	MaxConnections int
+	ConnectTimeout time.Duration
+	Parameters     map[string]string
 }
 
 // NewWildcardPooler creates a new wildcard pooler
@@ -104,43 +95,26 @@ func NewWildcardPooler(config Config, logger *Logger) (*WildcardPooler, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	pooler := &WildcardPooler{
-		config:           config,
-		listener:         listener,
-		staticDatabases:  make(map[string]*DatabaseManager),
-		dynamicDatabases: make(map[string]*DatabaseManager),
-		clients:          make(map[net.Conn]*ClientConnection),
-		listeners:        make(map[string]map[*ClientConnection]bool),
-		discoveryCache:   make(map[string]*DatabaseDiscoveryInfo),
-		ctx:              ctx,
-		cancel:           cancel,
-		logger:           logger,
+		config:        config,
+		listener:      listener,
+		targets:       make(map[string]map[string]map[string]*DatabaseManager),
+		targetConfigs: make([]*Target, 0, len(config.Targets)),
+		clients:       make(map[net.Conn]*ClientConnection),
+		listeners:     make(map[string]map[*ClientConnection]bool),
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        logger,
 	}
 
-	// Initialize wildcard targets
-	for i := range config.WildcardTargets {
-		pooler.wildcardTargets = append(pooler.wildcardTargets, &config.WildcardTargets[i])
+	// Initialize target references
+	for i := range config.Targets {
+		pooler.targetConfigs = append(pooler.targetConfigs, &config.Targets[i])
 	}
 
-	// Initialize static databases
-	for name, dbConfig := range config.Databases {
-		if err := pooler.addStaticDatabase(name, dbConfig); err != nil {
-			logger.WithError(err).Warn("Failed to initialize static database", "database", name)
-			continue
-		}
-	}
-
-	pooler.initializeWorkerPool()
-
-	// Start database discovery if enabled
-	if config.AutoDiscovery.Enabled && !config.AutoDiscovery.CreatePoolsOnDemand {
+	// Start idle connection cleanup worker
+	if config.Server.IdleTimeout > 0 {
 		pooler.wg.Add(1)
-		go pooler.databaseDiscoveryWorker()
-	}
-
-	// Start cleanup worker for unused pools
-	if config.AutoDiscovery.RemoveUnusedPools {
-		pooler.wg.Add(1)
-		go pooler.cleanupUnusedPoolsWorker()
+		go pooler.idleConnectionCleanupWorker()
 	}
 
 	// Start metrics server if enabled
@@ -156,10 +130,7 @@ func NewWildcardPooler(config Config, logger *Logger) (*WildcardPooler, error) {
 func (p *WildcardPooler) Start(ctx context.Context) error {
 	p.logger.Info("PostgreSQL connection pooler starting",
 		"listen_addr", p.config.Server.ListenAddr,
-		"static_databases", len(p.staticDatabases),
-		"wildcard_targets", len(p.wildcardTargets),
-		"auto_discovery", p.config.AutoDiscovery.Enabled,
-		"on_demand_pools", p.config.AutoDiscovery.CreatePoolsOnDemand)
+		"targets", len(p.targetConfigs))
 
 	for {
 		select {
@@ -194,12 +165,19 @@ func (p *WildcardPooler) shutdown() error {
 		p.listener.Close()
 	}
 
-	if p.workerPool != nil {
-		p.workerPool.Stop()
-	}
-
 	// Cancel all background workers
 	p.cancel()
+
+	// Stop all notification monitors FIRST (before closing clients)
+	// This ensures no new notifications are being processed
+	p.logger.Info("Stopping notification monitors")
+	p.notificationMonitorsMu.Lock()
+	for key, monitor := range p.notificationMonitors {
+		p.logger.Debug("Stopping notification monitor", "key", key)
+		monitor.Stop()
+	}
+	p.notificationMonitors = nil
+	p.notificationMonitorsMu.Unlock()
 
 	// Close all client connections
 	p.clientsMu.Lock()
@@ -209,14 +187,15 @@ func (p *WildcardPooler) shutdown() error {
 	p.clientsMu.Unlock()
 
 	// Close all database managers
-	p.databasesMu.Lock()
-	for _, dbManager := range p.staticDatabases {
-		p.closeDatabaseManager(dbManager)
+	p.targetsMu.Lock()
+	for _, targetMap := range p.targets {
+		for _, dbMap := range targetMap {
+			for _, manager := range dbMap {
+				p.closeDatabaseManager(manager)
+			}
+		}
 	}
-	for _, dbManager := range p.dynamicDatabases {
-		p.closeDatabaseManager(dbManager)
-	}
-	p.databasesMu.Unlock()
+	p.targetsMu.Unlock()
 
 	// Wait for all goroutines to finish
 	done := make(chan struct{})
@@ -238,10 +217,6 @@ func (p *WildcardPooler) shutdown() error {
 
 // closeDatabaseManager closes a database manager and its connections
 func (p *WildcardPooler) closeDatabaseManager(dbManager *DatabaseManager) {
-	if dbManager.healthChecker != nil {
-		dbManager.healthChecker.Stop()
-	}
-
 	// Close all backend connections
 	close(dbManager.backendPool)
 	for conn := range dbManager.backendPool {
@@ -287,6 +262,9 @@ func (p *WildcardPooler) handleClient(conn net.Conn) {
 				}
 			}
 		}
+
+		// Remove client from notification monitors
+		p.cleanupClientFromNotificationMonitors(client)
 	}()
 
 	if err := p.handleStartupMessage(client); err != nil {
@@ -309,61 +287,60 @@ func (p *WildcardPooler) handleClient(conn net.Conn) {
 	}
 }
 
-// addStaticDatabase adds a statically configured database
-func (p *WildcardPooler) addStaticDatabase(name string, config DatabaseConfig) error {
-	config.Name = name
-	dbManager := &DatabaseManager{
-		config:      config,
-		isStatic:    true,
-		lastUsed:    time.Now(),
-		backendPool: make(chan *BackendConnection, config.MaxConnections),
-	}
-
-	if err := dbManager.initializeConnections(); err != nil {
-		return fmt.Errorf("failed to initialize connections for %s: %w", name, err)
-	}
-
-	if config.HealthCheck.Enabled {
-		healthChecker, err := NewHealthChecker(config, p.logger.WithDatabase(name))
-		if err != nil {
-			p.logger.WithError(err).Warn("Failed to create health checker", "database", name)
-		} else {
-			dbManager.healthChecker = healthChecker
-			go healthChecker.Start(p.ctx)
-		}
-	}
-
-	p.databasesMu.Lock()
-	p.staticDatabases[name] = dbManager
-	p.databasesMu.Unlock()
-
-	atomic.AddInt64(&p.stats.StaticDatabases, 1)
-	p.logger.Info("Added static database", "database", name, "host", config.Host, "port", config.Port)
-	return nil
-}
-
 // Stats returns current pooler statistics
 func (p *WildcardPooler) Stats() GlobalStats {
 	stats := GlobalStats{
-		TotalClients:        atomic.LoadInt64(&p.stats.TotalClients),
-		ActiveClients:       atomic.LoadInt64(&p.stats.ActiveClients),
-		StaticDatabases:     atomic.LoadInt64(&p.stats.StaticDatabases),
-		DynamicDatabases:    atomic.LoadInt64(&p.stats.DynamicDatabases),
-		HealthyDatabases:    atomic.LoadInt64(&p.stats.HealthyDatabases),
-		TotalQueries:        atomic.LoadInt64(&p.stats.TotalQueries),
-		NotificationsSent:   atomic.LoadInt64(&p.stats.NotificationsSent),
-		DatabasesDiscovered: atomic.LoadInt64(&p.stats.DatabasesDiscovered),
-		DatabasesCreated:    atomic.LoadInt64(&p.stats.DatabasesCreated),
-		DatabasesRemoved:    atomic.LoadInt64(&p.stats.DatabasesRemoved),
-	}
-
-	if p.workerPool != nil {
-		stats.ActiveWorkers = int64(p.workerPool.workerCount)
-		stats.QueuedTasks = int64(len(p.workerPool.taskQueue))
-		stats.CompletedTasks = atomic.LoadInt64(&p.workerPool.completedTasks)
+		TotalClients:          atomic.LoadInt64(&p.stats.TotalClients),
+		ActiveClients:         atomic.LoadInt64(&p.stats.ActiveClients),
+		TotalDatabases:        atomic.LoadInt64(&p.stats.TotalDatabases),
+		TotalQueries:          atomic.LoadInt64(&p.stats.TotalQueries),
+		NotificationsSent:     atomic.LoadInt64(&p.stats.NotificationsSent),
+		IdleConnectionsClosed: atomic.LoadInt64(&p.stats.IdleConnectionsClosed),
 	}
 
 	return stats
+}
+
+// getSortedTargets returns targets sorted by priority
+func (p *WildcardPooler) getSortedTargets() []*Target {
+	sorted := make([]*Target, len(p.targetConfigs))
+	copy(sorted, p.targetConfigs)
+
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Priority == sorted[j].Priority {
+			// Same priority, sort by name for consistency
+			return sorted[i].Name < sorted[j].Name
+		}
+		return sorted[i].Priority < sorted[j].Priority
+	})
+
+	return sorted
+}
+
+// targetServesDatabase checks if a target serves a specific database
+func (p *WildcardPooler) targetServesDatabase(target *Target, dbName string) bool {
+	// Check include list (if specified, only these databases are allowed)
+	if len(target.IncludeDatabases) > 0 {
+		found := false
+		for _, included := range target.IncludeDatabases {
+			if included == dbName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	// Check target-level exclude list
+	for _, excluded := range target.ExcludeDatabases {
+		if excluded == dbName {
+			return false
+		}
+	}
+
+	return true
 }
 
 // cleanupClientListeners removes a client from all listener registrations
@@ -392,18 +369,25 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	// Find the appropriate database manager
 	var dbManager *DatabaseManager
 
-	p.databasesMu.RLock()
-	// Check static databases first
-	if manager, exists := p.staticDatabases[conn.dbName]; exists {
-		dbManager = manager
-	} else {
-		// Check dynamic databases
-		key := fmt.Sprintf("%s:%s", conn.targetName, conn.dbName)
-		if manager, exists := p.dynamicDatabases[key]; exists {
-			dbManager = manager
+	p.targetsMu.RLock()
+	for _, targetMap := range p.targets {
+		for _, dbMap := range targetMap {
+			for _, manager := range dbMap {
+				// Check if this manager owns this connection
+				if manager.config.Name == conn.dbName {
+					dbManager = manager
+					break
+				}
+			}
+			if dbManager != nil {
+				break
+			}
+		}
+		if dbManager != nil {
+			break
 		}
 	}
-	p.databasesMu.RUnlock()
+	p.targetsMu.RUnlock()
 
 	if dbManager == nil {
 		logger.Warn("No database manager found for connection, closing",
@@ -416,7 +400,7 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	isListening := conn.isListening
 	conn.inUse = false
 	conn.lastUsedAt = time.Now()
-	conn.clientRef = nil // Clear client reference
+	conn.clientRef = nil
 	conn.mu.Unlock()
 
 	if isListening {
@@ -434,33 +418,264 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 		atomic.AddInt64(&dbManager.stats.ActiveConnections, -1)
 		atomic.AddInt64(&dbManager.stats.IdleConnections, 1)
 		logger.Debug("Successfully returned connection to pool",
-			"db", conn.dbName,
-			"pool_size", len(dbManager.backendPool),
-			"total_connections", atomic.LoadInt64(&dbManager.stats.TotalConnections),
-			"active_connections", atomic.LoadInt64(&dbManager.stats.ActiveConnections),
-			"idle_connections", atomic.LoadInt64(&dbManager.stats.IdleConnections))
+			"db", conn.dbName)
 	default:
 		// Pool is full, close the connection
 		logger.Debug("Pool full, closing connection",
-			"db", conn.dbName,
-			"pool_capacity", cap(dbManager.backendPool),
-			"pool_size", len(dbManager.backendPool))
+			"db", conn.dbName)
 		conn.Close()
 		atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
 		atomic.AddInt64(&dbManager.stats.ActiveConnections, -1)
 	}
 }
 
-// startMetricsServer starts the metrics HTTP server
+// startMetricsServer starts the web server
 func (p *WildcardPooler) startMetricsServer() {
 	defer p.wg.Done()
 
 	addr := fmt.Sprintf(":%d", p.config.Metrics.Port)
-	server := NewMetricsServer(p, addr, p.config.Metrics.Path, p.logger)
+	server := NewWebServer(p, addr, p.logger)
 
-	p.logger.Info("Starting metrics server", "addr", addr, "path", p.config.Metrics.Path)
+	p.logger.Info("Starting web server", "addr", addr)
 
 	if err := server.Start(p.ctx); err != nil {
-		p.logger.WithError(err).Error("Metrics server failed")
+		p.logger.WithError(err).Error("Web server failed")
+	}
+}
+
+// isSSLSupported checks if SSL is supported by any configured target
+func (p *WildcardPooler) isSSLSupported() bool {
+	// Check all targets
+	for _, target := range p.targetConfigs {
+		if target.SSLMode != "disable" {
+			return true
+		}
+	}
+	return false
+}
+
+// upgradeToTLS upgrades a client connection to TLS
+func (p *WildcardPooler) upgradeToTLS(client *ClientConnection) error {
+	// Load TLS configuration from config
+	if p.config.Server.SSLCertFile == "" || p.config.Server.SSLKeyFile == "" {
+		return fmt.Errorf("SSL certificate or key file not configured")
+	}
+
+	cert, err := tls.LoadX509KeyPair(p.config.Server.SSLCertFile, p.config.Server.SSLKeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load SSL certificate: %w", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	// Wrap the connection with TLS
+	tlsConn := tls.Server(client.conn, tlsConfig)
+
+	// Perform TLS handshake
+	if err := tlsConn.Handshake(); err != nil {
+		return fmt.Errorf("TLS handshake failed: %w", err)
+	}
+
+	p.logger.Debug("TLS connection established", "client", client.RemoteAddr())
+
+	// Replace the connection, reader, and writer
+	client.mu.Lock()
+	client.conn = tlsConn
+	client.reader = bufio.NewReader(tlsConn)
+	client.writer = bufio.NewWriter(tlsConn)
+	client.mu.Unlock()
+
+	return nil
+}
+
+// idleConnectionCleanupWorker periodically removes idle connections from pools
+func (p *WildcardPooler) idleConnectionCleanupWorker() {
+	defer p.wg.Done()
+
+	logger := p.logger.WithField("component", "idle_cleanup")
+	logger.Info("Starting idle connection cleanup worker", "idle_timeout", p.config.Server.IdleTimeout)
+
+	// Run cleanup every 1/4 of the idle timeout period
+	interval := p.config.Server.IdleTimeout / 4
+	if interval < 30*time.Second {
+		interval = 30 * time.Second // Minimum 30 second interval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			logger.Info("Idle connection cleanup worker stopping")
+			return
+		case <-ticker.C:
+			p.cleanupIdleConnections()
+		}
+	}
+}
+
+// cleanupIdleConnections removes idle connections from all database pools
+func (p *WildcardPooler) cleanupIdleConnections() {
+	logger := p.logger.WithField("component", "idle_cleanup")
+	cutoff := time.Now().Add(-p.config.Server.IdleTimeout)
+
+	totalCleaned := 0
+
+	p.targetsMu.RLock()
+	defer p.targetsMu.RUnlock()
+
+	// Iterate through all targets -> databases -> users
+	for targetName, targetMap := range p.targets {
+		for dbName, dbMap := range targetMap {
+			for userName, dbManager := range dbMap {
+				key := fmt.Sprintf("%s/%s/%s", targetName, dbName, userName)
+				cleaned := p.cleanupDatabasePool(dbManager, key, cutoff)
+				totalCleaned += cleaned
+			}
+		}
+	}
+
+	if totalCleaned > 0 {
+		logger.Info("Idle connection cleanup completed", "connections_closed", totalCleaned)
+	} else {
+		logger.Debug("Idle connection cleanup completed", "connections_closed", 0)
+	}
+}
+
+// cleanupDatabasePool cleans up idle connections from a specific database pool
+func (p *WildcardPooler) cleanupDatabasePool(dbManager *DatabaseManager, poolKey string, cutoff time.Time) int {
+	logger := p.logger.WithField("pool_key", poolKey)
+
+	// Get minimum connections from target config (default to 0 if not set)
+	minConnections := 0
+	if dbManager.target != nil {
+		// You might want to add a MinConnectionsPerDB field to Target struct
+		// For now, we'll keep a minimum of 1 connection per pool
+		minConnections = 1
+	}
+
+	currentTotal := atomic.LoadInt64(&dbManager.stats.TotalConnections)
+
+	if currentTotal <= int64(minConnections) {
+		logger.Debug("Skipping cleanup - at or below minimum connections",
+			"current", currentTotal,
+			"min", minConnections)
+		return 0
+	}
+
+	cleaned := 0
+	poolSize := len(dbManager.backendPool)
+
+	logger.Debug("Checking pool for idle connections",
+		"pool_size", poolSize,
+		"total_connections", currentTotal,
+		"idle_timeout", p.config.Server.IdleTimeout)
+
+	// Check connections in the pool (idle ones)
+	// We can't check all at once, so we'll check a limited number per cycle
+	maxChecks := poolSize
+	if maxChecks > 10 {
+		maxChecks = 10 // Check at most 10 connections per cleanup cycle
+	}
+
+	for i := 0; i < maxChecks; i++ {
+		select {
+		case conn := <-dbManager.backendPool:
+			lastUsed := conn.LastUsedAt()
+
+			// Check if connection is idle for too long
+			if lastUsed.Before(cutoff) && currentTotal > int64(minConnections) {
+				logger.Debug("Closing idle connection",
+					"last_used", lastUsed,
+					"idle_duration", time.Since(lastUsed),
+					"backend_addr", conn.RemoteAddr())
+
+				conn.Close()
+				atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
+				atomic.AddInt64(&dbManager.stats.IdleConnections, -1)
+				atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
+				currentTotal--
+				cleaned++
+			} else {
+				// Connection is not idle or we're at minimum, put it back
+				select {
+				case dbManager.backendPool <- conn:
+					// Successfully returned to pool
+				default:
+					// Pool is full (shouldn't happen), close the connection
+					logger.Warn("Pool full when returning connection, closing")
+					conn.Close()
+					atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
+					atomic.AddInt64(&dbManager.stats.IdleConnections, -1)
+					atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
+					currentTotal--
+					cleaned++
+				}
+			}
+		default:
+			// No more connections in pool to check
+			return cleaned
+		}
+	}
+
+	if cleaned > 0 {
+		logger.Info("Cleaned up idle connections",
+			"closed", cleaned,
+			"remaining_total", atomic.LoadInt64(&dbManager.stats.TotalConnections),
+			"remaining_idle", atomic.LoadInt64(&dbManager.stats.IdleConnections))
+	}
+
+	return cleaned
+}
+
+// getOrCreateNotificationMonitor gets or creates a notification monitor
+func (p *WildcardPooler) getOrCreateNotificationMonitor(dbName, userName string) (*NotificationMonitor, error) {
+	key := fmt.Sprintf("%s:%s", dbName, userName)
+
+	p.notificationMonitorsMu.RLock()
+	monitor, exists := p.notificationMonitors[key]
+	p.notificationMonitorsMu.RUnlock()
+
+	if exists {
+		return monitor, nil
+	}
+
+	p.notificationMonitorsMu.Lock()
+	defer p.notificationMonitorsMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if monitor, exists := p.notificationMonitors[key]; exists {
+		return monitor, nil
+	}
+
+	// Create new monitor
+	monitor = NewNotificationMonitor(p, dbName, userName)
+	if err := monitor.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start notification monitor: %w", err)
+	}
+
+	if p.notificationMonitors == nil {
+		p.notificationMonitors = make(map[string]*NotificationMonitor)
+	}
+	p.notificationMonitors[key] = monitor
+
+	p.logger.Info("Created notification monitor", "key", key)
+
+	return monitor, nil
+}
+
+func (p *WildcardPooler) cleanupClientFromNotificationMonitors(client *ClientConnection) {
+	key := fmt.Sprintf("%s:%s", client.GetDatabase(), client.GetUser())
+
+	p.notificationMonitorsMu.RLock()
+	monitor, exists := p.notificationMonitors[key]
+	p.notificationMonitorsMu.RUnlock()
+
+	if exists {
+		monitor.RemoveClient(client)
 	}
 }

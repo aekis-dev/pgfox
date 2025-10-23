@@ -18,9 +18,9 @@ type ClientConnection struct {
 	authenticated  bool
 	database       string
 	user           string
+	password       string
 	inTransaction  bool
 	isListening    bool
-	sessionMode    bool // Track if this client is in session mode
 	listenChannels map[string]bool
 	logger         *Logger
 	mu             sync.Mutex
@@ -106,6 +106,20 @@ func (c *ClientConnection) SetUser(user string) {
 	c.user = user
 }
 
+// SetPassword stores the client's password (for backend authentication)
+func (c *ClientConnection) SetPassword(password string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.password = password
+}
+
+// GetPassword returns the client's password
+func (c *ClientConnection) GetPassword() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.password
+}
+
 // IsInTransaction returns whether the client is in a transaction
 func (c *ClientConnection) IsInTransaction() bool {
 	c.mu.Lock()
@@ -125,23 +139,6 @@ func (c *ClientConnection) SetInTransaction(inTx bool) {
 		c.logger.Debug("Client entered transaction")
 	} else {
 		c.logger.Debug("Client exited transaction")
-	}
-}
-
-// IsSessionMode returns whether the client is in session mode
-func (c *ClientConnection) IsSessionMode() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.sessionMode
-}
-
-// SetSessionMode sets the session mode
-func (c *ClientConnection) SetSessionMode(sessionMode bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.sessionMode = sessionMode
-	if sessionMode {
-		c.logger.Debug("Client set to session mode")
 	}
 }
 
@@ -229,8 +226,8 @@ func (c *ClientConnection) ShouldKeepBackendConnection() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Keep connection if in session mode, transaction, or listening
-	return c.sessionMode || c.inTransaction || c.isListening
+	// Keep connection if in transaction or listening
+	return c.inTransaction || c.isListening
 }
 
 // WriteMessage writes a message to the client
@@ -326,51 +323,6 @@ func (c *ClientConnection) GetLastActivity() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lastActivity
-}
-
-// GetConnectionDuration returns how long the client has been connected
-func (c *ClientConnection) GetConnectionDuration() time.Duration {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return time.Since(c.connectedAt)
-}
-
-// GetIdleDuration returns how long the client has been idle
-func (c *ClientConnection) GetIdleDuration() time.Duration {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return time.Since(c.lastActivity)
-}
-
-// GetConnectionInfo returns connection information for debugging
-func (c *ClientConnection) GetConnectionInfo() map[string]interface{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	info := map[string]interface{}{
-		"remote_addr":         c.conn.RemoteAddr().String(),
-		"database":            c.database,
-		"user":                c.user,
-		"authenticated":       c.authenticated,
-		"in_transaction":      c.inTransaction,
-		"is_listening":        c.isListening,
-		"session_mode":        c.sessionMode,
-		"connected_at":        c.connectedAt,
-		"last_activity":       c.lastActivity,
-		"connection_duration": time.Since(c.connectedAt),
-		"idle_duration":       time.Since(c.lastActivity),
-		"listen_channels":     len(c.listenChannels),
-	}
-
-	if c.backendConn != nil {
-		info["has_backend"] = true
-		info["backend_addr"] = c.backendConn.RemoteAddr().String()
-		info["backend_db"] = c.backendConn.GetDatabase()
-	} else {
-		info["has_backend"] = false
-	}
-
-	return info
 }
 
 // Logger returns the client's logger

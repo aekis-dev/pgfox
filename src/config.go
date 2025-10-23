@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,98 +10,44 @@ import (
 
 // Config represents the main configuration structure
 type Config struct {
-	Server          ServerConfig              `yaml:"server"`
-	Databases       map[string]DatabaseConfig `yaml:"databases"`
-	WildcardTargets []WildcardTarget          `yaml:"wildcard_targets"`
-	AutoDiscovery   AutoDiscoveryConfig       `yaml:"auto_discovery"`
-	Logging         LoggingConfig             `yaml:"logging"`
-	Metrics         MetricsConfig             `yaml:"metrics"`
+	Server  ServerConfig  `yaml:"server"`
+	Targets []Target      `yaml:"targets"`
+	Logging LoggingConfig `yaml:"logging"`
+	Metrics MetricsConfig `yaml:"metrics"`
 }
 
 // ServerConfig contains server-level configuration
 type ServerConfig struct {
-	ListenAddr        string        `yaml:"listen_addr"`
-	MaxConnections    int           `yaml:"max_connections"`
-	DefaultPoolMode   string        `yaml:"default_pool_mode"`
-	ConnectionTimeout time.Duration `yaml:"connection_timeout"`
-	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+	ListenAddr     string        `yaml:"listen_addr"`
+	MaxConnections int           `yaml:"max_connections"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
+	IdleTimeout    time.Duration `yaml:"idle_timeout"`
 
-	WorkerPoolSize int           `yaml:"worker_pool_size"` // Number of worker goroutines (0 = auto)
-	TaskQueueSize  int           `yaml:"task_queue_size"`  // Size of task queue buffer (0 = auto)
-	QueryTimeout   time.Duration `yaml:"query_timeout"`    // Timeout for individual queries
+	// SSL Configuration
+	SSLCertFile string `yaml:"ssl_cert_file"`
+	SSLKeyFile  string `yaml:"ssl_key_file"`
+	SSLCAFile   string `yaml:"ssl_ca_file"`
 }
 
-// DatabaseConfig contains database-specific configuration
-type DatabaseConfig struct {
+// Target represents a PostgreSQL server that can serve one or more databases
+// If IncludeDatabases is specified, only those databases are accessible
+// If IncludeDatabases is empty, all databases are accessible (wildcard mode)
+type Target struct {
 	Name           string            `yaml:"name"`
 	Host           string            `yaml:"host"`
 	Port           int               `yaml:"port"`
-	User           string            `yaml:"user"`
-	Password       string            `yaml:"password"`
 	SSLMode        string            `yaml:"ssl_mode"`
+	SSLCAFile      string            `yaml:"ssl_ca_file"`
 	MaxConnections int               `yaml:"max_connections"`
-	MinConnections int               `yaml:"min_connections"`
-	PoolMode       string            `yaml:"pool_mode"`
 	ConnectTimeout time.Duration     `yaml:"connect_timeout"`
 	Parameters     map[string]string `yaml:"parameters"`
-	HealthCheck    HealthCheckConfig `yaml:"health_check"`
-}
 
-// WildcardTarget defines a PostgreSQL server that can serve any database
-type WildcardTarget struct {
-	Name                string               `yaml:"name"`
-	Host                string               `yaml:"host"`
-	Port                int                  `yaml:"port"`
-	AdminUser           string               `yaml:"admin_user"`
-	AdminPassword       string               `yaml:"admin_password"`
-	DefaultUser         string               `yaml:"default_user"`
-	DefaultPassword     string               `yaml:"default_password"`
-	SSLMode             string               `yaml:"ssl_mode"`
-	MaxConnectionsPerDB int                  `yaml:"max_connections_per_db"`
-	MinConnectionsPerDB int                  `yaml:"min_connections_per_db"`
-	PoolMode            string               `yaml:"pool_mode"`
-	ConnectTimeout      time.Duration        `yaml:"connect_timeout"`
-	Parameters          map[string]string    `yaml:"parameters"`
-	HealthCheck         HealthCheckConfig    `yaml:"health_check"`
-	UserMappings        []UserMappingRule    `yaml:"user_mappings"`
-	DatabaseFilters     DatabaseFilterConfig `yaml:"database_filters"`
-	Priority            int                  `yaml:"priority"`
-}
+	// Database filtering (both optional)
+	IncludeDatabases []string `yaml:"include_databases"` // If specified, ONLY these databases
+	ExcludeDatabases []string `yaml:"exclude_databases"` // Exclude these databases
 
-// UserMappingRule defines how to map client users to database users
-type UserMappingRule struct {
-	ClientUser     string `yaml:"client_user"`
-	DatabaseUser   string `yaml:"database_user"`
-	DatabasePass   string `yaml:"database_password"`
-	DatabaseFilter string `yaml:"database_filter"`
-}
-
-// DatabaseFilterConfig defines which databases to include/exclude
-type DatabaseFilterConfig struct {
-	IncludePatterns  []string `yaml:"include_patterns"`
-	ExcludePatterns  []string `yaml:"exclude_patterns"`
-	ExcludeDatabases []string `yaml:"exclude_databases"`
-	IncludeDatabases []string `yaml:"include_databases"`
-}
-
-// AutoDiscoveryConfig contains auto-discovery configuration
-type AutoDiscoveryConfig struct {
-	Enabled               bool          `yaml:"enabled"`
-	DatabaseQueryInterval time.Duration `yaml:"database_query_interval"`
-	CreatePoolsOnDemand   bool          `yaml:"create_pools_on_demand"`
-	RemoveUnusedPools     bool          `yaml:"remove_unused_pools"`
-	UnusedPoolTimeout     time.Duration `yaml:"unused_pool_timeout"`
-	DiscoveryQuery        string        `yaml:"discovery_query"`
-	CacheDiscoveredDBs    bool          `yaml:"cache_discovered_dbs"`
-	CacheTTL              time.Duration `yaml:"cache_ttl"`
-}
-
-// HealthCheckConfig contains health check settings
-type HealthCheckConfig struct {
-	Enabled  bool          `yaml:"enabled"`
-	Interval time.Duration `yaml:"interval"`
-	Timeout  time.Duration `yaml:"timeout"`
-	Query    string        `yaml:"query"`
+	// Priority for multi-target scenarios (lower = higher priority)
+	Priority int `yaml:"priority"`
 }
 
 // LoggingConfig contains logging configuration
@@ -156,116 +101,32 @@ func (c *Config) setDefaults() error {
 	if c.Server.MaxConnections == 0 {
 		c.Server.MaxConnections = 100
 	}
-	if c.Server.DefaultPoolMode == "" {
-		c.Server.DefaultPoolMode = "transaction"
-	}
-	if c.Server.ConnectionTimeout == 0 {
-		c.Server.ConnectionTimeout = 30 * time.Second
+	if c.Server.ConnectTimeout == 0 {
+		c.Server.ConnectTimeout = 10 * time.Second
 	}
 	if c.Server.IdleTimeout == 0 {
 		c.Server.IdleTimeout = 10 * time.Minute
 	}
-	// Worker pool defaults
-	if c.Server.WorkerPoolSize == 0 {
-		// Auto-calculate: 1 worker per 20 max connections
-		c.Server.WorkerPoolSize = c.Server.MaxConnections / 20
-		if c.Server.WorkerPoolSize < 10 {
-			c.Server.WorkerPoolSize = 10 // Minimum 10 workers
-		}
-		if c.Server.WorkerPoolSize > 100 {
-			c.Server.WorkerPoolSize = 100 // Maximum 100 workers
-		}
-	}
-	if c.Server.TaskQueueSize == 0 {
-		// Auto-calculate: 4 tasks per worker
-		c.Server.TaskQueueSize = c.Server.WorkerPoolSize * 4
-	}
-	if c.Server.QueryTimeout == 0 {
-		c.Server.QueryTimeout = 60 * time.Second
-	}
 
-	// Auto discovery defaults
-	if c.AutoDiscovery.DatabaseQueryInterval == 0 {
-		c.AutoDiscovery.DatabaseQueryInterval = 60 * time.Second
-	}
-	if c.AutoDiscovery.UnusedPoolTimeout == 0 {
-		c.AutoDiscovery.UnusedPoolTimeout = 30 * time.Minute
-	}
-	if c.AutoDiscovery.DiscoveryQuery == "" {
-		c.AutoDiscovery.DiscoveryQuery = `
-			SELECT datname, pg_database_size(datname) as size, 
-			       pg_get_userbyid(datdba) as owner
-			FROM pg_database 
-			WHERE datallowconn = true 
-			  AND datname NOT IN ('template0', 'template1')
-		`
-	}
-	if c.AutoDiscovery.CacheTTL == 0 {
-		c.AutoDiscovery.CacheTTL = 5 * time.Minute
-	}
-
-	// Wildcard target defaults
-	for i := range c.WildcardTargets {
-		target := &c.WildcardTargets[i]
+	// Target defaults
+	for i := range c.Targets {
+		target := &c.Targets[i]
 		if target.Port == 0 {
 			target.Port = 5432
 		}
-		if target.MaxConnectionsPerDB == 0 {
-			target.MaxConnectionsPerDB = 20
-		}
-		if target.MinConnectionsPerDB == 0 {
-			target.MinConnectionsPerDB = 2
-		}
-		if target.PoolMode == "" {
-			target.PoolMode = c.Server.DefaultPoolMode
+		if target.MaxConnections == 0 {
+			target.MaxConnections = 20
 		}
 		if target.ConnectTimeout == 0 {
-			target.ConnectTimeout = 10 * time.Second
+			target.ConnectTimeout = c.Server.ConnectTimeout
 		}
 		if target.SSLMode == "" {
 			target.SSLMode = "prefer"
 		}
-		if target.HealthCheck.Interval == 0 {
-			target.HealthCheck.Interval = 30 * time.Second
+		// Default exclude databases
+		if len(target.ExcludeDatabases) == 0 && len(target.IncludeDatabases) == 0 {
+			target.ExcludeDatabases = []string{"template0", "template1"}
 		}
-		if target.HealthCheck.Timeout == 0 {
-			target.HealthCheck.Timeout = 5 * time.Second
-		}
-		if target.HealthCheck.Query == "" {
-			target.HealthCheck.Query = "SELECT 1"
-		}
-	}
-
-	// Static database defaults
-	for name, db := range c.Databases {
-		if db.Port == 0 {
-			db.Port = 5432
-		}
-		if db.MaxConnections == 0 {
-			db.MaxConnections = 20
-		}
-		if db.MinConnections == 0 {
-			db.MinConnections = 2
-		}
-		if db.PoolMode == "" {
-			db.PoolMode = c.Server.DefaultPoolMode
-		}
-		if db.ConnectTimeout == 0 {
-			db.ConnectTimeout = 10 * time.Second
-		}
-		if db.SSLMode == "" {
-			db.SSLMode = "prefer"
-		}
-		if db.HealthCheck.Interval == 0 {
-			db.HealthCheck.Interval = 30 * time.Second
-		}
-		if db.HealthCheck.Timeout == 0 {
-			db.HealthCheck.Timeout = 5 * time.Second
-		}
-		if db.HealthCheck.Query == "" {
-			db.HealthCheck.Query = "SELECT 1"
-		}
-		c.Databases[name] = db
 	}
 
 	// Logging defaults
@@ -278,7 +139,7 @@ func (c *Config) setDefaults() error {
 
 	// Metrics defaults
 	if c.Metrics.Port == 0 {
-		c.Metrics.Port = 9090
+		c.Metrics.Port = 4502
 	}
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -289,59 +150,25 @@ func (c *Config) setDefaults() error {
 
 // validate validates the configuration
 func (c *Config) validate() error {
-	if len(c.Databases) == 0 && len(c.WildcardTargets) == 0 {
-		return fmt.Errorf("no databases or wildcard targets configured")
+	if len(c.Targets) == 0 {
+		return fmt.Errorf("no targets configured")
 	}
 
-	validPoolModes := map[string]bool{
-		"session":     true,
-		"transaction": true,
-		"statement":   true,
-	}
-
-	if !validPoolModes[c.Server.DefaultPoolMode] {
-		return fmt.Errorf("invalid default pool mode: %s", c.Server.DefaultPoolMode)
-	}
-
-	// Validate wildcard targets
-	for i, target := range c.WildcardTargets {
+	// Validate targets
+	targetNames := make(map[string]bool)
+	for i, target := range c.Targets {
 		if target.Name == "" {
-			return fmt.Errorf("wildcard_targets[%d]: name is required", i)
+			return fmt.Errorf("targets[%d]: name is required", i)
 		}
 		if target.Host == "" {
-			return fmt.Errorf("wildcard_targets[%d]: host is required", i)
-		}
-		if target.AdminUser == "" {
-			return fmt.Errorf("wildcard_targets[%d]: admin_user is required for database discovery", i)
-		}
-		if !validPoolModes[target.PoolMode] {
-			return fmt.Errorf("wildcard_targets[%d]: invalid pool mode: %s", i, target.PoolMode)
+			return fmt.Errorf("targets[%d]: host is required", i)
 		}
 
-		// Validate regex patterns
-		for _, pattern := range target.DatabaseFilters.IncludePatterns {
-			if _, err := regexp.Compile(pattern); err != nil {
-				return fmt.Errorf("wildcard_targets[%d]: invalid include pattern %s: %w", i, pattern, err)
-			}
+		// Check for duplicate names
+		if targetNames[target.Name] {
+			return fmt.Errorf("targets[%d]: duplicate target name: %s", i, target.Name)
 		}
-		for _, pattern := range target.DatabaseFilters.ExcludePatterns {
-			if _, err := regexp.Compile(pattern); err != nil {
-				return fmt.Errorf("wildcard_targets[%d]: invalid exclude pattern %s: %w", i, pattern, err)
-			}
-		}
-	}
-
-	// Validate static databases
-	for name, db := range c.Databases {
-		if db.Host == "" {
-			return fmt.Errorf("database %s: host is required", name)
-		}
-		if db.User == "" {
-			return fmt.Errorf("database %s: user is required", name)
-		}
-		if !validPoolModes[db.PoolMode] {
-			return fmt.Errorf("database %s: invalid pool mode: %s", name, db.PoolMode)
-		}
+		targetNames[target.Name] = true
 	}
 
 	return nil

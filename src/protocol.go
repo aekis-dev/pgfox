@@ -11,30 +11,31 @@ import (
 
 // PostgreSQL protocol constants
 const (
-	StartupMessageType         = 0
-	AuthenticationOK           = 0
-	AuthenticationMD5          = 5
-	AuthenticationSASL         = 10
-	AuthenticationSASLContinue = 11
-	AuthenticationSASLFinal    = 12
-	ReadyForQuery              = 'Z'
-	Query                      = 'Q'
-	Parse                      = 'P'
-	Bind                       = 'B'
-	Execute                    = 'E'
-	Sync                       = 'S'
-	RowDescription             = 'T'
-	DataRow                    = 'D'
-	CommandComplete            = 'C'
-	ErrorResponse              = 'E'
-	ParameterStatus            = 'S'
-	BackendKeyData             = 'K'
-	NotificationResponse       = 'A'
-	Terminate                  = 'X'
-	CopyInResponse             = 'G'
-	CopyOutResponse            = 'H'
-	CopyData                   = 'd'
-	CopyDone                   = 'c'
+	StartupMessageType              = 0
+	AuthenticationOK                = 0
+	AuthenticationCleartextPassword = 3
+	AuthenticationMD5               = 5
+	AuthenticationSASL              = 10
+	AuthenticationSASLContinue      = 11
+	AuthenticationSASLFinal         = 12
+	ReadyForQuery                   = 'Z'
+	Query                           = 'Q'
+	Parse                           = 'P'
+	Bind                            = 'B'
+	Execute                         = 'E'
+	Sync                            = 'S'
+	RowDescription                  = 'T'
+	DataRow                         = 'D'
+	CommandComplete                 = 'C'
+	ErrorResponse                   = 'E'
+	ParameterStatus                 = 'S'
+	BackendKeyData                  = 'K'
+	NotificationResponse            = 'A'
+	Terminate                       = 'X'
+	CopyInResponse                  = 'G'
+	CopyOutResponse                 = 'H'
+	CopyData                        = 'd'
+	CopyDone                        = 'c'
 
 	// Protocol versions and special requests
 	ProtocolVersion30 = 196608   // PostgreSQL protocol version 3.0
@@ -340,36 +341,4 @@ func forwardBackendMessage(backend *BackendConnection, client *ClientConnection,
 	}
 
 	return client.WriteMessage(msgType, body)
-}
-
-// isQueryCommand checks if a string is a query command (SELECT, INSERT, etc.)
-func isQueryCommand(query string) bool {
-	query = strings.TrimSpace(strings.ToUpper(query))
-	queryCommands := []string{"SELECT", "INSERT", "UPDATE", "DELETE", "WITH"}
-
-	for _, cmd := range queryCommands {
-		if strings.HasPrefix(query, cmd) {
-			return true
-		}
-	}
-	return false
-}
-
-// isTransactionCommand checks if a string is a transaction command
-func isTransactionCommand(query string) bool {
-	query = strings.TrimSpace(strings.ToUpper(query))
-	txCommands := []string{"BEGIN", "START TRANSACTION", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE SAVEPOINT"}
-
-	for _, cmd := range txCommands {
-		if strings.HasPrefix(query, cmd) {
-			return true
-		}
-	}
-	return false
-}
-
-// isListenCommand checks if a string is a LISTEN command
-func isListenCommand(query string) bool {
-	query = strings.TrimSpace(strings.ToUpper(query))
-	return strings.HasPrefix(query, "LISTEN ")
 }

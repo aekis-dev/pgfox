@@ -1,10 +1,13 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
-	"sync/atomic"
+	"os"
 	"time"
 )
 
@@ -30,18 +33,44 @@ func (p *WildcardPooler) handleStartupMessage(client *ClientConnection) error {
 
 		// SSL request magic number is 80877103 (0x04D2162F)
 		if requestCode == SSLRequestCode {
-			p.logger.Debug("SSL request received, rejecting SSL")
+			// Get the database config to check SSL mode
+			// We need to peek at the next startup message to get the database name
+			// For now, check if ANY of our targets/databases support SSL
 
-			// Respond with 'N' (SSL not supported)
-			if err := client.writer.WriteByte('N'); err != nil {
-				return fmt.Errorf("failed to send SSL rejection: %w", err)
-			}
-			if err := client.writer.Flush(); err != nil {
-				return fmt.Errorf("failed to flush SSL rejection: %w", err)
-			}
+			sslSupported := p.isSSLSupported()
 
-			// Now read the actual startup message
-			return p.handleStartupMessage(client)
+			if sslSupported {
+				p.logger.Debug("SSL request received, accepting SSL")
+
+				// Respond with 'S' (SSL supported)
+				if err := client.writer.WriteByte('S'); err != nil {
+					return fmt.Errorf("failed to send SSL acceptance: %w", err)
+				}
+				if err := client.writer.Flush(); err != nil {
+					return fmt.Errorf("failed to flush SSL acceptance: %w", err)
+				}
+
+				// Upgrade connection to TLS
+				if err := p.upgradeToTLS(client); err != nil {
+					return fmt.Errorf("failed to upgrade to TLS: %w", err)
+				}
+
+				// Now read the actual startup message over TLS
+				return p.handleStartupMessage(client)
+			} else {
+				p.logger.Debug("SSL request received, rejecting SSL")
+
+				// Respond with 'N' (SSL not supported)
+				if err := client.writer.WriteByte('N'); err != nil {
+					return fmt.Errorf("failed to send SSL rejection: %w", err)
+				}
+				if err := client.writer.Flush(); err != nil {
+					return fmt.Errorf("failed to flush SSL rejection: %w", err)
+				}
+
+				// Now read the actual startup message
+				return p.handleStartupMessage(client)
+			}
 		} else if requestCode == CancelRequestCode {
 			// Handle cancel request (not implemented in this example)
 			return fmt.Errorf("cancel request not supported")
@@ -106,67 +135,130 @@ func (p *WildcardPooler) handleStartupMessage(client *ClientConnection) error {
 	logger.Info("Client startup",
 		"protocol_version", protocolVersion,
 		"remote_addr", client.RemoteAddr(),
-		"all_params", params)
+		"database", startupMsg.Database,
+		"user", startupMsg.User)
 
-	// Try to find or create a database manager for the requested database
-	dbManager, err := p.getDatabaseManager(startupMsg.Database, startupMsg.User)
-	if err != nil {
-		logger.WithError(err).Error("Database not available")
-		return sendErrorResponse(client, "FATAL", "3D000",
-			fmt.Sprintf("database \"%s\" does not exist or is not accessible", startupMsg.Database))
-	}
+	// Always authenticate client with backend (true passthrough)
+	logger.Debug("Requesting client authentication for passthrough")
+	return p.authenticateClientWithBackend(client, startupMsg.User, startupMsg.Database)
+}
 
-	// Update last used time
-	dbManager.mu.Lock()
-	dbManager.lastUsed = time.Now()
-	poolMode := dbManager.config.PoolMode
-	if poolMode == "" {
-		poolMode = p.config.Server.DefaultPoolMode
-	}
-	dbManager.mu.Unlock()
+// authenticateClientWithBackend performs passthrough authentication
+func (p *WildcardPooler) authenticateClientWithBackend(client *ClientConnection, user, database string) error {
+	logger := client.Logger()
 
-	// Set session mode based on pool configuration
-	client.SetSessionMode(poolMode == "session")
+	// Find target that serves this database (in priority order)
+	var selectedTarget *Target
 
-	logger.Info("Client pool mode determined", "pool_mode", poolMode, "session_mode", poolMode == "session")
-
-	// For session mode, establish backend connection now
-	// For transaction/statement mode, connections are acquired per query/transaction
-	if poolMode == "session" {
-		backend, err := p.acquireBackendConnection(startupMsg.Database)
-		if err != nil {
-			logger.WithError(err).Error("Failed to acquire backend connection for session mode")
-			return sendErrorResponse(client, "FATAL", "53300", "too many connections")
+	for _, target := range p.getSortedTargets() {
+		if p.targetServesDatabase(target, database) {
+			selectedTarget = target
+			logger.Debug("Selected target for database",
+				"target", target.Name,
+				"priority", target.Priority)
+			break
 		}
-
-		client.SetBackendConnection(backend)
-		backend.SetClientRef(client)
-		logger.Debug("Session mode backend connection established",
-			"backend_addr", backend.RemoteAddr())
-	} else {
-		logger.Debug("Transaction/statement mode - backend connections will be acquired per query")
 	}
 
-	// Send authentication OK (simplified authentication)
+	if selectedTarget == nil {
+		logger.Warn("No target serves this database", "database", database)
+		return sendErrorResponse(client, "FATAL", "3D000", "database not found")
+	}
+
+	// Request password from client using CleartextPassword
+	logger.Debug("Requesting cleartext password from client")
+
+	authRequest := make([]byte, 4)
+	authRequest[0] = 0
+	authRequest[1] = 0
+	authRequest[2] = 0
+	authRequest[3] = 3 // AuthenticationCleartextPassword
+
+	if err := client.WriteMessage('R', authRequest); err != nil {
+		return fmt.Errorf("failed to request password: %w", err)
+	}
+
+	// Read password response
+	msgType, body, err := client.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("failed to read password: %w", err)
+	}
+
+	if msgType != 'p' {
+		return fmt.Errorf("expected password message, got %c", msgType)
+	}
+
+	// Password is null-terminated
+	password := string(body)
+	if len(password) > 0 && password[len(password)-1] == 0 {
+		password = password[:len(password)-1]
+	}
+
+	logger.Debug("Received client password, attempting backend connection")
+	client.SetPassword(password)
+
+	// Try to connect to backend with these credentials
+	backendConn, err := p.createBackendConnectionWithCredentials(
+		selectedTarget.Host, selectedTarget.Port, database, user, password, selectedTarget)
+	if err != nil {
+		logger.WithError(err).Error("Backend authentication failed")
+		return sendErrorResponse(client, "FATAL", "28P01", "password authentication failed")
+	}
+
+	// Success! Backend accepted the credentials
+	logger.Info("Backend authentication successful")
+
+	// Get process ID and secret key
+	processID := backendConn.GetProcessID()
+	secretKey := backendConn.GetSecretKey()
+
+	// Create database pool with these credentials
+	// Pass the authenticated connection to be added to the pool
+	if err := p.addDatabaseWithCredentials(selectedTarget, database, user, password, backendConn); err != nil {
+		logger.WithError(err).Error("Failed to create database pool")
+		backendConn.Close()
+		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
+	}
+
+	// DON'T close the connection - it's now in the pool!
+	logger.Debug("auth connection added to pool for reuse")
+
+	// Send AuthenticationOK to client
 	if err := sendAuthenticationOK(client); err != nil {
 		return fmt.Errorf("failed to send authentication OK: %w", err)
 	}
 
-	// Send backend key data (dummy values for now)
-	if err := sendBackendKeyData(client, 12345, 67890); err != nil {
+	// Send backend key data
+	if err := sendBackendKeyData(client, processID, secretKey); err != nil {
 		return fmt.Errorf("failed to send backend key data: %w", err)
 	}
 
 	// Send parameter status messages
+	if err := p.sendParameterStatuses(client, user); err != nil {
+		return err
+	}
+
+	// Send ready for query
+	if err := sendReadyForQuery(client, 'I'); err != nil {
+		return fmt.Errorf("failed to send ready for query: %w", err)
+	}
+
+	client.SetAuthenticated(true)
+	logger.Info("Client authenticated successfully with passthrough credentials")
+	return nil
+}
+
+// sendParameterStatuses sends parameter status messages
+func (p *WildcardPooler) sendParameterStatuses(client *ClientConnection, user string) error {
 	parameterStatuses := map[string]string{
-		"server_version":              "13.0 (PgJoint)",
+		"server_version":              "13.0 (PgFox)",
 		"client_encoding":             "UTF8",
 		"DateStyle":                   "ISO, MDY",
 		"TimeZone":                    "UTC",
 		"integer_datetimes":           "on",
 		"is_superuser":                "off",
 		"server_encoding":             "UTF8",
-		"session_authorization":       startupMsg.User,
+		"session_authorization":       user,
 		"standard_conforming_strings": "on",
 	}
 
@@ -176,30 +268,135 @@ func (p *WildcardPooler) handleStartupMessage(client *ClientConnection) error {
 		}
 	}
 
-	// Send ready for query
-	if err := sendReadyForQuery(client, 'I'); err != nil {
-		return fmt.Errorf("failed to send ready for query: %w", err)
-	}
-
-	client.SetAuthenticated(true)
-	logger.Info("Client authenticated successfully",
-		"session_mode", client.IsSessionMode(),
-		"has_backend", client.GetBackendConnection() != nil)
 	return nil
 }
 
-// authenticateBackend authenticates with the PostgreSQL backend using raw TCP connection
-func (dm *DatabaseManager) authenticateBackend(backend *BackendConnection) error {
-	// Send startup message
-	startupMsg := buildStartupMessage(dm.config.User, dm.config.Name)
-	if _, err := backend.writer.Write(startupMsg); err != nil {
-		return fmt.Errorf("failed to send startup message: %w", err)
-	}
-	if err := backend.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush startup message: %w", err)
+// createBackendConnectionWithCredentials creates a backend connection with specific credentials
+func (p *WildcardPooler) createBackendConnectionWithCredentials(
+	host string, port int, database, user, password string, target *Target) (*BackendConnection, error) {
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	// Determine connect timeout
+	var connectTimeout time.Duration
+	if target != nil {
+		connectTimeout = target.ConnectTimeout
+	} else {
+		connectTimeout = p.config.Server.ConnectTimeout
 	}
 
-	// Read authentication response and consume ALL messages until ready
+	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
+	}
+
+	// Enable TCP keepalive to detect dead connections
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// Handle SSL to backend if required
+	if target != nil && target.SSLMode != "disable" {
+		conn, err = p.upgradeBackendToTLS(conn, host, target.SSLMode, target.SSLCAFile)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to establish SSL to backend: %w", err)
+		}
+	}
+
+	targetName := database
+	if target != nil {
+		targetName = target.Name
+	}
+
+	backend := NewBackendConnection(conn, database, targetName)
+
+	// Send startup message
+	startupMsg := buildStartupMessage(user, database)
+	if _, err := backend.writer.Write(startupMsg); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to send startup message: %w", err)
+	}
+	if err := backend.writer.Flush(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to flush startup message: %w", err)
+	}
+
+	// Handle authentication with provided credentials
+	if err := p.authenticateBackendWithPassword(backend, user, password); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("backend authentication failed: %w", err)
+	}
+
+	return backend, nil
+}
+
+// upgradeBackendToTLS upgrades a backend connection to TLS (pooler-level function)
+func (p *WildcardPooler) upgradeBackendToTLS(conn net.Conn, host, sslMode, sslCAFile string) (net.Conn, error) {
+	// Send SSL request to backend
+	sslRequest := make([]byte, 8)
+	binary.BigEndian.PutUint32(sslRequest[0:4], 8)
+	binary.BigEndian.PutUint32(sslRequest[4:8], SSLRequestCode)
+
+	if _, err := conn.Write(sslRequest); err != nil {
+		return nil, fmt.Errorf("failed to send SSL request to backend: %w", err)
+	}
+
+	// Read response
+	response := make([]byte, 1)
+	if _, err := conn.Read(response); err != nil {
+		return nil, fmt.Errorf("failed to read SSL response from backend: %w", err)
+	}
+
+	if response[0] == 'N' {
+		// Backend doesn't support SSL
+		if sslMode == "require" || sslMode == "verify-ca" || sslMode == "verify-full" {
+			return nil, fmt.Errorf("backend does not support SSL but SSLMode is %s", sslMode)
+		}
+		// For "prefer", fall back to non-SSL
+		return conn, nil
+	}
+
+	if response[0] != 'S' {
+		return nil, fmt.Errorf("unexpected SSL response from backend: %c", response[0])
+	}
+
+	// Configure TLS for backend connection
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: sslMode == "require", // Only verify for verify-ca and verify-full
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	// Load CA certificate if specified and needed
+	if (sslMode == "verify-ca" || sslMode == "verify-full") && sslCAFile != "" {
+		caCert, err := os.ReadFile(sslCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	// Upgrade to TLS
+	tlsConn := tls.Client(conn, tlsConfig)
+
+	// Perform handshake
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake with backend failed: %w", err)
+	}
+
+	return tlsConn, nil
+}
+
+// authenticateBackendWithPassword authenticates with backend using provided credentials
+func (p *WildcardPooler) authenticateBackendWithPassword(backend *BackendConnection, user, password string) error {
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
@@ -216,17 +413,94 @@ func (dm *DatabaseManager) authenticateBackend(backend *BackendConnection) error
 
 			switch authType {
 			case AuthenticationOK:
-				continue // Continue reading until ReadyForQuery
+				continue
+			case AuthenticationCleartextPassword:
+				// Send cleartext password
+				passMsg := []byte(password + "\x00")
+				if err := backend.WriteMessage('p', passMsg); err != nil {
+					return fmt.Errorf("failed to send password: %w", err)
+				}
 			case AuthenticationMD5:
 				if len(body) < 8 {
 					return fmt.Errorf("invalid MD5 auth response")
 				}
-
-				// Handle MD5 authentication
 				salt := body[4:8]
-				response := buildMD5Response(dm.config.User, dm.config.Password, salt)
+				response := buildMD5Response(user, password, salt)
+				passMsg := []byte(response + "\x00")
+				if err := backend.WriteMessage('p', passMsg); err != nil {
+					return fmt.Errorf("failed to send password: %w", err)
+				}
+			case AuthenticationSASL:
+				if len(body) < 4 {
+					return fmt.Errorf("invalid SASL auth response")
+				}
+				saslData := body[4:]
+				return handleSCRAMAuth(backend, user, password, saslData)
+			default:
+				return fmt.Errorf("unsupported authentication type: %d", authType)
+			}
 
-				// Send password message
+		case 'K': // Backend key data
+			if len(body) >= 8 {
+				processID := int32(body[0])<<24 | int32(body[1])<<16 | int32(body[2])<<8 | int32(body[3])
+				secretKey := int32(body[4])<<24 | int32(body[5])<<16 | int32(body[6])<<8 | int32(body[7])
+				backend.SetProcessID(processID)
+				backend.SetSecretKey(secretKey)
+			}
+
+		case 'S': // Parameter status
+			continue
+
+		case 'Z': // Ready for query
+			return nil
+
+		case 'E': // Error response
+			errorMsg := parseErrorMessage(body)
+			return fmt.Errorf("authentication failed: %s", errorMsg)
+		}
+	}
+}
+
+// authenticateBackend authenticates with the PostgreSQL backend using stored credentials
+func (dm *DatabaseManager) authenticateBackend(backend *BackendConnection) error {
+	// Send startup message with stored username
+	startupMsg := buildStartupMessage(dm.username, dm.config.Name)
+	if _, err := backend.writer.Write(startupMsg); err != nil {
+		return fmt.Errorf("failed to send startup message: %w", err)
+	}
+	if err := backend.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush startup message: %w", err)
+	}
+
+	// Read authentication response and authenticate with stored password
+	for {
+		msgType, body, err := backend.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("failed to read auth response: %w", err)
+		}
+
+		switch msgType {
+		case 'R': // Authentication
+			if len(body) < 4 {
+				return fmt.Errorf("invalid authentication response")
+			}
+
+			authType := uint32(body[0])<<24 | uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
+
+			switch authType {
+			case AuthenticationOK:
+				continue
+			case AuthenticationCleartextPassword:
+				passMsg := []byte(dm.password + "\x00")
+				if err := backend.WriteMessage('p', passMsg); err != nil {
+					return fmt.Errorf("failed to send password: %w", err)
+				}
+			case AuthenticationMD5:
+				if len(body) < 8 {
+					return fmt.Errorf("invalid MD5 auth response")
+				}
+				salt := body[4:8]
+				response := buildMD5Response(dm.username, dm.password, salt)
 				passMsg := []byte(response + "\x00")
 				if err := backend.WriteMessage('p', passMsg); err != nil {
 					return fmt.Errorf("failed to send password: %w", err)
@@ -237,12 +511,7 @@ func (dm *DatabaseManager) authenticateBackend(backend *BackendConnection) error
 					return fmt.Errorf("invalid SASL auth response")
 				}
 				saslData := body[4:] // Skip the auth type (first 4 bytes)
-
-				// Handle SCRAM flow inline to ensure we consume all messages
-				if err := dm.handleSCRAMAuthInline(backend, saslData); err != nil {
-					return err
-				}
-				continue
+				return handleSCRAMAuth(backend, dm.username, dm.password, saslData)
 			case AuthenticationSASLContinue:
 				return fmt.Errorf("unexpected SASL continue outside of SCRAM flow")
 			case AuthenticationSASLFinal:
@@ -268,19 +537,12 @@ func (dm *DatabaseManager) authenticateBackend(backend *BackendConnection) error
 
 		case 'E': // Error response
 			errorMsg := parseErrorMessage(body)
-			return fmt.Errorf("backend authentication failed: %s", errorMsg)
+			return fmt.Errorf("authentication failed: %s", errorMsg)
 
 		default:
 			return fmt.Errorf("unexpected message type during auth: %c", msgType)
 		}
 	}
-}
-
-// handleSCRAMAuthInline handles SCRAM authentication inline during backend connection setup
-func (dm *DatabaseManager) handleSCRAMAuthInline(backend *BackendConnection, saslData []byte) error {
-	// This is a simplified version that just completes the SCRAM flow
-	// without returning early, ensuring all messages are consumed
-	return handleSCRAMAuth(backend, dm.config.User, dm.config.Password, saslData)
 }
 
 // createBackendConnection creates a new backend connection using raw TCP connection
@@ -293,9 +555,27 @@ func (dm *DatabaseManager) createBackendConnection() (*BackendConnection, error)
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
 
+	// Enable TCP keepalive to detect dead connections
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		// Enable keepalive
+		tcpConn.SetKeepAlive(true)
+		// Send keepalive probes every 30 seconds
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// Handle SSL to backend if required
+	if dm.config.SSLMode != "disable" {
+		conn, err = dm.upgradeBackendToTLS(conn, addr)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to establish SSL to backend: %w", err)
+		}
+	}
+
+	// Use target name if available, otherwise use database name
 	targetName := dm.config.Name
-	if dm.wildcardTarget != nil {
-		targetName = dm.wildcardTarget.Name
+	if dm.target != nil {
+		targetName = dm.target.Name
 	}
 
 	// Create backend connection with proper reader/writer
@@ -310,24 +590,65 @@ func (dm *DatabaseManager) createBackendConnection() (*BackendConnection, error)
 	return backend, nil
 }
 
-// initializeConnections initializes the minimum number of backend connections
-func (dm *DatabaseManager) initializeConnections() error {
-	for i := 0; i < dm.config.MinConnections; i++ {
-		conn, err := dm.createBackendConnection()
-		if err != nil {
-			return fmt.Errorf("failed to create connection %d: %w", i+1, err)
-		}
+// upgradeBackendToTLS upgrades a backend connection to TLS (DatabaseManager method)
+func (dm *DatabaseManager) upgradeBackendToTLS(conn net.Conn, addr string) (net.Conn, error) {
+	// Send SSL request to backend
+	sslRequest := make([]byte, 8)
+	binary.BigEndian.PutUint32(sslRequest[0:4], 8)
+	binary.BigEndian.PutUint32(sslRequest[4:8], SSLRequestCode)
 
-		select {
-		case dm.backendPool <- conn:
-			atomic.AddInt64(&dm.stats.TotalConnections, 1)
-			atomic.AddInt64(&dm.stats.IdleConnections, 1)
-		default:
-			// This shouldn't happen since we're creating min connections
-			conn.Close()
-			return fmt.Errorf("failed to add connection to pool")
-		}
+	if _, err := conn.Write(sslRequest); err != nil {
+		return nil, fmt.Errorf("failed to send SSL request to backend: %w", err)
 	}
 
-	return nil
+	// Read response
+	response := make([]byte, 1)
+	if _, err := conn.Read(response); err != nil {
+		return nil, fmt.Errorf("failed to read SSL response from backend: %w", err)
+	}
+
+	if response[0] == 'N' {
+		// Backend doesn't support SSL
+		if dm.config.SSLMode == "require" || dm.config.SSLMode == "verify-ca" || dm.config.SSLMode == "verify-full" {
+			return nil, fmt.Errorf("backend does not support SSL but SSLMode is %s", dm.config.SSLMode)
+		}
+		// For "prefer", fall back to non-SSL
+		return conn, nil
+	}
+
+	if response[0] != 'S' {
+		return nil, fmt.Errorf("unexpected SSL response from backend: %c", response[0])
+	}
+
+	// Configure TLS for backend connection
+	tlsConfig := &tls.Config{
+		ServerName:         dm.config.Host,
+		InsecureSkipVerify: dm.config.SSLMode == "require", // Only verify for verify-ca and verify-full
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	// Load CA certificate if specified and needed
+	if (dm.config.SSLMode == "verify-ca" || dm.config.SSLMode == "verify-full") && dm.config.SSLCAFile != "" {
+		caCert, err := os.ReadFile(dm.config.SSLCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	// Upgrade to TLS
+	tlsConn := tls.Client(conn, tlsConfig)
+
+	// Perform handshake
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake with backend failed: %w", err)
+	}
+
+	return tlsConn, nil
 }

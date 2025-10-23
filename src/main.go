@@ -21,7 +21,7 @@ func main() {
 	flag.Parse()
 
 	if *version {
-		fmt.Printf("PgJoint %s\n", Version)
+		fmt.Printf("PgFox %s\n", Version)
 		fmt.Printf("PostgreSQL Connection Pooler with Wildcard Database Support\n")
 		os.Exit(0)
 	}
@@ -39,7 +39,7 @@ func main() {
 
 	// Initialize logger
 	logger := NewLogger(config.Logging)
-	logger.Info("Starting PgJoint", "version", Version, "config", *configPath)
+	logger.Info("Starting PgFox", "version", Version, "config", *configPath)
 
 	// Create pooler
 	pooler, err := NewWildcardPooler(*config, logger)
@@ -64,12 +64,12 @@ func main() {
 	// Start the pooler
 	logger.Info("Starting PostgreSQL connection pooler",
 		"listen_addr", config.Server.ListenAddr,
-		"wildcard_targets", len(config.WildcardTargets),
-		"static_databases", len(config.Databases))
+		"targets", len(config.Targets),
+	)
 
 	if err := pooler.Start(ctx); err != nil {
 		logger.Fatal("Pooler failed to start", "error", err)
 	}
 
-	logger.Info("PgJoint shutdown complete")
+	logger.Info("PgFox shutdown complete")
 }
