@@ -28,8 +28,8 @@ type NotificationMonitor struct {
 }
 
 // NewNotificationMonitor creates a new notification monitor for a database
-func NewNotificationMonitor(pooler *WildcardPooler, dbName, username string) *NotificationMonitor {
-	ctx, cancel := context.WithCancel(pooler.ctx)
+func NewNotificationMonitor(ctx context.Context, pooler *WildcardPooler, dbName, username string) *NotificationMonitor {
+	monitorCtx, cancel := context.WithCancel(ctx)
 
 	return &NotificationMonitor{
 		pooler:           pooler,
@@ -37,7 +37,7 @@ func NewNotificationMonitor(pooler *WildcardPooler, dbName, username string) *No
 		username:         username,
 		listenedChannels: make(map[string]int),
 		subscribers:      make(map[string]map[*ClientConnection]bool),
-		ctx:              ctx,
+		ctx:              monitorCtx,
 		cancel:           cancel,
 		logger:           pooler.logger.WithField("component", "notification_monitor").WithDatabase(dbName).WithUser(username),
 		reconnectBackoff: 1 * time.Second,
@@ -68,7 +68,9 @@ func (nm *NotificationMonitor) Stop() {
 	nm.cancel()
 
 	if nm.backend != nil {
+		nm.logger.Debug("Closing backend connection")
 		nm.backend.Close()
+		nm.backend = nil
 	}
 }
 
@@ -294,16 +296,31 @@ func (nm *NotificationMonitor) sendUnlisten(channel string) error {
 func (nm *NotificationMonitor) listenLoop() {
 	nm.logger.Info("Starting listen loop")
 
-	for nm.active.Load() {
+	defer func() {
+		nm.logger.Info("Listen loop exiting")
+	}()
+
+	for {
 		select {
 		case <-nm.ctx.Done():
 			nm.logger.Info("Listen loop stopping due to context cancellation")
 			return
 		default:
+			if !nm.active.Load() {
+				nm.logger.Info("Listen loop stopping due to inactive flag")
+				return
+			}
+
 			if err := nm.readAndProcessMessage(); err != nil {
+				// Check if this is due to shutdown
+				if nm.ctx.Err() != nil || !nm.active.Load() {
+					nm.logger.Info("Listen loop stopping during shutdown")
+					return
+				}
+
 				nm.logger.WithError(err).Error("Error in listen loop")
 
-				// Attempt to reconnect
+				// Attempt to reconnect only if still active
 				if nm.active.Load() {
 					nm.handleConnectionFailure()
 				}
@@ -335,7 +352,8 @@ func (nm *NotificationMonitor) readAndProcessMessage() error {
 
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return nil // Just timeout, continue
+			// Timeout is normal, allows context checking
+			return nil
 		}
 		return fmt.Errorf("failed to read message: %w", err)
 	}
@@ -423,6 +441,12 @@ func (nm *NotificationMonitor) handleNotification(body []byte) {
 
 // handleConnectionFailure attempts to reconnect after connection failure
 func (nm *NotificationMonitor) handleConnectionFailure() {
+	// Check if we're shutting down
+	if !nm.active.Load() || nm.ctx.Err() != nil {
+		nm.logger.Info("Skipping reconnection during shutdown")
+		return
+	}
+
 	nm.logger.Warn("Backend connection failed, attempting to reconnect")
 
 	// Close old connection
@@ -443,8 +467,13 @@ func (nm *NotificationMonitor) handleConnectionFailure() {
 	for attempt := 1; nm.active.Load(); attempt++ {
 		select {
 		case <-nm.ctx.Done():
+			nm.logger.Info("Stopping reconnection attempts due to shutdown")
 			return
 		case <-time.After(nm.reconnectBackoff):
+			if !nm.active.Load() {
+				return
+			}
+
 			nm.logger.Info("Attempting to reconnect", "attempt", attempt)
 
 			if err := nm.createBackendConnection(); err != nil {
@@ -680,26 +709,6 @@ func (p *WildcardPooler) triggerBackendNotificationCheck(backend *BackendConnect
 
 		// Skip other messages (RowDescription, DataRow, CommandComplete)
 	}
-}
-
-// acquireListeningBackendConnection gets a backend connection for listening
-func (p *WildcardPooler) acquireListeningBackendConnection(dbName string) (*BackendConnection, error) {
-	// For listening connections, we create dedicated connections
-	dbManager, err := p.getDatabaseManager(dbName, "")
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a new dedicated connection for listening
-	conn, err := dbManager.createBackendConnection()
-	if err != nil {
-		return nil, err
-	}
-
-	atomic.AddInt64(&dbManager.stats.TotalConnections, 1)
-	atomic.AddInt64(&dbManager.stats.ActiveConnections, 1)
-
-	return conn, nil
 }
 
 // listenForNotificationsAsync listens for notifications on a backend connection asynchronously

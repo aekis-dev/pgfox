@@ -92,8 +92,6 @@ func NewWildcardPooler(config Config, logger *Logger) (*WildcardPooler, error) {
 		return nil, fmt.Errorf("failed to listen on %s: %w", config.Server.ListenAddr, err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	pooler := &WildcardPooler{
 		config:        config,
 		listener:      listener,
@@ -101,8 +99,6 @@ func NewWildcardPooler(config Config, logger *Logger) (*WildcardPooler, error) {
 		targetConfigs: make([]*Target, 0, len(config.Targets)),
 		clients:       make(map[net.Conn]*ClientConnection),
 		listeners:     make(map[string]map[*ClientConnection]bool),
-		ctx:           ctx,
-		cancel:        cancel,
 		logger:        logger,
 	}
 
@@ -111,36 +107,54 @@ func NewWildcardPooler(config Config, logger *Logger) (*WildcardPooler, error) {
 		pooler.targetConfigs = append(pooler.targetConfigs, &config.Targets[i])
 	}
 
-	// Start idle connection cleanup worker
-	if config.Server.IdleTimeout > 0 {
-		pooler.wg.Add(1)
-		go pooler.idleConnectionCleanupWorker()
-	}
-
-	// Start metrics server if enabled
-	if config.Metrics.Enabled {
-		pooler.wg.Add(1)
-		go pooler.startMetricsServer()
-	}
-
 	return pooler, nil
 }
 
 // Start starts the wildcard pooler
 func (p *WildcardPooler) Start(ctx context.Context) error {
+	// Store context and create cancel function
+	p.ctx, p.cancel = context.WithCancel(ctx)
+
 	p.logger.Info("PostgreSQL connection pooler starting",
 		"listen_addr", p.config.Server.ListenAddr,
 		"targets", len(p.targetConfigs))
 
+	// Start idle connection cleanup worker if configured
+	if p.config.Server.IdleTimeout > 0 {
+		p.wg.Add(1)
+		go p.idleConnectionCleanupWorker(p.ctx)
+	}
+
+	// Start metrics server if enabled
+	if p.config.Metrics.Enabled {
+		p.wg.Add(1)
+		go p.startMetricsServer(p.ctx)
+	}
+
 	for {
 		select {
-		case <-ctx.Done():
-			p.logger.Info("Pooler shutting down")
+		case <-p.ctx.Done():
+			p.logger.Info("Accept loop stopping due to shutdown signal")
 			return p.shutdown()
 		default:
+			// Set accept deadline to allow periodic context checking
+			if listener, ok := p.listener.(*net.TCPListener); ok {
+				listener.SetDeadline(time.Now().Add(1 * time.Second))
+			}
+
 			conn, err := p.listener.Accept()
+
+			// Clear deadline
+			if listener, ok := p.listener.(*net.TCPListener); ok {
+				listener.SetDeadline(time.Time{})
+			}
+
 			if err != nil {
-				if ctx.Err() != nil {
+				if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+					// Timeout is expected, continue to check context
+					continue
+				}
+				if p.ctx.Err() != nil {
 					return p.shutdown()
 				}
 				p.logger.WithError(err).Error("Accept error")
@@ -162,14 +176,15 @@ func (p *WildcardPooler) shutdown() error {
 
 	// Stop accepting new connections
 	if p.listener != nil {
-		p.listener.Close()
+		if err := p.listener.Close(); err != nil {
+			p.logger.WithError(err).Warn("Error closing listener")
+		}
 	}
 
 	// Cancel all background workers
 	p.cancel()
 
-	// Stop all notification monitors FIRST (before closing clients)
-	// This ensures no new notifications are being processed
+	// Stop all notification monitors
 	p.logger.Info("Stopping notification monitors")
 	p.notificationMonitorsMu.Lock()
 	for key, monitor := range p.notificationMonitors {
@@ -179,7 +194,8 @@ func (p *WildcardPooler) shutdown() error {
 	p.notificationMonitors = nil
 	p.notificationMonitorsMu.Unlock()
 
-	// Close all client connections
+	// Close all client connections with a brief grace period
+	p.logger.Info("Closing client connections")
 	p.clientsMu.Lock()
 	for conn := range p.clients {
 		conn.Close()
@@ -187,6 +203,7 @@ func (p *WildcardPooler) shutdown() error {
 	p.clientsMu.Unlock()
 
 	// Close all database managers
+	p.logger.Info("Closing database pools")
 	p.targetsMu.Lock()
 	for _, targetMap := range p.targets {
 		for _, dbMap := range targetMap {
@@ -197,20 +214,9 @@ func (p *WildcardPooler) shutdown() error {
 	}
 	p.targetsMu.Unlock()
 
-	// Wait for all goroutines to finish
-	done := make(chan struct{})
-	go func() {
-		p.wg.Wait()
-		close(done)
-	}()
-
-	// Wait for shutdown with timeout
-	select {
-	case <-done:
-		p.logger.Info("Graceful shutdown completed")
-	case <-time.After(30 * time.Second):
-		p.logger.Warn("Shutdown timeout reached, forcing exit")
-	}
+	// Wait for all goroutines to finish (no timeout)
+	p.wg.Wait()
+	p.logger.Info("Graceful shutdown completed")
 
 	return nil
 }
@@ -370,21 +376,16 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 	var dbManager *DatabaseManager
 
 	p.targetsMu.RLock()
-	for _, targetMap := range p.targets {
-		for _, dbMap := range targetMap {
+	targetMap, exists := p.targets[conn.targetName]
+	if exists {
+		dbMap, exists := targetMap[conn.dbName]
+		if exists {
 			for _, manager := range dbMap {
-				// Check if this manager owns this connection
 				if manager.config.Name == conn.dbName {
 					dbManager = manager
 					break
 				}
 			}
-			if dbManager != nil {
-				break
-			}
-		}
-		if dbManager != nil {
-			break
 		}
 	}
 	p.targetsMu.RUnlock()
@@ -430,7 +431,7 @@ func (p *WildcardPooler) releaseBackendConnection(conn *BackendConnection) {
 }
 
 // startMetricsServer starts the web server
-func (p *WildcardPooler) startMetricsServer() {
+func (p *WildcardPooler) startMetricsServer(ctx context.Context) {
 	defer p.wg.Done()
 
 	addr := fmt.Sprintf(":%d", p.config.Metrics.Port)
@@ -438,7 +439,7 @@ func (p *WildcardPooler) startMetricsServer() {
 
 	p.logger.Info("Starting web server", "addr", addr)
 
-	if err := server.Start(p.ctx); err != nil {
+	if err := server.Start(ctx); err != nil {
 		p.logger.WithError(err).Error("Web server failed")
 	}
 }
@@ -492,7 +493,7 @@ func (p *WildcardPooler) upgradeToTLS(client *ClientConnection) error {
 }
 
 // idleConnectionCleanupWorker periodically removes idle connections from pools
-func (p *WildcardPooler) idleConnectionCleanupWorker() {
+func (p *WildcardPooler) idleConnectionCleanupWorker(ctx context.Context) {
 	defer p.wg.Done()
 
 	logger := p.logger.WithField("component", "idle_cleanup")
@@ -509,10 +510,14 @@ func (p *WildcardPooler) idleConnectionCleanupWorker() {
 
 	for {
 		select {
-		case <-p.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("Idle connection cleanup worker stopping")
 			return
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				// Check context before cleanup
+				return
+			}
 			p.cleanupIdleConnections()
 		}
 	}
@@ -653,7 +658,7 @@ func (p *WildcardPooler) getOrCreateNotificationMonitor(dbName, userName string)
 	}
 
 	// Create new monitor
-	monitor = NewNotificationMonitor(p, dbName, userName)
+	monitor = NewNotificationMonitor(p.ctx, p, dbName, userName)
 	if err := monitor.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start notification monitor: %w", err)
 	}

@@ -45,7 +45,7 @@ func (p *WildcardPooler) handleClientMessage(client *ClientConnection) error {
 
 // handleQuery handles a query from the client
 func (p *WildcardPooler) executeQuery(client *ClientConnection, query string) error {
-	logger := client.Logger().WithField("query", query)
+	logger := client.Logger()
 
 	// Check if this is a LISTEN/UNLISTEN/NOTIFY command
 	queryUpper := strings.ToUpper(strings.TrimSpace(query))
@@ -57,22 +57,40 @@ func (p *WildcardPooler) executeQuery(client *ClientConnection, query string) er
 	} else if strings.HasPrefix(queryUpper, "NOTIFY ") {
 		return p.handleNotify(client, query)
 	} else if p.containsPgNotify(queryUpper) {
-		logger.Info("Detected pg_notify function call", "query", query)
+		logger.Info("Detected pg_notify function call")
 		return p.handleNotify(client, query)
 	}
 
-	// Determine transaction state changes BEFORE getting backend
+	// Determine transaction state changes
 	isTransactionStart := strings.HasPrefix(queryUpper, "BEGIN") || strings.HasPrefix(queryUpper, "START TRANSACTION")
 	isTransactionEnd := strings.HasPrefix(queryUpper, "COMMIT") || strings.HasPrefix(queryUpper, "ROLLBACK")
 
-	// Get or create backend connection based on pool mode
+	// Get or create backend connection
 	backend, shouldRelease, err := p.getBackendForClient(client)
 	if err != nil {
 		logger.WithError(err).Error("Failed to get backend connection")
 		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
 	}
 
-	// Set read timeout for this query operation
+	// Track connection state
+	connectionOK := false
+
+	defer func() {
+		if shouldRelease {
+			if connectionOK {
+				p.releaseBackendConnection(backend)
+			} else {
+				// Connection is in unknown state, close it
+				backend.Close()
+				if dbManager, _ := p.getDatabaseManager(client.GetDatabase(), client.GetUser()); dbManager != nil {
+					atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
+					atomic.AddInt64(&dbManager.stats.ActiveConnections, -1)
+				}
+			}
+		}
+	}()
+
+	// Set read timeout
 	if conn, ok := backend.conn.(net.Conn); ok {
 		deadline := time.Now().Add(30 * time.Second)
 		conn.SetReadDeadline(deadline)
@@ -82,29 +100,28 @@ func (p *WildcardPooler) executeQuery(client *ClientConnection, query string) er
 	// Forward query to backend
 	if err := p.forwardQueryToBackend(backend, query); err != nil {
 		logger.WithError(err).Error("Failed to forward query to backend")
-		if shouldRelease {
-			p.releaseBackendConnection(backend)
-		}
+		// OK to send error here - query didn't make it to backend
 		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
 	// Forward complete response from backend to client
-	if err := p.forwardCompleteBackendResponse(client, backend); err != nil {
+	err = p.forwardCompleteBackendResponse(client, backend)
+	if err != nil {
 		logger.WithError(err).Error("Failed to forward backend response")
-		if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
-			if shouldRelease {
-				p.releaseBackendConnection(backend)
-			}
-			return sendErrorResponse(client, "ERROR", "57014", "query timeout")
-		}
-		if shouldRelease {
-			p.releaseBackendConnection(backend)
-		}
-		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		// Do NOT send error response - just close the connection to client
+		// The client will see a connection close, which is better than desynced messages
+		return err
 	}
 
-	// Update transaction state based on query AFTER successful execution
-	p.updateTransactionState(client, query)
+	// Successfully completed query
+	connectionOK = true
+
+	// Update transaction state
+	if isTransactionStart {
+		client.SetInTransaction(true)
+	} else if isTransactionEnd {
+		client.SetInTransaction(false)
+	}
 
 	// Update statistics
 	if dbManager, _ := p.getDatabaseManager(client.GetDatabase(), client.GetUser()); dbManager != nil {
@@ -112,36 +129,18 @@ func (p *WildcardPooler) executeQuery(client *ClientConnection, query string) er
 	}
 	atomic.AddInt64(&p.stats.TotalQueries, 1)
 
-	// Connection release logic
-	logger.Debug("Determining connection release strategy",
-		"should_release", shouldRelease,
-		"is_transaction_start", isTransactionStart,
-		"is_transaction_end", isTransactionEnd,
-		"client_in_transaction", client.IsInTransaction(),
-		"client_is_listening", client.IsListening())
-
-	if shouldRelease {
-		if isTransactionStart {
-			logger.Debug("Transaction started - converting pooled connection to dedicated")
-			client.SetBackendConnection(backend)
-			backend.SetClientRef(client)
-		} else {
-			logger.Debug("Releasing pooled backend connection after query")
-			p.releaseBackendConnection(backend)
-		}
-	} else {
-		if isTransactionEnd {
-			if !client.IsListening() {
-				logger.Debug("Transaction ended - releasing dedicated connection to pool")
-				client.SetBackendConnection(nil)
-				backend.SetClientRef(nil)
-				p.releaseBackendConnection(backend)
-			} else {
-				logger.Debug("Transaction ended but client is listening - keeping dedicated connection")
-			}
-		} else {
-			logger.Debug("Keeping dedicated backend connection")
-		}
+	// Handle transaction state changes for connection management
+	if shouldRelease && isTransactionStart {
+		logger.Debug("Transaction started - converting pooled connection to dedicated")
+		client.SetBackendConnection(backend)
+		backend.SetClientRef(client)
+		connectionOK = false // Don't release in defer
+		shouldRelease = false
+	} else if !shouldRelease && isTransactionEnd && !client.IsListening() {
+		logger.Debug("Transaction ended - releasing dedicated connection to pool")
+		client.SetBackendConnection(nil)
+		backend.SetClientRef(nil)
+		p.releaseBackendConnection(backend)
 	}
 
 	return nil
@@ -165,7 +164,7 @@ func (p *WildcardPooler) getBackendForClient(client *ClientConnection) (*Backend
 		if backend == nil {
 			logger.Debug("Creating dedicated backend connection for listening client")
 			var err error
-			backend, err = p.acquireBackendConnection(client.GetDatabase())
+			backend, err = p.acquireBackendConnection(client.GetDatabase(), client.GetUser())
 			if err != nil {
 				return nil, false, err
 			}
@@ -183,7 +182,7 @@ func (p *WildcardPooler) getBackendForClient(client *ClientConnection) (*Backend
 		if backend == nil {
 			logger.Debug("Creating dedicated backend connection for active transaction")
 			var err error
-			backend, err = p.acquireBackendConnection(client.GetDatabase())
+			backend, err = p.acquireBackendConnection(client.GetDatabase(), client.GetUser())
 			if err != nil {
 				return nil, false, err
 			}
@@ -197,7 +196,7 @@ func (p *WildcardPooler) getBackendForClient(client *ClientConnection) (*Backend
 	// Rule 3: Outside of transactions and not listening, use pooled connections
 	// This provides connection pooling efficiency for stateless queries
 	logger.Debug("Acquiring pooled backend connection")
-	backend, err := p.acquireBackendConnection(client.GetDatabase())
+	backend, err := p.acquireBackendConnection(client.GetDatabase(), client.GetUser())
 	if err != nil {
 		return nil, false, err
 	}
@@ -364,21 +363,16 @@ func (p *WildcardPooler) forwardUntilReady(client *ClientConnection, backend *Ba
 
 // forwardCompleteBackendResponse forwards a complete query response
 func (p *WildcardPooler) forwardCompleteBackendResponse(client *ClientConnection, backend *BackendConnection) error {
-	logger := client.Logger()
-
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
 			if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
-				logger.WithError(err).Warn("Timeout reading complete response")
 				return fmt.Errorf("query timeout")
 			}
-			logger.WithError(err).Error("Failed to read complete response")
 			return err
 		}
 
 		if err := client.WriteMessage(msgType, body); err != nil {
-			logger.WithError(err).Error("Failed to forward complete response")
 			return err
 		}
 
@@ -490,33 +484,21 @@ func (p *WildcardPooler) forwardBackendResponse(client *ClientConnection, backen
 	}
 }
 
-// acquireBackendConnection gets a backend connection for a specific database
-func (p *WildcardPooler) acquireBackendConnection(dbName string) (*BackendConnection, error) {
-	dbManager, err := p.getDatabaseManager(dbName, "")
+// acquireBackendConnection gets a backend connection for a specific database and user
+func (p *WildcardPooler) acquireBackendConnection(dbName string, username string) (*BackendConnection, error) {
+	dbManager, err := p.getDatabaseManager(dbName, username)
 	if err != nil {
 		return nil, err
 	}
 
-	logger := p.logger.WithDatabase(dbName)
+	logger := p.logger.WithDatabase(dbName).WithUser(username)
 
 	select {
 	case conn := <-dbManager.backendPool:
-		// Quick connection state check (no network I/O)
-		if !conn.IsAlive() {
-			logger.Warn("Pooled connection is closed, discarding")
-			conn.Close()
-			atomic.AddInt64(&dbManager.stats.TotalConnections, -1)
-			atomic.AddInt64(&dbManager.stats.IdleConnections, -1)
-
-			// Create replacement
-			return p.createReplacementConnection(dbManager, logger)
-		}
-
-		// Connection is alive, use it
 		conn.SetInUse(true)
 		atomic.AddInt64(&dbManager.stats.ActiveConnections, 1)
 		atomic.AddInt64(&dbManager.stats.IdleConnections, -1)
-		logger.Debug("Successfully acquired healthy pooled connection")
+		logger.Debug("Successfully acquired pooled connection")
 		return conn, nil
 
 	default:

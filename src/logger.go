@@ -35,25 +35,27 @@ func NewLogger(config LoggingConfig) *Logger {
 		Level: level,
 	}
 
-	// Determine output destination
-	var output *os.File
+	// Determine output destination - default to stdout
+	output := os.Stdout
 	if config.File != "" {
 		file, err := os.OpenFile(config.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v, using stdout\n", config.File, err)
-			output = os.Stdout
 		} else {
 			output = file
 		}
-	} else {
-		output = os.Stdout
 	}
 
-	// Create handler based on format
-	switch strings.ToLower(config.Format) {
+	// Create handler based on format - default to JSON for containers
+	format := strings.ToLower(config.Format)
+	if format == "" {
+		format = "json" // Default to JSON for better container log parsing
+	}
+
+	switch format {
 	case "json":
 		handler = slog.NewJSONHandler(output, opts)
-	case "text", "":
+	case "text":
 		handler = slog.NewTextHandler(output, opts)
 	default:
 		handler = slog.NewTextHandler(output, opts)

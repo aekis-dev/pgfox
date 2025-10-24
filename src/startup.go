@@ -212,7 +212,31 @@ func (p *WildcardPooler) authenticateClientWithBackend(client *ClientConnection,
 	processID := backendConn.GetProcessID()
 	secretKey := backendConn.GetSecretKey()
 
-	// Create database pool with these credentials
+	// Send AuthenticationOK to client
+	if err := sendAuthenticationOK(client); err != nil {
+		backendConn.Close()
+		return fmt.Errorf("failed to send authentication OK: %w", err)
+	}
+
+	// Send backend key data
+	if err := sendBackendKeyData(client, processID, secretKey); err != nil {
+		backendConn.Close()
+		return fmt.Errorf("failed to send backend key data: %w", err)
+	}
+
+	// Send parameter status messages
+	if err := p.sendParameterStatuses(client, user); err != nil {
+		backendConn.Close()
+		return err
+	}
+
+	// Send ready for query
+	if err := sendReadyForQuery(client, 'I'); err != nil {
+		backendConn.Close()
+		return fmt.Errorf("failed to send ready for query: %w", err)
+	}
+
+	// NOW create database pool with these credentials
 	// Pass the authenticated connection to be added to the pool
 	if err := p.addDatabaseWithCredentials(selectedTarget, database, user, password, backendConn); err != nil {
 		logger.WithError(err).Error("Failed to create database pool")
@@ -220,28 +244,7 @@ func (p *WildcardPooler) authenticateClientWithBackend(client *ClientConnection,
 		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
 	}
 
-	// DON'T close the connection - it's now in the pool!
 	logger.Debug("auth connection added to pool for reuse")
-
-	// Send AuthenticationOK to client
-	if err := sendAuthenticationOK(client); err != nil {
-		return fmt.Errorf("failed to send authentication OK: %w", err)
-	}
-
-	// Send backend key data
-	if err := sendBackendKeyData(client, processID, secretKey); err != nil {
-		return fmt.Errorf("failed to send backend key data: %w", err)
-	}
-
-	// Send parameter status messages
-	if err := p.sendParameterStatuses(client, user); err != nil {
-		return err
-	}
-
-	// Send ready for query
-	if err := sendReadyForQuery(client, 'I'); err != nil {
-		return fmt.Errorf("failed to send ready for query: %w", err)
-	}
 
 	client.SetAuthenticated(true)
 	logger.Info("Client authenticated successfully with passthrough credentials")
@@ -327,6 +330,21 @@ func (p *WildcardPooler) createBackendConnectionWithCredentials(
 	if err := p.authenticateBackendWithPassword(backend, user, password); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("backend authentication failed: %w", err)
+	}
+
+	// CRITICAL: Verify buffer is clean after authentication
+	buffered := backend.reader.Buffered()
+	if buffered > 0 {
+		p.logger.Error("Backend connection has buffered data after authentication",
+			"bytes", buffered,
+			"backend", backend.RemoteAddr())
+		// Drain the buffer
+		junk := make([]byte, buffered)
+		if _, err := backend.reader.Read(junk); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to drain buffer: %w", err)
+		}
+		p.logger.Debug("Drained buffered data after authentication", "bytes", buffered)
 	}
 
 	return backend, nil
@@ -585,6 +603,17 @@ func (dm *DatabaseManager) createBackendConnection() (*BackendConnection, error)
 	if err := dm.authenticateBackend(backend); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	// CRITICAL: Verify buffer is clean after authentication
+	buffered := backend.reader.Buffered()
+	if buffered > 0 {
+		// This shouldn't happen, but drain it if it does
+		junk := make([]byte, buffered)
+		if _, err := backend.reader.Read(junk); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to drain buffer: %w", err)
+		}
 	}
 
 	return backend, nil

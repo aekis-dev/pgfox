@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -296,15 +295,9 @@ func (b *BackendConnection) IsAlive() bool {
 
 	// Try to read one byte
 	one := make([]byte, 1)
-	n, err := netConn.Read(one)
+	_, err := netConn.Read(one)
 
-	if err == nil && n > 0 {
-		// Unexpected data - put it back and consider connection alive
-		b.reader = bufio.NewReader(io.MultiReader(bytes.NewReader(one), netConn))
-		return true
-	}
-
-	// Check if timeout (good - no data means alive)
+	// Check if timeout (good - no data means alive and idle)
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		return true
 	}
