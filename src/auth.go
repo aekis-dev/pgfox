@@ -211,7 +211,7 @@ func (s *SCRAMAuth) xor(a, b []byte) []byte {
 
 // handleSCRAMAuth handles SCRAM-SHA-256 authentication
 func handleSCRAMAuth(backend *BackendConnection, username, password string, saslData []byte) error {
-	// Parse supported SASL mechanisms from the server
+	// Parse supported SASL mechanisms
 	mechanisms := parseSASLMechanisms(saslData)
 
 	// Check if SCRAM-SHA-256 is supported
@@ -233,26 +233,22 @@ func handleSCRAMAuth(backend *BackendConnection, username, password string, sasl
 	initialResponse := scram.BuildInitialResponse()
 
 	// Build SASL initial response message
-	// Format: mechanism_name(null-terminated) + initial_response_length(4 bytes) + initial_response
 	mechanism := "SCRAM-SHA-256"
 	msgLen := len(mechanism) + 1 + 4 + len(initialResponse)
 	msg := make([]byte, msgLen)
 
 	pos := 0
-	// Mechanism name (null-terminated)
 	copy(msg[pos:], mechanism)
 	pos += len(mechanism)
-	msg[pos] = 0 // null terminator
+	msg[pos] = 0
 	pos++
 
-	// Initial response length (4 bytes, big-endian)
 	msg[pos] = byte(len(initialResponse) >> 24)
 	msg[pos+1] = byte(len(initialResponse) >> 16)
 	msg[pos+2] = byte(len(initialResponse) >> 8)
 	msg[pos+3] = byte(len(initialResponse))
 	pos += 4
 
-	// Initial response
 	copy(msg[pos:], initialResponse)
 
 	if err := backend.WriteMessage('p', msg); err != nil {
@@ -266,7 +262,6 @@ func handleSCRAMAuth(backend *BackendConnection, username, password string, sasl
 	}
 
 	if msgType == 'E' {
-		// Parse error message
 		errorMsg := parseErrorMessage(body)
 		return fmt.Errorf("SCRAM authentication failed: %s", errorMsg)
 	}
@@ -284,10 +279,7 @@ func handleSCRAMAuth(backend *BackendConnection, username, password string, sasl
 		return fmt.Errorf("expected SASL continue, got auth type %d", authType)
 	}
 
-	// Extract server first message
 	serverFirst := body[4:]
-
-	// Process server first and build client final
 	clientFinal, err := scram.ProcessServerFirst(serverFirst)
 	if err != nil {
 		return fmt.Errorf("failed to process server first: %w", err)
@@ -305,7 +297,6 @@ func handleSCRAMAuth(backend *BackendConnection, username, password string, sasl
 	}
 
 	if msgType == 'E' {
-		// Parse error message
 		errorMsg := parseErrorMessage(body)
 		return fmt.Errorf("SCRAM final authentication failed: %s", errorMsg)
 	}
@@ -323,11 +314,70 @@ func handleSCRAMAuth(backend *BackendConnection, username, password string, sasl
 		return fmt.Errorf("expected SASL final, got auth type %d", authType)
 	}
 
-	// Verify server final
 	serverFinal := body[4:]
 	if err := scram.VerifyServerFinal(serverFinal); err != nil {
 		return fmt.Errorf("server verification failed: %w", err)
 	}
 
-	return nil
+	// CRITICAL: SCRAM auth is complete, but we MUST continue reading
+	// until we get ReadyForQuery. The server will send:
+	// - AuthenticationOK (R with type=0)
+	// - ParameterStatus (S) messages
+	// - BackendKeyData (K)
+	// - ReadyForQuery (Z)
+
+	authComplete := false
+
+	for {
+		msgType, body, err := backend.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("failed to read post-SCRAM message: %w", err)
+		}
+
+		switch msgType {
+		case 'R': // Should be AuthenticationOK
+			if len(body) >= 4 {
+				authType := uint32(body[0])<<24 | uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
+				if authType == AuthenticationOK {
+					authComplete = true
+					continue
+				}
+			}
+			return fmt.Errorf("unexpected auth message after SCRAM")
+
+		case 'K': // Backend key data
+			if !authComplete {
+				return fmt.Errorf("received BackendKeyData before AuthenticationOK")
+			}
+			if len(body) >= 8 {
+				processID := int32(body[0])<<24 | int32(body[1])<<16 | int32(body[2])<<8 | int32(body[3])
+				secretKey := int32(body[4])<<24 | int32(body[5])<<16 | int32(body[6])<<8 | int32(body[7])
+				backend.SetProcessID(processID)
+				backend.SetSecretKey(secretKey)
+			}
+			continue
+
+		case 'S': // Parameter status
+			if !authComplete {
+				return fmt.Errorf("received ParameterStatus before AuthenticationOK")
+			}
+			continue
+
+		case 'Z': // Ready for query - DONE!
+			if !authComplete {
+				return fmt.Errorf("received ReadyForQuery before AuthenticationOK")
+			}
+			return nil
+
+		case 'E':
+			errorMsg := parseErrorMessage(body)
+			return fmt.Errorf("error after SCRAM: %s", errorMsg)
+
+		case 'N':
+			continue
+
+		default:
+			return fmt.Errorf("unexpected message type after SCRAM: %c", msgType)
+		}
+	}
 }
