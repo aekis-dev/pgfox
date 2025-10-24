@@ -1,0 +1,45 @@
+name: pgfox-service
+services:
+  9f3cf465-e480-4a2d-a47d-36d8e468808e:
+    image: aekis/pgfox:latest
+    expose:
+      - 5432
+      - 4502
+    configs:
+      - source: 125ceb23-7556-4c02-af88-950a64a89e78
+        target: /etc/pgfox/config.yaml
+        mode: 0755
+    environment:
+      - TZ=UTC
+    networks:
+      - postgres-6416c805
+    restart: always
+
+networks:
+  postgres-6416c805:
+    name: postgres-6416c805
+    driver: overlay
+    external: true
+
+configs:
+  125ceb23-7556-4c02-af88-950a64a89e78:
+    name: 125ceb23-7556-4c02-af88-950a64a89e78
+    content: |
+      server:
+        listen_addr: ":5432"
+        max_connections: 1000
+        connect_timeout: 10s
+        idle_timeout: 10m
+      logging:
+        level: "debug"
+        format: "text"
+      targets:
+        - name: "primary_cluster"
+          host: "3b528289-a9c2-4054-8bf0-7d6108ac5d54"
+          port: 5432
+          ssl_mode: "prefer"
+          max_connections: 50
+          priority: 1
+      metrics:
+        enabled: true
+        port: 4502
