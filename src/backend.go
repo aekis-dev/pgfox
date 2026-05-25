@@ -15,29 +15,32 @@ type BackendConnection struct {
 	reader         *bufio.Reader
 	writer         *bufio.Writer
 	dbName         string
+	username       string
 	targetName     string
 	inUse          bool
 	createdAt      time.Time
 	lastUsedAt     time.Time
 	processID      int32
 	secretKey      int32
-	isListening    bool
-	listenChannels map[string]bool
 	clientRef      *ClientConnection
+	maxMessageSize int               // maximum allowed PostgreSQL message body size in bytes
+	parameters     map[string]string // ParameterStatus values received during backend auth
 	mu             sync.Mutex
 }
 
 // NewBackendConnection creates a new backend connection
-func NewBackendConnection(conn net.Conn, dbName, targetName string) *BackendConnection {
+func NewBackendConnection(conn net.Conn, dbName, targetName, username string, maxMessageSize int) *BackendConnection {
 	return &BackendConnection{
 		conn:           conn,
 		reader:         bufio.NewReader(conn),
 		writer:         bufio.NewWriter(conn),
 		dbName:         dbName,
+		username:       username,
 		targetName:     targetName,
 		createdAt:      time.Now(),
 		lastUsedAt:     time.Now(),
-		listenChannels: make(map[string]bool),
+		maxMessageSize: maxMessageSize,
+		parameters:     make(map[string]string),
 	}
 }
 
@@ -47,7 +50,14 @@ func (b *BackendConnection) Close() error {
 	defer b.mu.Unlock()
 
 	if b.conn != nil {
-		return b.conn.Close()
+		addr := b.conn.RemoteAddr()
+		err := b.conn.Close()
+		if err != nil {
+			// Log with context about which connection closed
+			return fmt.Errorf("failed to close backend %v: %w", addr, err)
+		}
+		// Explicitly log successful close
+		return nil
 	}
 	return nil
 }
@@ -126,45 +136,6 @@ func (b *BackendConnection) SetSecretKey(secretKey int32) {
 	b.secretKey = secretKey
 }
 
-// IsListening returns whether the connection is listening for notifications
-func (b *BackendConnection) IsListening() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.isListening
-}
-
-// SetListening sets the listening status
-func (b *BackendConnection) SetListening(listening bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.isListening = listening
-}
-
-// AddListenChannel adds a channel to the listen set
-func (b *BackendConnection) AddListenChannel(channel string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.listenChannels[channel] = true
-}
-
-// RemoveListenChannel removes a channel from the listen set
-func (b *BackendConnection) RemoveListenChannel(channel string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.listenChannels, channel)
-}
-
-// GetListenChannels returns a copy of the listen channels
-func (b *BackendConnection) GetListenChannels() map[string]bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	channels := make(map[string]bool)
-	for ch, active := range b.listenChannels {
-		channels[ch] = active
-	}
-	return channels
-}
-
 // GetClientRef returns the associated client connection
 func (b *BackendConnection) GetClientRef() *ClientConnection {
 	b.mu.Lock()
@@ -185,8 +156,8 @@ func (b *BackendConnection) WriteMessage(msgType byte, body []byte) error {
 	defer b.mu.Unlock()
 
 	// Validate message parameters
-	if len(body) > 1024*1024 { // 1MB limit
-		return fmt.Errorf("message body too large: %d bytes", len(body))
+	if len(body) > b.maxMessageSize {
+		return fmt.Errorf("message body %d bytes exceeds max_message_size %d", len(body), b.maxMessageSize)
 	}
 
 	// Write message type
@@ -236,8 +207,8 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid message length %d for type %c (must be >= 4)", length, msgType)
 	}
 
-	if length > 1024*1024*10 { // 10MB limit for large result sets
-		return 0, nil, fmt.Errorf("message length %d too large for type %c", length, msgType)
+	if length > uint32(b.maxMessageSize) {
+		return 0, nil, fmt.Errorf("message length %d exceeds max_message_size %d for type %c", length, b.maxMessageSize, msgType)
 	}
 
 	// Read message body (length includes the length field itself)
@@ -304,4 +275,8 @@ func (b *BackendConnection) IsAlive() bool {
 
 	// Any other error = closed
 	return false
+}
+
+func (b *BackendConnection) Peek(n int) ([]byte, error) {
+	return b.reader.Peek(n)
 }

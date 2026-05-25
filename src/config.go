@@ -23,28 +23,72 @@ type ServerConfig struct {
 	ConnectTimeout time.Duration `yaml:"connect_timeout"`
 	IdleTimeout    time.Duration `yaml:"idle_timeout"`
 
-	// SSL Configuration
-	SSLCertFile string `yaml:"ssl_cert_file"`
-	SSLKeyFile  string `yaml:"ssl_key_file"`
-	SSLCAFile   string `yaml:"ssl_ca_file"`
+	// QueryTimeout is the maximum time allowed for a single query response to
+	// complete. Set to 0 to disable — recommended when clients may upload large
+	// binary attachments via the extended query protocol.
+	QueryTimeout time.Duration `yaml:"query_timeout"`
+
+	// MaxMessageSize is the maximum allowed size of a single PostgreSQL protocol
+	// message in bytes. Must be large enough for binary attachments sent via Bind
+	// messages. Default: 256 MB.
+	MaxMessageSize int `yaml:"max_message_size"`
+
+	// PgFoxDir is the base directory for PgFox runtime files.
+	// Bootstrap files (generated automatically if missing):
+	//   {pgfox_dir}/ca.crt          CA certificate
+	//   {pgfox_dir}/ca.key          CA private key
+	//   {pgfox_dir}/server.crt      PostgreSQL server cert (copy to $PGDATA)
+	//   {pgfox_dir}/server.key      PostgreSQL server key  (copy to $PGDATA)
+	//   {pgfox_dir}/pgfox.crt       PgFox client-facing TLS cert (CN=Hostname)
+	//   {pgfox_dir}/pgfox.key       PgFox client-facing TLS key
+	// Runtime certs (generated on demand):
+	//   {pgfox_dir}/certs/{role}.crt   Per-role backend client certs
+	//   {pgfox_dir}/certs/{role}.key
+	PgFoxDir string `yaml:"pgfox_dir"`
+
+	// Hostname is the CN used for the PgFox client-facing TLS certificate
+	// ({pgfox_dir}/pgfox.crt). Must match the hostname or IP clients use to
+	// connect to PgFox, otherwise TLS verification will fail.
+	// Default: "localhost"
+	Hostname string `yaml:"hostname"`
+
+	// PgFoxRole is the PostgreSQL role used for the privileged connection.
+	// Its certificate is generated automatically at {pgfox_dir}/certs/{pgfox_role}.crt.
+	// This role must have pg_read_all_auth_data (PG14+) or superuser privilege.
+	PgFoxRole string `yaml:"pgfox_role"`
+
+	// Certs contains certificate generation settings for user certificates.
+	Certs CertsConfig `yaml:"certs"`
 }
 
-// Target represents a PostgreSQL server that can serve one or more databases
-// If IncludeDatabases is specified, only those databases are accessible
-// If IncludeDatabases is empty, all databases are accessible (wildcard mode)
+// CertsConfig contains settings for dynamically generated user certificates.
+type CertsConfig struct {
+	// TTL is how long generated user certificates are valid.
+	// Certificates are renewed automatically when they expire.
+	TTL time.Duration `yaml:"ttl"`
+
+	// Subject fields for generated certificates.
+	// CN is always set to the PostgreSQL username — not configurable.
+	Organization       string `yaml:"organization"`
+	OrganizationalUnit string `yaml:"organizational_unit"`
+	Country            string `yaml:"country"`
+}
+
+// Target represents a PostgreSQL server that can serve one or more databases.
+// Backend connections always use verify-full TLS with client certificate auth.
+// If IncludeDatabases is specified, only those databases are accessible.
+// If IncludeDatabases is empty, all databases are accessible (wildcard mode).
 type Target struct {
 	Name           string            `yaml:"name"`
 	Host           string            `yaml:"host"`
 	Port           int               `yaml:"port"`
-	SSLMode        string            `yaml:"ssl_mode"`
-	SSLCAFile      string            `yaml:"ssl_ca_file"`
 	MaxConnections int               `yaml:"max_connections"`
 	ConnectTimeout time.Duration     `yaml:"connect_timeout"`
 	Parameters     map[string]string `yaml:"parameters"`
 
 	// Database filtering (both optional)
-	IncludeDatabases []string `yaml:"include_databases"` // If specified, ONLY these databases
-	ExcludeDatabases []string `yaml:"exclude_databases"` // Exclude these databases
+	IncludeDatabases []string `yaml:"include_databases"`
+	ExcludeDatabases []string `yaml:"exclude_databases"`
 
 	// Priority for multi-target scenarios (lower = higher priority)
 	Priority int `yaml:"priority"`
@@ -64,111 +108,87 @@ type MetricsConfig struct {
 	Path    string `yaml:"path"`
 }
 
-// LoadConfig loads configuration from a YAML file
+// LoadConfig loads configuration from a YAML file.
+// Defaults are applied first via defaultConfig(); only fields present in the
+// file are overwritten — same pattern as the dfne project.
 func LoadConfig(configPath string) (*Config, error) {
+	config := Config{
+		Server: ServerConfig{
+			ListenAddr:     ":5432",
+			MaxConnections: 20,
+			ConnectTimeout: 10 * time.Second,
+			IdleTimeout:    10 * time.Minute,
+			QueryTimeout:   0, // disabled — no fixed deadline on query execution
+			MaxMessageSize: 256 * 1024 * 1024,
+			PgFoxDir:       "/etc/pgfox",
+			Hostname:       "localhost",
+			PgFoxRole:      "postgres",
+			Certs: CertsConfig{
+				TTL:                2160 * time.Hour, // 90 days
+				Organization:       "PgFox",
+				OrganizationalUnit: "PostgreSQL Users",
+				Country:            "US",
+			},
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "text",
+		},
+		Metrics: MetricsConfig{
+			Enabled: false,
+			Port:    4502,
+			Path:    "/metrics",
+		},
+	}
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	// Expand environment variables
-	expandedData := os.ExpandEnv(string(data))
-
-	var config Config
-	if err := yaml.Unmarshal([]byte(expandedData), &config); err != nil {
+	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	// Set defaults
-	if err := config.setDefaults(); err != nil {
-		return nil, fmt.Errorf("failed to set defaults: %w", err)
+	// Per-target defaults that depend on other config values and cannot be
+	// expressed as struct literals.
+	for i := range config.Targets {
+		t := &config.Targets[i]
+		if t.Port == 0 {
+			t.Port = 5432
+		}
+		if t.MaxConnections == 0 {
+			t.MaxConnections = 20
+		}
+		if t.ConnectTimeout == 0 {
+			t.ConnectTimeout = config.Server.ConnectTimeout
+		}
+		if len(t.ExcludeDatabases) == 0 && len(t.IncludeDatabases) == 0 {
+			t.ExcludeDatabases = []string{"template0", "template1"}
+		}
 	}
 
-	// Validate configuration
-	if err := config.validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-
-	return &config, nil
+	return &config, config.validate()
 }
 
-// setDefaults sets default values for configuration
-func (c *Config) setDefaults() error {
-	// Server defaults
-	if c.Server.ListenAddr == "" {
-		c.Server.ListenAddr = ":5432"
-	}
-	if c.Server.MaxConnections == 0 {
-		c.Server.MaxConnections = 100
-	}
-	if c.Server.ConnectTimeout == 0 {
-		c.Server.ConnectTimeout = 10 * time.Second
-	}
-	if c.Server.IdleTimeout == 0 {
-		c.Server.IdleTimeout = 10 * time.Minute
-	}
-
-	// Target defaults
-	for i := range c.Targets {
-		target := &c.Targets[i]
-		if target.Port == 0 {
-			target.Port = 5432
-		}
-		if target.MaxConnections == 0 {
-			target.MaxConnections = 20
-		}
-		if target.ConnectTimeout == 0 {
-			target.ConnectTimeout = c.Server.ConnectTimeout
-		}
-		if target.SSLMode == "" {
-			target.SSLMode = "prefer"
-		}
-		// Default exclude databases
-		if len(target.ExcludeDatabases) == 0 && len(target.IncludeDatabases) == 0 {
-			target.ExcludeDatabases = []string{"template0", "template1"}
-		}
-	}
-
-	// Logging defaults
-	if c.Logging.Level == "" {
-		c.Logging.Level = "info"
-	}
-	if c.Logging.Format == "" {
-		c.Logging.Format = "text"
-	}
-
-	// Metrics defaults
-	if c.Metrics.Port == 0 {
-		c.Metrics.Port = 4502
-	}
-	if c.Metrics.Path == "" {
-		c.Metrics.Path = "/metrics"
-	}
-
-	return nil
-}
-
-// validate validates the configuration
+// validate checks that required fields are present and consistent.
 func (c *Config) validate() error {
 	if len(c.Targets) == 0 {
 		return fmt.Errorf("no targets configured")
 	}
 
-	// Validate targets
-	targetNames := make(map[string]bool)
-	for i, target := range c.Targets {
-		if target.Name == "" {
+	seen := make(map[string]bool)
+	for i, t := range c.Targets {
+		if t.Name == "" {
 			return fmt.Errorf("targets[%d]: name is required", i)
 		}
-		if target.Host == "" {
+		if t.Host == "" {
 			return fmt.Errorf("targets[%d]: host is required", i)
 		}
-
-		// Check for duplicate names
-		if targetNames[target.Name] {
-			return fmt.Errorf("targets[%d]: duplicate target name: %s", i, target.Name)
+		if seen[t.Name] {
+			return fmt.Errorf("targets[%d]: duplicate target name: %s", i, t.Name)
 		}
-		targetNames[target.Name] = true
+		seen[t.Name] = true
 	}
 
 	return nil

@@ -21,24 +21,26 @@ type ClientConnection struct {
 	password       string
 	inTransaction  bool
 	isListening    bool
-	listenChannels map[string]bool
+	listenChannels map[Channel]bool
 	logger         *Logger
 	mu             sync.Mutex
 	connectedAt    time.Time
 	lastActivity   time.Time
+	maxMessageSize int // maximum allowed PostgreSQL message body size in bytes
 }
 
 // NewClientConnection creates a new client connection
-func NewClientConnection(conn net.Conn, logger *Logger) *ClientConnection {
+func NewClientConnection(conn net.Conn, logger *Logger, maxMessageSize int) *ClientConnection {
 	now := time.Now()
 	return &ClientConnection{
 		conn:           conn,
 		reader:         bufio.NewReader(conn),
 		writer:         bufio.NewWriter(conn),
-		listenChannels: make(map[string]bool),
+		listenChannels: make(map[Channel]bool),
 		logger:         logger,
 		connectedAt:    now,
 		lastActivity:   now,
+		maxMessageSize: maxMessageSize,
 	}
 }
 
@@ -157,7 +159,7 @@ func (c *ClientConnection) SetListening(listening bool) {
 }
 
 // AddListenChannel adds a channel to the listen set
-func (c *ClientConnection) AddListenChannel(channel string) {
+func (c *ClientConnection) AddListenChannel(channel Channel) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.listenChannels[channel] = true
@@ -166,7 +168,7 @@ func (c *ClientConnection) AddListenChannel(channel string) {
 }
 
 // RemoveListenChannel removes a channel from the listen set
-func (c *ClientConnection) RemoveListenChannel(channel string) {
+func (c *ClientConnection) RemoveListenChannel(channel Channel) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.listenChannels, channel)
@@ -176,10 +178,10 @@ func (c *ClientConnection) RemoveListenChannel(channel string) {
 }
 
 // GetListenChannels returns a copy of the listen channels
-func (c *ClientConnection) GetListenChannels() map[string]bool {
+func (c *ClientConnection) GetListenChannels() map[Channel]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	channels := make(map[string]bool)
+	channels := make(map[Channel]bool)
 	for ch, active := range c.listenChannels {
 		channels[ch] = active
 	}
@@ -190,7 +192,7 @@ func (c *ClientConnection) GetListenChannels() map[string]bool {
 func (c *ClientConnection) ClearListenChannels() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.listenChannels = make(map[string]bool)
+	c.listenChannels = make(map[Channel]bool)
 	c.isListening = false
 }
 
@@ -207,7 +209,11 @@ func (c *ClientConnection) SetBackendConnection(conn *BackendConnection) {
 	defer c.mu.Unlock()
 
 	if c.backendConn != nil && c.backendConn != conn {
-		c.logger.Debug("Replacing existing backend connection")
+		if conn != nil {
+			c.logger.Debug("Replacing existing backend connection")
+		} else {
+			c.logger.Debug("Clearing backend connection reference")
+		}
 		// Don't close the old connection here - let the pooler handle it
 	}
 
@@ -226,8 +232,8 @@ func (c *ClientConnection) ShouldKeepBackendConnection() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Keep connection if in transaction or listening
-	return c.inTransaction || c.isListening
+	// Keep connection only if in transaction — listening is managed by Listen monitors
+	return c.inTransaction
 }
 
 // WriteMessage writes a message to the client
@@ -239,7 +245,7 @@ func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
 	c.lastActivity = time.Now()
 
 	// Validate message parameters
-	if len(body) > 1024*1024*10 { // 10MB limit
+	if len(body) > c.maxMessageSize {
 		return fmt.Errorf("message body too large: %d bytes", len(body))
 	}
 
@@ -290,8 +296,8 @@ func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid message length %d for type %c from client (must be >= 4)", length, msgType)
 	}
 
-	if length > 1024*1024 { // 1MB limit for client messages
-		return 0, nil, fmt.Errorf("message length %d too large for type %c from client", length, msgType)
+	if length > uint32(c.maxMessageSize) {
+		return 0, nil, fmt.Errorf("message length %d exceeds max_message_size %d for type %c from client", length, c.maxMessageSize, msgType)
 	}
 
 	// Read message body (length includes the length field itself)

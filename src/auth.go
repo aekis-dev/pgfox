@@ -381,3 +381,71 @@ func handleSCRAMAuth(backend *BackendConnection, username, password string, sasl
 		}
 	}
 }
+
+// SCRAMVerifier holds the server-side SCRAM-SHA-256 verification data
+// retrieved from pg_authid.rolpassword. PgFox uses this to act as a
+// proper SCRAM server when authenticating clients without needing plaintext.
+type SCRAMVerifier struct {
+	Iterations int
+	Salt       []byte // raw bytes decoded from base64
+	StoredKey  []byte // HMAC-SHA-256(SHA-256(ClientKey), "")
+	ServerKey  []byte // HMAC-SHA-256(SaltedPassword, "Server Key")
+}
+
+// parseSCRAMVerifier parses a PostgreSQL SCRAM-SHA-256 verifier string from
+// pg_authid.rolpassword. The format is:
+//
+//	SCRAM-SHA-256$<iterations>:<salt-base64>$<StoredKey-base64>:<ServerKey-base64>
+func parseSCRAMVerifier(rolpassword string) (*SCRAMVerifier, error) {
+	const prefix = "SCRAM-SHA-256$"
+	if !strings.HasPrefix(rolpassword, prefix) {
+		return nil, fmt.Errorf("not a SCRAM-SHA-256 verifier: unexpected prefix")
+	}
+
+	rest := rolpassword[len(prefix):]
+
+	// Split on "$" to separate "iterations:salt" from "StoredKey:ServerKey"
+	parts := strings.SplitN(rest, "$", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid SCRAM verifier: missing $ separator")
+	}
+
+	// Parse iterations and salt
+	iterSalt := strings.SplitN(parts[0], ":", 2)
+	if len(iterSalt) != 2 {
+		return nil, fmt.Errorf("invalid SCRAM verifier: missing iterations:salt separator")
+	}
+
+	iterations, err := strconv.Atoi(iterSalt[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid SCRAM verifier: bad iterations %q: %w", iterSalt[0], err)
+	}
+
+	salt, err := base64.StdEncoding.DecodeString(iterSalt[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid SCRAM verifier: bad salt base64: %w", err)
+	}
+
+	// Parse StoredKey and ServerKey
+	keys := strings.SplitN(parts[1], ":", 2)
+	if len(keys) != 2 {
+		return nil, fmt.Errorf("invalid SCRAM verifier: missing StoredKey:ServerKey separator")
+	}
+
+	storedKey, err := base64.StdEncoding.DecodeString(keys[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid SCRAM verifier: bad StoredKey base64: %w", err)
+	}
+
+	serverKey, err := base64.StdEncoding.DecodeString(keys[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid SCRAM verifier: bad ServerKey base64: %w", err)
+	}
+
+	return &SCRAMVerifier{
+		Iterations: iterations,
+		Salt:       salt,
+		StoredKey:  storedKey,
+		ServerKey:  serverKey,
+	}, nil
+}
