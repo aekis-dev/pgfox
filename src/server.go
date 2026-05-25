@@ -318,43 +318,57 @@ func (p *Server) Stats() GlobalStats {
 	}
 }
 
-// getPool returns the Pool for (dbName, user), or nil if not found.
+// getPool returns the existing Pool for (dbName, user), or creates a new one
+// under the highest-priority target that serves dbName. Returns nil if no
+// target serves the database.
 func (p *Server) getPool(dbName, user string) *Pool {
+	// Fast path: read-only lookup.
 	p.targetsMu.RLock()
-	defer p.targetsMu.RUnlock()
-
-	for _, target := range p.getSortedTargets() {
-		if !p.targetServesDatabase(target, dbName) {
+	for _, t := range p.getSortedTargets() {
+		if !p.targetServesDatabase(t, dbName) {
 			continue
 		}
-		if targetMap, ok := p.targets[target.Name]; ok {
+		if targetMap, ok := p.targets[t.Name]; ok {
 			if dbMap, ok := targetMap[dbName]; ok {
 				if pool, ok := dbMap[user]; ok {
+					p.targetsMu.RUnlock()
 					return pool
 				}
 			}
 		}
 	}
-	return nil
-}
+	p.targetsMu.RUnlock()
 
-// addPool registers a new pool and starts its manager goroutine.
-// The pool starts empty — the manager goroutine opens the first connection
-// on its first growth tick and closes pool.ready when it is in backendPool.
-func (p *Server) addPool(target *Target, dbName, user string) (*Pool, error) {
+	// Pool not found — select the target and create under write lock.
+	var target *Target
+	for _, t := range p.getSortedTargets() {
+		if p.targetServesDatabase(t, dbName) {
+			target = t
+			break
+		}
+	}
+	if target == nil {
+		return nil
+	}
+
+	// Slow path: create under write lock.
 	p.targetsMu.Lock()
 	defer p.targetsMu.Unlock()
+
+	// Re-check under write lock — another goroutine may have created it.
+	if targetMap, ok := p.targets[target.Name]; ok {
+		if dbMap, ok := targetMap[dbName]; ok {
+			if pool, ok := dbMap[user]; ok {
+				return pool
+			}
+		}
+	}
 
 	if p.targets[target.Name] == nil {
 		p.targets[target.Name] = make(map[string]map[string]*Pool)
 	}
 	if p.targets[target.Name][dbName] == nil {
 		p.targets[target.Name][dbName] = make(map[string]*Pool)
-	}
-
-	// Race guard: another goroutine may have created the pool already.
-	if existing, ok := p.targets[target.Name][dbName][user]; ok {
-		return existing, nil
 	}
 
 	config := DatabaseConfig{
@@ -389,7 +403,7 @@ func (p *Server) addPool(target *Target, dbName, user string) (*Pool, error) {
 	p.wg.Add(1)
 	go pool.run(p)
 
-	return pool, nil
+	return pool
 }
 
 // run is the pool manager goroutine — the sole creator of backend connections.

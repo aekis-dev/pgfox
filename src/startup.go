@@ -122,19 +122,14 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, database string) error {
 	logger := client.Logger()
 
-	// Find the target that serves this database.
-	var selectedTarget *Target
-	for _, target := range p.getSortedTargets() {
-		if p.targetServesDatabase(target, database) {
-			selectedTarget = target
-			logger.Debug("Selected target", "target", target.Name, "priority", target.Priority)
-			break
-		}
-	}
-	if selectedTarget == nil {
+	// Get or create the pool — target selection is handled inside getPool.
+	pool := p.getPool(database, user)
+	if pool == nil {
 		logger.Warn("No target serves database", "database", database)
 		return sendErrorResponse(client, "FATAL", "3D000", "database not found")
 	}
+
+	selectedTarget := pool.target
 
 	// Fetch live SCRAM verifier from pg_shadow.
 	verifier, err := p.getSCRAMVerifier(selectedTarget.Name, user)
@@ -150,15 +145,6 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 	}
 	logger.Info("Client SCRAM authentication successful")
 
-	// Ensure the pool exists for this (target, database, user). If it already
-	// exists (another client authenticated first) we reuse it — no connection
-	// is opened here in either case.
-	pool, err := p.addPool(selectedTarget, database, user)
-	if err != nil {
-		logger.WithError(err).Error("Failed to create pool")
-		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
-	}
-
 	// Block until the pool manager has at least one connection ready.
 	select {
 	case <-pool.ready:
@@ -169,7 +155,6 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 	}
 
 	// Peek the first idle connection's BackendKeyData without consuming it.
-	// This is best-effort — cancel requests are already best-effort by protocol.
 	var processID, secretKey int32
 	select {
 	case conn := <-pool.backendPool:
@@ -177,12 +162,8 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 		secretKey = conn.GetSecretKey()
 		pool.backendPool <- conn
 	default:
-		// All connections are currently active — send zero values.
-		// The client can still send queries; cancel just won't work for this session.
 	}
 
-	// Send authentication success to the client using parameters captured from
-	// the privileged connection at startup — no extra backend connection needed.
 	if err := sendAuthenticationOK(client); err != nil {
 		return fmt.Errorf("failed to send AuthenticationOK: %w", err)
 	}
