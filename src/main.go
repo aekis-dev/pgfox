@@ -41,10 +41,10 @@ func main() {
 	logger := NewLogger(config.Logging)
 	logger.Info("Starting PgFox", "version", Version, "config", *configPath)
 
-	// Create pooler
-	pooler, err := NewWildcardPooler(*config, logger)
+	// Create server
+	server, err := NewServer(*config, logger)
 	if err != nil {
-		logger.Fatal("Failed to create pooler", "error", err)
+		logger.Fatal("Failed to create server", "error", err)
 	}
 
 	// Setup graceful shutdown
@@ -61,14 +61,8 @@ func main() {
 		cancel()
 	}()
 
-	// Start the pooler
-	logger.Info("Starting PostgreSQL connection pooler",
-		"listen_addr", config.Server.ListenAddr,
-		"targets", len(config.Targets),
-	)
-
-	if err := pooler.Start(ctx); err != nil {
-		logger.Fatal("Pooler failed to start", "error", err)
+	if err := server.Start(ctx); err != nil {
+		logger.Fatal("Server failed to start", "error", err)
 	}
 
 	logger.Info("PgFox shutdown complete")

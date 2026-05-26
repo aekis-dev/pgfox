@@ -130,6 +130,12 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 
 	target := pool.target
 
+	// Check access control rules before doing any crypto work.
+	if err := target.checkAccess(client.RemoteAddr(), user, database); err != nil {
+		logger.Warn("Access denied", "user", user, "database", database, "client", client.RemoteAddr(), "target", target.Name)
+		return sendErrorResponse(client, "FATAL", "28000", "access denied")
+	}
+
 	// Fetch live SCRAM verifier from pg_shadow via target.conn.
 	verifier, err := p.getSCRAMVerifier(target, user)
 	if err != nil {

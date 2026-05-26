@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"sort"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,7 +13,7 @@ import (
 // Config represents the main configuration structure
 type Config struct {
 	Server  ServerConfig  `yaml:"server"`
-	Targets []Target      `yaml:"targets"`
+	Targets []*Target     `yaml:"targets"`
 	Logging LoggingConfig `yaml:"logging"`
 	Metrics MetricsConfig `yaml:"metrics"`
 }
@@ -84,6 +86,28 @@ type CertsConfig struct {
 	Country            string `yaml:"country"`
 }
 
+// RuleAction defines whether a rule permits or denies access.
+type RuleAction string
+
+const (
+	RuleAllow RuleAction = "allow"
+	RuleDeny  RuleAction = "deny"
+)
+
+// Rule is a single access control entry evaluated in order within a target's
+// rules list. All specified fields must match for the rule to apply (AND logic).
+// Empty lists match anything. The first matching rule wins — if no rule matches,
+// access is denied by default.
+type Rule struct {
+	Action    RuleAction `yaml:"action"`
+	CIDR      []string   `yaml:"cidr"`
+	Users     []string   `yaml:"users"`
+	Databases []string   `yaml:"databases"`
+
+	// nets holds the parsed CIDR networks, populated by LoadConfig.
+	nets []*net.IPNet
+}
+
 // LoggingConfig contains logging configuration
 type LoggingConfig struct {
 	Level  string `yaml:"level"`
@@ -142,10 +166,10 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	// Per-target defaults that depend on other config values and cannot be
-	// expressed as struct literals.
-	for i := range config.Targets {
-		t := &config.Targets[i]
+	// Per-target initialization: apply defaults, parse CIDRs, initialize
+	// runtime fields, and add a default deny rule for system databases if
+	// no rules are configured.
+	for _, t := range config.Targets {
 		if t.Port == 0 {
 			t.Port = 5432
 		}
@@ -155,10 +179,40 @@ func LoadConfig(configPath string) (*Config, error) {
 		if t.ConnectTimeout == 0 {
 			t.ConnectTimeout = config.Server.ConnectTimeout
 		}
-		if len(t.ExcludeDatabases) == 0 && len(t.IncludeDatabases) == 0 {
-			t.ExcludeDatabases = []string{"template0", "template1"}
+		// Default rule: deny system databases unless the user has defined rules.
+		if len(t.Rules) == 0 {
+			t.Rules = []Rule{
+				{Action: RuleDeny, Databases: []string{"template0", "template1"}},
+			}
 		}
+		// Parse CIDRs in each rule once so checkAccess is allocation-free.
+		for i := range t.Rules {
+			r := &t.Rules[i]
+			for _, cidr := range r.CIDR {
+				_, network, err := net.ParseCIDR(cidr)
+				if err != nil {
+					return nil, fmt.Errorf("target %s rule %d: invalid cidr %q: %w",
+						t.Name, i, cidr, err)
+				}
+				r.nets = append(r.nets, network)
+			}
+		}
+		// Initialize runtime fields.
+		t.pools = make(map[string]map[string]*Pool)
+		t.ready = make(chan struct{})
+		t.params = make(map[string]string)
+		t.returnCh = make(chan *BackendConnection, t.MaxConnections)
+		t.closeCh = make(chan *BackendConnection, t.MaxConnections)
+		t.connReady = make(chan struct{}, 1)
 	}
+
+	// Sort targets by priority (lower value = higher priority, ties by name).
+	sort.Slice(config.Targets, func(i, j int) bool {
+		if config.Targets[i].Priority == config.Targets[j].Priority {
+			return config.Targets[i].Name < config.Targets[j].Name
+		}
+		return config.Targets[i].Priority < config.Targets[j].Priority
+	})
 
 	return &config, config.validate()
 }
@@ -181,6 +235,12 @@ func (c *Config) validate() error {
 			return fmt.Errorf("targets[%d]: duplicate target name: %s", i, t.Name)
 		}
 		seen[t.Name] = true
+		for j, r := range t.Rules {
+			if r.Action != RuleAllow && r.Action != RuleDeny {
+				return fmt.Errorf("targets[%d] rule[%d]: action must be %q or %q",
+					i, j, RuleAllow, RuleDeny)
+			}
+		}
 	}
 
 	return nil

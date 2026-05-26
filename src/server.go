@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,47 +41,17 @@ type Server struct {
 	logger *Logger
 }
 
-// NewWildcardPooler creates a new wildcard pooler.
-func NewWildcardPooler(config Config, logger *Logger) (*Server, error) {
+// NewServer creates a new PgFox server.
+func NewServer(config Config, logger *Logger) (*Server, error) {
 	listener, err := net.Listen("tcp", config.Server.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", config.Server.ListenAddr, err)
 	}
 
-	targets := make([]*Target, 0, len(config.Targets))
-	for i := range config.Targets {
-		src := &config.Targets[i]
-		t := &Target{
-			Name:             src.Name,
-			Host:             src.Host,
-			Port:             src.Port,
-			MaxConnections:   src.MaxConnections,
-			ConnectTimeout:   src.ConnectTimeout,
-			Parameters:       src.Parameters,
-			IncludeDatabases: src.IncludeDatabases,
-			ExcludeDatabases: src.ExcludeDatabases,
-			Priority:         src.Priority,
-			pools:            make(map[string]map[string]*Pool),
-			ready:            make(chan struct{}),
-			params:           make(map[string]string),
-			returnCh:         make(chan *BackendConnection, src.MaxConnections),
-			closeCh:          make(chan *BackendConnection, src.MaxConnections),
-			connReady:        make(chan struct{}, 1),
-		}
-		targets = append(targets, t)
-	}
-
-	sort.Slice(targets, func(i, j int) bool {
-		if targets[i].Priority == targets[j].Priority {
-			return targets[i].Name < targets[j].Name
-		}
-		return targets[i].Priority < targets[j].Priority
-	})
-
 	return &Server{
 		config:    config,
 		listener:  listener,
-		targets:   targets,
+		targets:   config.Targets,
 		clients:   make(map[net.Conn]*ClientConnection),
 		listeners: make(map[Channel]*Listen),
 		logger:    logger,
@@ -321,23 +290,17 @@ func (p *Server) getPool(dbName, user string) *Pool {
 
 // --- Server helpers ---
 
-// targetServesDatabase checks if a target serves a specific database.
+// targetServesDatabase checks if a target can serve a specific database.
+// Evaluates only database-matching rules; the first match wins.
+// Default is permit — consistent with checkAccess.
 func (p *Server) targetServesDatabase(target *Target, dbName string) bool {
-	if len(target.IncludeDatabases) > 0 {
-		for _, included := range target.IncludeDatabases {
-			if included == dbName {
-				goto checkExclude
-			}
+	for _, r := range target.Rules {
+		if !r.matchesDatabase(dbName) {
+			continue
 		}
-		return false
+		return r.Action == RuleAllow
 	}
-checkExclude:
-	for _, excluded := range target.ExcludeDatabases {
-		if excluded == dbName {
-			return false
-		}
-	}
-	return true
+	return true // no matching rule — default permit
 }
 
 // Stats returns current pooler statistics.

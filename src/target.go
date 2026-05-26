@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,15 +14,18 @@ import (
 // The target goroutine is the sole creator and manager of all backend connections
 // for this target.
 type Target struct {
-	Name             string            `yaml:"name"`
-	Host             string            `yaml:"host"`
-	Port             int               `yaml:"port"`
-	MaxConnections   int               `yaml:"max_connections"`
-	ConnectTimeout   time.Duration     `yaml:"connect_timeout"`
-	Parameters       map[string]string `yaml:"parameters"`
-	IncludeDatabases []string          `yaml:"include_databases"`
-	ExcludeDatabases []string          `yaml:"exclude_databases"`
-	Priority         int               `yaml:"priority"`
+	Name           string            `yaml:"name"`
+	Host           string            `yaml:"host"`
+	Port           int               `yaml:"port"`
+	MaxConnections int               `yaml:"max_connections"`
+	ConnectTimeout time.Duration     `yaml:"connect_timeout"`
+	Parameters     map[string]string `yaml:"parameters"`
+	Priority       int               `yaml:"priority"`
+
+	// Rules is the ordered access control list for this target.
+	// The first matching rule wins. If no rule matches, access is denied.
+	// Populated with defaults by LoadConfig if empty.
+	Rules []Rule `yaml:"rules"`
 
 	// --- Runtime: privileged connection ---
 	// conn is the pgfox_role backend connection used exclusively for
@@ -65,7 +69,86 @@ type Target struct {
 	wg     sync.WaitGroup
 }
 
-// --- Target goroutine ---
+// checkAccess evaluates the target's ordered rule list against the client
+// address, user, and database. The first matching rule wins — all specified
+// fields in a rule must match (AND logic), empty fields match anything.
+// Returns an error if access is denied or no rule matches (default deny).
+func (t *Target) checkAccess(clientAddr net.Addr, user, database string) error {
+	ip := extractIP(clientAddr)
+
+	for _, r := range t.Rules {
+		if !r.matchesIP(ip) {
+			continue
+		}
+		if !r.matchesUser(user) {
+			continue
+		}
+		if !r.matchesDatabase(database) {
+			continue
+		}
+		// Rule matched.
+		if r.Action == RuleDeny {
+			return fmt.Errorf("access denied for user %q database %q from %s", user, database, ip)
+		}
+		return nil // RuleAllow
+	}
+
+	// No rule matched — default permit.
+	return nil
+}
+
+// matchesIP returns true if the rule's CIDR list contains ip, or the list is empty.
+func (r *Rule) matchesIP(ip net.IP) bool {
+	if len(r.nets) == 0 {
+		return true
+	}
+	for _, network := range r.nets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesUser returns true if the rule's Users list contains user, or is empty.
+func (r *Rule) matchesUser(user string) bool {
+	if len(r.Users) == 0 {
+		return true
+	}
+	for _, u := range r.Users {
+		if u == user {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesDatabase returns true if the rule's Databases list contains database, or is empty.
+func (r *Rule) matchesDatabase(database string) bool {
+	if len(r.Databases) == 0 {
+		return true
+	}
+	for _, d := range r.Databases {
+		if d == database {
+			return true
+		}
+	}
+	return false
+}
+
+// extractIP extracts the IP address from a net.Addr, stripping the port.
+func extractIP(addr net.Addr) net.IP {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return a.IP
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return nil
+		}
+		return net.ParseIP(host)
+	}
+}
 
 // run is the target manager goroutine. It:
 //  1. Opens and maintains the privileged connection (conn).
