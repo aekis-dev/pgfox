@@ -232,6 +232,8 @@ func (p *Server) getOrCreateListen(ch Channel, client *ClientConnection) (*Liste
 	return l, true, nil
 }
 
+// removeClientFromListen removes a client from a channel's monitor.
+// If the monitor becomes empty it is torn down.
 func (p *Server) removeClientFromListen(ch Channel, client *ClientConnection) {
 	p.listenersMu.Lock()
 	l, ok := p.listeners[ch]
