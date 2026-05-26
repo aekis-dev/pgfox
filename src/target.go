@@ -54,6 +54,11 @@ type Target struct {
 	// target. Written atomically from client goroutines.
 	listenOpen int32
 
+	// draining is set to true when the target is being removed during a config
+	// reload. New pools and new borrows are refused; existing transactions are
+	// allowed to complete until query_timeout, then force-closed.
+	draining atomic.Bool
+
 	// returnCh and closeCh are target-level. conn.pool identifies which pool
 	// the connection belongs to. The target goroutine is the sole reader.
 	returnCh chan *BackendConnection
@@ -67,6 +72,39 @@ type Target struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// activeConnections returns the total number of connections currently checked
+// out across all pools on this target.
+func (t *Target) activeConnections() int {
+	t.poolsMu.RLock()
+	defer t.poolsMu.RUnlock()
+	total := 0
+	for _, dbMap := range t.pools {
+		for _, pool := range dbMap {
+			total += pool.activeConnections()
+		}
+	}
+	return total
+}
+
+// waitDrained blocks until all active connections on this target complete or
+// the timeout expires, then returns. Used during config reload removal.
+func (t *Target) waitDrained(timeout time.Duration, logger *Logger) {
+	if timeout <= 0 {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if t.activeConnections() == 0 {
+			logger.Info("Target drained of active connections", "target", t.Name)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	logger.Warn("Target drain timed out, force-closing remaining connections",
+		"target", t.Name,
+		"active", t.activeConnections())
 }
 
 // checkAccess evaluates the target's ordered rule list against the client

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,9 +26,10 @@ type GlobalStats struct {
 
 // Server is the top-level pooler. targets is an ordered slice (by priority).
 type Server struct {
-	config   Config
-	listener net.Listener
-	targets  []*Target
+	config     Config
+	listener   net.Listener
+	listenerMu sync.RWMutex // protects listener during live address changes
+	targets    []*Target
 
 	clients     map[net.Conn]*ClientConnection
 	clientsMu   sync.RWMutex
@@ -105,14 +107,18 @@ func (p *Server) Start(ctx context.Context) error {
 			p.logger.Info("Accept loop stopping")
 			return p.shutdown()
 		default:
-			if listener, ok := p.listener.(*net.TCPListener); ok {
-				listener.SetDeadline(time.Now().Add(1 * time.Second))
+			p.listenerMu.RLock()
+			ln := p.listener
+			p.listenerMu.RUnlock()
+
+			if tcpLn, ok := ln.(*net.TCPListener); ok {
+				tcpLn.SetDeadline(time.Now().Add(1 * time.Second))
 			}
 
-			conn, err := p.listener.Accept()
+			conn, err := ln.Accept()
 
-			if listener, ok := p.listener.(*net.TCPListener); ok {
-				listener.SetDeadline(time.Time{})
+			if tcpLn, ok := ln.(*net.TCPListener); ok {
+				tcpLn.SetDeadline(time.Time{})
 			}
 
 			if err != nil {
@@ -139,9 +145,11 @@ func (p *Server) Start(ctx context.Context) error {
 func (p *Server) shutdown() error {
 	p.logger.Info("Starting graceful shutdown")
 
+	p.listenerMu.Lock()
 	if p.listener != nil {
 		p.listener.Close()
 	}
+	p.listenerMu.Unlock()
 
 	p.cancel()
 	p.shutdownListeners()
@@ -235,6 +243,9 @@ func (p *Server) handleClient(conn net.Conn) {
 func (p *Server) getPool(dbName, user string) *Pool {
 	// Fast path: read-only lookup across all targets.
 	for _, target := range p.targets {
+		if target.draining.Load() {
+			continue
+		}
 		if !p.targetServesDatabase(target, dbName) {
 			continue
 		}
@@ -248,9 +259,12 @@ func (p *Server) getPool(dbName, user string) *Pool {
 		target.poolsMu.RUnlock()
 	}
 
-	// Not found — create under the first matching target.
+	// Not found — create under the first matching non-draining target.
 	var selectedTarget *Target
 	for _, t := range p.targets {
+		if t.draining.Load() {
+			continue
+		}
 		if p.targetServesDatabase(t, dbName) {
 			selectedTarget = t
 			break
@@ -324,6 +338,144 @@ func (p *Server) startMetricsServer(ctx context.Context) {
 	if err := server.Start(ctx); err != nil {
 		p.logger.WithError(err).Error("Web server failed")
 	}
+}
+
+// reload applies a new configuration to the running server without restarting.
+// It diffs the new config against the current one and:
+//  1. Marks removed targets as draining — new connections refused, existing
+//     transactions allowed to complete up to query_timeout, then force-closed.
+//  2. Updates existing targets in-place (rules, timeouts, pool size, params).
+//  3. Starts new target goroutines for added targets.
+//
+// listen_addr changes are ignored — a restart is required for that.
+func (p *Server) reload(newConfig Config) {
+	logger := p.logger.WithField("component", "reload")
+	logger.Info("Applying config reload")
+
+	oldTargets := make(map[string]*Target, len(p.targets))
+	for _, t := range p.targets {
+		oldTargets[t.Name] = t
+	}
+
+	newTargets := make(map[string]*Target, len(newConfig.Targets))
+	for _, t := range newConfig.Targets {
+		newTargets[t.Name] = t
+	}
+
+	// --- Step 1: mark removed targets as draining ---
+	var draining []*Target
+	for name, old := range oldTargets {
+		if _, exists := newTargets[name]; !exists {
+			old.draining.Store(true)
+			draining = append(draining, old)
+			logger.Info("Target marked for removal", "target", name)
+		}
+	}
+
+	// Wait for active connections to finish (up to query_timeout), then cancel.
+	for _, t := range draining {
+		timeout := p.config.Server.QueryTimeout
+		if timeout > 0 {
+			t.waitDrained(timeout, logger)
+		}
+		t.cancel()
+		t.wg.Wait()
+		logger.Info("Target removed", "target", t.Name)
+	}
+
+	// Remove drained targets from the slice.
+	if len(draining) > 0 {
+		kept := p.targets[:0]
+		drainSet := make(map[string]bool, len(draining))
+		for _, t := range draining {
+			drainSet[t.Name] = true
+		}
+		for _, t := range p.targets {
+			if !drainSet[t.Name] {
+				kept = append(kept, t)
+			}
+		}
+		p.targets = kept
+	}
+
+	// --- Step 2: update existing targets in-place ---
+	for name, old := range oldTargets {
+		fresh, exists := newTargets[name]
+		if !exists {
+			continue // already removed above
+		}
+		old.Rules = fresh.Rules
+		old.MaxConnections = fresh.MaxConnections
+		old.ConnectTimeout = fresh.ConnectTimeout
+		old.Parameters = fresh.Parameters
+		logger.Info("Target updated", "target", name)
+	}
+
+	// --- Step 3: start new targets ---
+	for name, fresh := range newTargets {
+		if _, exists := oldTargets[name]; exists {
+			continue // already updated above
+		}
+
+		tctx, tcancel := context.WithCancel(p.ctx)
+		fresh.ctx = tctx
+		fresh.cancel = tcancel
+
+		p.wg.Add(1)
+		go func(t *Target) {
+			defer p.wg.Done()
+			t.run(p)
+		}(fresh)
+
+		select {
+		case <-fresh.ready:
+			logger.Info("New target ready", "target", name)
+		case <-time.After(fresh.ConnectTimeout):
+			logger.Warn("Timed out waiting for new target", "target", name)
+		case <-p.ctx.Done():
+			return
+		}
+
+		p.targets = append(p.targets, fresh)
+	}
+
+	// --- Step 4: update server-level config (non-structural fields) ---
+	if newConfig.Server.ListenAddr != p.config.Server.ListenAddr {
+		newLn, err := net.Listen("tcp", newConfig.Server.ListenAddr)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to bind new listen_addr, keeping current",
+				"current", p.config.Server.ListenAddr,
+				"new", newConfig.Server.ListenAddr)
+		} else {
+			p.listenerMu.Lock()
+			oldLn := p.listener
+			p.listener = newLn
+			p.listenerMu.Unlock()
+			oldLn.Close() // accept loop gets a timeout/error and re-reads p.listener
+			logger.Info("Listener moved",
+				"from", p.config.Server.ListenAddr,
+				"to", newConfig.Server.ListenAddr)
+		}
+	}
+	p.config.Server.ConnectTimeout = newConfig.Server.ConnectTimeout
+	p.config.Server.IdleTimeout = newConfig.Server.IdleTimeout
+	p.config.Server.QueryTimeout = newConfig.Server.QueryTimeout
+	p.config.Server.MaxMessageSize = newConfig.Server.MaxMessageSize
+	p.config.Server.StatsInterval = newConfig.Server.StatsInterval
+	p.config.Server.PeakWindow = newConfig.Server.PeakWindow
+	p.config.Logging = newConfig.Logging
+	p.config.Targets = newConfig.Targets
+
+	// Re-sort targets by priority after any additions.
+	sort.Slice(p.targets, func(i, j int) bool {
+		if p.targets[i].Priority == p.targets[j].Priority {
+			return p.targets[i].Name < p.targets[j].Name
+		}
+		return p.targets[i].Priority < p.targets[j].Priority
+	})
+
+	logger.Info("Config reload complete",
+		"targets", len(p.targets))
 }
 
 // isSSLSupported checks whether the pgfox client-facing TLS cert exists.

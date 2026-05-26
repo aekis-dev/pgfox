@@ -51,14 +51,30 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle shutdown signals
+	// Handle shutdown signals.
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Handle reload signal separately.
+	reloadChan := make(chan os.Signal, 1)
+	signal.Notify(reloadChan, syscall.SIGHUP)
 
 	go func() {
 		sig := <-sigChan
 		logger.Info("Received shutdown signal", "signal", sig)
 		cancel()
+	}()
+
+	go func() {
+		for range reloadChan {
+			logger.Info("Received SIGHUP, reloading config")
+			newConfig, err := LoadConfig(*configPath)
+			if err != nil {
+				logger.WithError(err).Error("Config reload failed, keeping current config")
+				continue
+			}
+			server.reload(*newConfig)
+		}
 	}()
 
 	if err := server.Start(ctx); err != nil {

@@ -61,9 +61,13 @@ func (pool *Pool) newConn(p *Server) (*BackendConnection, error) {
 }
 
 // borrowConn takes a connection from the pool, blocking until one is available,
-// the timeout fires, or ctx is cancelled. Never creates connections — that is
-// the target goroutine's exclusive responsibility.
+// the timeout fires, or ctx is cancelled. Refuses if the target is draining.
+// Never creates connections — that is the target goroutine's exclusive responsibility.
 func (pool *Pool) borrowConn(ctx context.Context) (*BackendConnection, error) {
+	if pool.target.draining.Load() {
+		return nil, fmt.Errorf("target %s is being removed, try again after reconnect",
+			pool.target.Name)
+	}
 	timeout := pool.target.ConnectTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
