@@ -8,82 +8,93 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Server manages dynamic database discovery and pooling.
-type Server struct {
-	config   Config
-	listener net.Listener
+// Target represents a PostgreSQL server. It holds both config (from yaml) and
+// all runtime state: the privileged connection, pools, and connection budget.
+// The target goroutine is the sole creator and manager of all backend connections
+// for this target.
+type Target struct {
+	Name             string            `yaml:"name"`
+	Host             string            `yaml:"host"`
+	Port             int               `yaml:"port"`
+	MaxConnections   int               `yaml:"max_connections"`
+	ConnectTimeout   time.Duration     `yaml:"connect_timeout"`
+	Parameters       map[string]string `yaml:"parameters"`
+	IncludeDatabases []string          `yaml:"include_databases"`
+	ExcludeDatabases []string          `yaml:"exclude_databases"`
+	Priority         int               `yaml:"priority"`
 
-	// Unified storage: target_name -> database_name -> username -> pool
-	targets   map[string]map[string]map[string]*Pool
-	targetsMu sync.RWMutex
+	// --- Runtime: privileged connection ---
+	// conn is the pgfox_role backend connection used exclusively for
+	// pg_shadow queries during client authentication.
+	conn   *BackendConnection
+	ready  chan struct{}     // closed when conn is ready for the first time
+	params map[string]string // ParameterStatus values from conn startup
 
-	targetConfigs []*Target
+	// --- Runtime: pools ---
+	pools   map[string]map[string]*Pool // database -> user -> pool
+	poolsMu sync.RWMutex
 
-	clients     map[net.Conn]*ClientConnection
-	clientsMu   sync.RWMutex
-	listeners   map[Channel]*Listen
-	listenersMu sync.RWMutex
-	stats       GlobalStats
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	logger      *Logger
+	// --- Runtime: connection budget ---
+	// totalOpen is the count of all open backend connections on this target
+	// across all pools plus the privileged conn. Only the target goroutine
+	// writes this — no atomic needed.
+	totalOpen int
 
-	// targetParams holds ParameterStatus values captured from the privileged
-	// connection startup for each target. Populated once during
-	// initPrivilegedConnections and read-only after that — no mutex needed.
-	targetParams map[string]map[string]string
+	// serverMaxConns and serverOpenConns are updated by the stats ticker
+	// from pg_stat_activity. They reflect the real PostgreSQL server state
+	// regardless of other clients not using pgfox.
+	serverMaxConns  int // pg max_connections setting
+	serverOpenConns int // total connections currently open on the server
 
-	// One persistent privileged backend connection per target.
-	// Used exclusively for pg_shadow queries during client authentication.
-	privilegedConns   map[string]*BackendConnection
-	privilegedConnsMu sync.RWMutex
+	// listenOpen is the count of active dedicated listen connections on this
+	// target. Written atomically from client goroutines.
+	listenOpen int32
 
-	// privilegedReady[targetName] is closed when the privileged connection for
-	// that target is ready. Replaced with a new open channel while reconnecting.
-	privilegedReady   map[string]chan struct{}
-	privilegedReadyMu sync.RWMutex
+	// returnCh and closeCh are target-level. conn.pool identifies which pool
+	// the connection belongs to. The target goroutine is the sole reader.
+	returnCh chan *BackendConnection
+	closeCh  chan *BackendConnection
+
+	// connReady is signaled (non-blocking send) whenever a connection is
+	// returned to any pool, waking borrowConn waiters.
+	connReady chan struct{}
+
+	// --- Runtime: lifecycle ---
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-// Pool manages backend connections for a specific (target, database, user) tuple.
-// The pool manager goroutine is the sole creator and owner of backend connections.
-// All other code only takes from backendPool and returns via returnCh / closeCh.
+// Pool manages the idle connection queue and stats for a (database, user) pair.
+// It is a plain data struct — the target goroutine owns all connection lifecycle.
 type Pool struct {
 	config   DatabaseConfig
 	target   *Target
 	username string
 
 	// backendPool is the queue of idle connections available to borrow.
-	// Its capacity is MaxConnections — the hard cap on total open connections.
 	backendPool chan *BackendConnection
 
-	// returnCh: consumers return healthy connections here.
-	// closeCh:  consumers report dead/failed connections here.
-	returnCh chan *BackendConnection
-	closeCh  chan *BackendConnection
+	// allConns is the list of every connection owned by this pool (idle or
+	// active). Written only by the target goroutine — no mutex needed.
+	allConns []*BackendConnection
 
-	// allConns is the authoritative list of every connection owned by this pool,
-	// whether idle (in backendPool) or active (checked out by a client or listen
-	// monitor). Only the pool manager goroutine reads or writes this slice.
-	// len(allConns) is the true total; len(backendPool) is the idle count.
-	allConns   []*BackendConnection
-	allConnsMu sync.Mutex
-
-	// ready is closed by the pool manager as soon as the first connection
-	// is placed in backendPool. Auth goroutines block on this.
-	ready chan struct{}
+	// Peak tracking for smart shrink decisions.
+	peakSamples []peakSample
 
 	stats Stats
+}
 
-	maxMessageSize int
-
-	ctx    context.Context
-	cancel context.CancelFunc
+// peakSample records active connection count at a point in time.
+type peakSample struct {
+	active int
+	at     time.Time
 }
 
 // Stats contains per-pool statistics.
@@ -113,6 +124,24 @@ type DatabaseConfig struct {
 	Parameters     map[string]string
 }
 
+// Server is the top-level pooler. targets is an ordered slice (by priority).
+type Server struct {
+	config   Config
+	listener net.Listener
+	targets  []*Target
+
+	clients     map[net.Conn]*ClientConnection
+	clientsMu   sync.RWMutex
+	listeners   map[Channel]*Listen
+	listenersMu sync.RWMutex
+
+	stats  GlobalStats
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	logger *Logger
+}
+
 // NewWildcardPooler creates a new wildcard pooler.
 func NewWildcardPooler(config Config, logger *Logger) (*Server, error) {
 	listener, err := net.Listen("tcp", config.Server.ListenAddr)
@@ -120,24 +149,44 @@ func NewWildcardPooler(config Config, logger *Logger) (*Server, error) {
 		return nil, fmt.Errorf("failed to listen on %s: %w", config.Server.ListenAddr, err)
 	}
 
-	pooler := &Server{
-		config:          config,
-		listener:        listener,
-		targets:         make(map[string]map[string]map[string]*Pool),
-		targetConfigs:   make([]*Target, 0, len(config.Targets)),
-		clients:         make(map[net.Conn]*ClientConnection),
-		listeners:       make(map[Channel]*Listen),
-		targetParams:    make(map[string]map[string]string),
-		privilegedConns: make(map[string]*BackendConnection),
-		privilegedReady: make(map[string]chan struct{}),
-		logger:          logger,
-	}
-
+	targets := make([]*Target, 0, len(config.Targets))
 	for i := range config.Targets {
-		pooler.targetConfigs = append(pooler.targetConfigs, &config.Targets[i])
+		src := &config.Targets[i]
+		t := &Target{
+			Name:             src.Name,
+			Host:             src.Host,
+			Port:             src.Port,
+			MaxConnections:   src.MaxConnections,
+			ConnectTimeout:   src.ConnectTimeout,
+			Parameters:       src.Parameters,
+			IncludeDatabases: src.IncludeDatabases,
+			ExcludeDatabases: src.ExcludeDatabases,
+			Priority:         src.Priority,
+			pools:            make(map[string]map[string]*Pool),
+			ready:            make(chan struct{}),
+			params:           make(map[string]string),
+			returnCh:         make(chan *BackendConnection, src.MaxConnections),
+			closeCh:          make(chan *BackendConnection, src.MaxConnections),
+			connReady:        make(chan struct{}, 1),
+		}
+		targets = append(targets, t)
 	}
 
-	return pooler, nil
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].Priority == targets[j].Priority {
+			return targets[i].Name < targets[j].Name
+		}
+		return targets[i].Priority < targets[j].Priority
+	})
+
+	return &Server{
+		config:    config,
+		listener:  listener,
+		targets:   targets,
+		clients:   make(map[net.Conn]*ClientConnection),
+		listeners: make(map[Channel]*Listen),
+		logger:    logger,
+	}, nil
 }
 
 // Start starts the wildcard pooler.
@@ -146,14 +195,34 @@ func (p *Server) Start(ctx context.Context) error {
 
 	p.logger.Info("PostgreSQL connection pooler starting",
 		"listen_addr", p.config.Server.ListenAddr,
-		"targets", len(p.targetConfigs))
+		"targets", len(p.targets))
 
 	if err := p.ensureBootstrapCerts(); err != nil {
 		return fmt.Errorf("failed to ensure bootstrap certificates: %w", err)
 	}
 
-	if err := p.initPrivilegedConnections(); err != nil {
-		return fmt.Errorf("failed to initialize privileged connections: %w", err)
+	// Start one goroutine per target — it opens the privileged connection
+	// and manages all pool connections for that target.
+	for _, target := range p.targets {
+		tctx, tcancel := context.WithCancel(p.ctx)
+		target.ctx = tctx
+		target.cancel = tcancel
+
+		p.wg.Add(1)
+		go func(t *Target) {
+			defer p.wg.Done()
+			t.run(p)
+		}(target)
+
+		// Wait for privileged connection before accepting clients.
+		select {
+		case <-target.ready:
+			p.logger.Info("Target ready", "target", target.Name)
+		case <-time.After(target.ConnectTimeout):
+			return fmt.Errorf("timed out waiting for target %s to become ready", target.Name)
+		case <-p.ctx.Done():
+			return fmt.Errorf("server shutting down during target init")
+		}
 	}
 
 	if p.config.Metrics.Enabled {
@@ -164,7 +233,7 @@ func (p *Server) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-p.ctx.Done():
-			p.logger.Info("Accept loop stopping due to shutdown signal")
+			p.logger.Info("Accept loop stopping")
 			return p.shutdown()
 		default:
 			if listener, ok := p.listener.(*net.TCPListener); ok {
@@ -202,38 +271,26 @@ func (p *Server) shutdown() error {
 	p.logger.Info("Starting graceful shutdown")
 
 	if p.listener != nil {
-		if err := p.listener.Close(); err != nil {
-			p.logger.WithError(err).Warn("Error closing listener")
-		}
+		p.listener.Close()
 	}
 
 	p.cancel()
-
 	p.shutdownListeners()
 
-	p.logger.Info("Closing client connections")
 	p.clientsMu.Lock()
 	for conn := range p.clients {
 		conn.Close()
 	}
 	p.clientsMu.Unlock()
 
-	// Cancel all pool manager goroutines — each drains and closes its own
-	// connections on ctx.Done.
-	p.logger.Info("Stopping pool managers")
-	p.targetsMu.Lock()
-	for _, targetMap := range p.targets {
-		for _, dbMap := range targetMap {
-			for _, pool := range dbMap {
-				pool.cancel()
-			}
-		}
+	// Cancel all target goroutines — each drains and closes its own connections.
+	for _, target := range p.targets {
+		target.cancel()
+		target.wg.Wait()
 	}
-	p.targetsMu.Unlock()
 
 	p.wg.Wait()
 	p.logger.Info("Graceful shutdown completed")
-
 	return nil
 }
 
@@ -257,6 +314,11 @@ func (p *Server) handleClient(conn net.Conn) {
 		delete(p.clients, conn)
 		p.clientsMu.Unlock()
 
+		duration := time.Since(client.GetConnectedAt())
+		clientLogger.Info("Client disconnected",
+			"duration", duration.Round(time.Millisecond),
+			"active_clients", atomic.LoadInt64(&p.stats.ActiveClients)-1)
+
 		p.cleanupClientListeners(client)
 
 		backend := client.GetBackendConnection()
@@ -264,25 +326,14 @@ func (p *Server) handleClient(conn net.Conn) {
 			return
 		}
 
-		pool := p.getPool(client.GetDatabase(), client.GetUser())
-
 		if client.IsInTransaction() {
-			clientLogger.Debug("Closing transaction backend on client disconnect")
-			// Best-effort graceful termination.
+			clientLogger.Debug("Closing transaction backend on disconnect")
 			_ = backend.WriteMessage('X', []byte{})
 			time.Sleep(10 * time.Millisecond)
-			if pool != nil {
-				pool.closeCh <- backend
-			} else {
-				backend.Close()
-			}
+			backend.Release()
 		} else {
-			clientLogger.Debug("Releasing pooled backend on client disconnect")
-			if pool != nil {
-				pool.returnCh <- backend
-			} else {
-				backend.Close()
-			}
+			clientLogger.Debug("Releasing backend on disconnect")
+			backend.pool.target.returnCh <- backend
 		}
 	}()
 
@@ -297,357 +348,528 @@ func (p *Server) handleClient(conn net.Conn) {
 			return
 		default:
 			if err := p.handleClientMessage(client); err != nil {
-				if err.Error() != "EOF" {
-					clientLogger.WithError(err).Error("Client message error")
+				if isClientGone(err) {
+					return
 				}
+				clientLogger.WithError(err).Error("Client message error")
 				return
 			}
 		}
 	}
 }
 
-// Stats returns current pooler statistics.
-func (p *Server) Stats() GlobalStats {
-	return GlobalStats{
-		TotalClients:          atomic.LoadInt64(&p.stats.TotalClients),
-		ActiveClients:         atomic.LoadInt64(&p.stats.ActiveClients),
-		TotalPools:            atomic.LoadInt64(&p.stats.TotalPools),
-		TotalQueries:          atomic.LoadInt64(&p.stats.TotalQueries),
-		NotificationsSent:     atomic.LoadInt64(&p.stats.NotificationsSent),
-		IdleConnectionsClosed: atomic.LoadInt64(&p.stats.IdleConnectionsClosed),
-	}
-}
+// --- Target goroutine ---
 
-// getPool returns the existing Pool for (dbName, user), or creates a new one
-// under the highest-priority target that serves dbName. Returns nil if no
-// target serves the database.
-func (p *Server) getPool(dbName, user string) *Pool {
-	// Fast path: read-only lookup.
-	p.targetsMu.RLock()
-	for _, t := range p.getSortedTargets() {
-		if !p.targetServesDatabase(t, dbName) {
-			continue
-		}
-		if targetMap, ok := p.targets[t.Name]; ok {
-			if dbMap, ok := targetMap[dbName]; ok {
-				if pool, ok := dbMap[user]; ok {
-					p.targetsMu.RUnlock()
-					return pool
-				}
-			}
-		}
-	}
-	p.targetsMu.RUnlock()
-
-	// Pool not found — select the target and create under write lock.
-	var target *Target
-	for _, t := range p.getSortedTargets() {
-		if p.targetServesDatabase(t, dbName) {
-			target = t
-			break
-		}
-	}
-	if target == nil {
-		return nil
-	}
-
-	// Slow path: create under write lock.
-	p.targetsMu.Lock()
-	defer p.targetsMu.Unlock()
-
-	// Re-check under write lock — another goroutine may have created it.
-	if targetMap, ok := p.targets[target.Name]; ok {
-		if dbMap, ok := targetMap[dbName]; ok {
-			if pool, ok := dbMap[user]; ok {
-				return pool
-			}
-		}
-	}
-
-	if p.targets[target.Name] == nil {
-		p.targets[target.Name] = make(map[string]map[string]*Pool)
-	}
-	if p.targets[target.Name][dbName] == nil {
-		p.targets[target.Name][dbName] = make(map[string]*Pool)
-	}
-
-	config := DatabaseConfig{
-		Name:           dbName,
-		Host:           target.Host,
-		Port:           target.Port,
-		User:           user,
-		MaxConnections: target.MaxConnections,
-		ConnectTimeout: target.ConnectTimeout,
-		Parameters:     target.Parameters,
-	}
-
-	ctx, cancel := context.WithCancel(p.ctx)
-
-	pool := &Pool{
-		config:         config,
-		target:         target,
-		username:       user,
-		backendPool:    make(chan *BackendConnection, config.MaxConnections),
-		returnCh:       make(chan *BackendConnection, config.MaxConnections),
-		closeCh:        make(chan *BackendConnection, config.MaxConnections),
-		allConns:       make([]*BackendConnection, 0, config.MaxConnections),
-		ready:          make(chan struct{}),
-		maxMessageSize: p.config.Server.MaxMessageSize,
-		ctx:            ctx,
-		cancel:         cancel,
-	}
-
-	p.targets[target.Name][dbName][user] = pool
-	atomic.AddInt64(&p.stats.TotalPools, 1)
-
-	p.wg.Add(1)
-	go pool.run(p)
-
-	return pool
-}
-
-// run is the pool manager goroutine — the sole creator of backend connections.
-// The pool starts empty. The growth ticker opens connections toward MaxConnections
-// and closes pool.ready as soon as the first one is in backendPool.
-func (pool *Pool) run(p *Server) {
-	defer p.wg.Done()
-
+// run is the target manager goroutine. It:
+//  1. Opens and maintains the privileged connection (conn).
+//  2. Manages all pool connections: growth, shrink, recycling, health checks.
+//  3. Periodically queries pg_stat_activity to track real server capacity.
+func (t *Target) run(p *Server) {
 	logger := p.logger.
-		WithField("component", "pool").
-		WithField("target", pool.target.Name).
-		WithField("database", pool.config.Name).
-		WithField("user", pool.username)
+		WithField("component", "target").
+		WithField("target", t.Name)
 
-	logger.Info("Pool manager started", "max_connections", pool.config.MaxConnections)
+	// Open privileged connection first — blocks until ready or ctx cancelled.
+	if err := t.openPrivilegedConn(p, logger); err != nil {
+		logger.WithError(err).Error("Failed to open privileged connection")
+		return
+	}
 
-	readyClosed := false
-
-	growthTicker := time.NewTicker(250 * time.Millisecond)
+	growthTicker := time.NewTicker(50 * time.Millisecond)
 	defer growthTicker.Stop()
 
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer healthTicker.Stop()
 
+	statsTicker := time.NewTicker(p.config.Server.StatsInterval)
+	defer statsTicker.Stop()
+
 	for {
 		select {
-		case <-pool.ctx.Done():
-			logger.Info("Pool manager stopping, draining connections")
-			pool.drain(logger)
+		case <-t.ctx.Done():
+			logger.Info("Target manager stopping")
+			t.drain(p, logger)
 			return
 
-		case conn := <-pool.returnCh:
-			pool.handleReturn(p, conn, logger)
+		case conn := <-t.returnCh:
+			t.handleReturn(p, conn, logger)
 
-		case conn := <-pool.closeCh:
-			pool.handleClose(p, conn, logger)
+		case conn := <-t.closeCh:
+			t.handleClose(p, conn, logger)
 
 		case <-growthTicker.C:
-			pool.allConnsMu.Lock()
-			total := len(pool.allConns)
-			pool.allConnsMu.Unlock()
-
-			if total < pool.config.MaxConnections {
-				pool.openOne(p, logger, "growth")
-
-				// Close ready after the first connection is successfully placed.
-				if !readyClosed && len(pool.backendPool) > 0 {
-					close(pool.ready)
-					readyClosed = true
-					logger.Info("Pool ready",
-						"total", pool.totalConnections(),
-						"max", pool.config.MaxConnections)
-				}
-			}
+			t.growthCycle(p, logger)
 
 		case <-healthTicker.C:
-			pool.healthCheck(p, logger)
+			t.healthCheck(p, logger)
+
+		case <-statsTicker.C:
+			t.updateServerStats(p, logger)
 		}
 	}
 }
 
-// removeFromAllConns removes a connection from allConns.
-// Must be called with allConnsMu held.
-func (pool *Pool) removeFromAllConns(conn *BackendConnection) {
-	for i, c := range pool.allConns {
-		if c == conn {
-			pool.allConns[i] = pool.allConns[len(pool.allConns)-1]
-			pool.allConns = pool.allConns[:len(pool.allConns)-1]
-			return
+// openPrivilegedConn opens t.conn and populates t.params, then closes t.ready.
+// Retries until successful or ctx is cancelled.
+func (t *Target) openPrivilegedConn(p *Server, logger *Logger) error {
+	pgfoxCert, err := p.loadOrGenerateUserCert(p.config.Server.PgFoxRole)
+	if err != nil {
+		return fmt.Errorf("failed to load pgfox cert: %w", err)
+	}
+
+	for {
+		if t.ctx.Err() != nil {
+			return fmt.Errorf("context cancelled")
 		}
+
+		conn, err := p.createCertBackendConnection(t, "postgres", p.config.Server.PgFoxRole, pgfoxCert)
+		if err != nil {
+			logger.WithError(err).Warn("Privileged connection failed, retrying in 5s")
+			select {
+			case <-t.ctx.Done():
+				return fmt.Errorf("context cancelled")
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		t.conn = conn
+		t.totalOpen++
+
+		for k, v := range conn.parameters {
+			t.params[k] = v
+		}
+
+		close(t.ready)
+		logger.Info("Privileged connection ready", "role", p.config.Server.PgFoxRole)
+		return nil
 	}
 }
 
-// handleReturn validates a returned connection and puts it back in backendPool,
-// or closes it and removes it from allConns if dead.
-func (pool *Pool) handleReturn(p *Server, conn *BackendConnection, logger *Logger) {
+// handleReturn validates a returned connection and puts it back in its pool's
+// backendPool, or closes it if dead.
+func (t *Target) handleReturn(p *Server, conn *BackendConnection, logger *Logger) {
+	pool := conn.pool
+
 	if !conn.IsAlive() {
 		logger.Warn("Returned connection is dead, closing")
 		conn.conn.Close()
-		pool.allConnsMu.Lock()
+		t.totalOpen--
 		pool.removeFromAllConns(conn)
-		pool.allConnsMu.Unlock()
+		t.signalConnReady()
 		return
 	}
 
 	conn.mu.Lock()
 	conn.inUse = false
 	conn.lastUsedAt = time.Now()
-	conn.clientRef = nil
+	conn.client = nil
 	conn.mu.Unlock()
 
 	select {
 	case pool.backendPool <- conn:
-		// Returned to idle queue successfully.
+		t.signalConnReady()
 	default:
-		// backendPool channel is full — this should not happen since allConns
-		// is capped at MaxConnections and backendPool has the same capacity,
-		// but guard defensively.
-		logger.Warn("backendPool full on return — closing extra connection",
-			"total", pool.totalConnections(),
-			"max", pool.config.MaxConnections)
+		// backendPool full — shouldn't happen, close defensively.
+		logger.Warn("backendPool full on return, closing extra connection")
 		conn.conn.Close()
-		pool.allConnsMu.Lock()
+		t.totalOpen--
 		pool.removeFromAllConns(conn)
-		pool.allConnsMu.Unlock()
 	}
 }
 
-// handleClose closes a dead/failed connection, removes it from allConns,
-// and opens a replacement if we are still below MaxConnections.
-func (pool *Pool) handleClose(p *Server, conn *BackendConnection, logger *Logger) {
+// handleClose closes a dead connection, removes it from its pool, and signals
+// connReady so waiting borrowers can react (e.g. trigger growth).
+func (t *Target) handleClose(p *Server, conn *BackendConnection, logger *Logger) {
+	pool := conn.pool
 	conn.conn.Close()
-
-	pool.allConnsMu.Lock()
+	t.totalOpen--
 	pool.removeFromAllConns(conn)
-	total := len(pool.allConns)
-	pool.allConnsMu.Unlock()
-
 	logger.Debug("Closed failed connection",
-		"remaining", total,
-		"max", pool.config.MaxConnections)
+		"database", pool.config.Name,
+		"user", pool.username,
+		"target_total", t.totalOpen)
+	t.signalConnReady()
+}
 
-	// Open a replacement only if we are still below the cap.
-	if total < pool.config.MaxConnections {
-		pool.openOne(p, logger, "replacement")
+// growthCycle runs on every growthTicker. Opens one connection per contended
+// pool per tick, recycling slots from idle pools before using fresh server slots.
+// Shrinks only when nothing is contended.
+func (t *Target) growthCycle(p *Server, logger *Logger) {
+	now := time.Now()
+	peakWindow := p.config.Server.PeakWindow
+
+	t.poolsMu.RLock()
+	pools := t.allPools()
+	t.poolsMu.RUnlock()
+
+	serverAvailable := 0
+	if t.serverMaxConns > 0 {
+		serverAvailable = t.serverMaxConns - t.serverOpenConns
+	} else {
+		serverAvailable = t.MaxConnections - t.totalOpen
+	}
+
+	type poolState struct {
+		pool      *Pool
+		active    int
+		idle      int
+		total     int
+		hwm       int
+		contended bool
+		excess    int
+	}
+
+	states := make([]poolState, 0, len(pools))
+
+	for _, pool := range pools {
+		active := pool.activeConnections()
+		pool.peakSamples = append(pool.peakSamples, peakSample{active: active, at: now})
+
+		cutoff := now.Add(-peakWindow)
+		i := 0
+		for i < len(pool.peakSamples) && pool.peakSamples[i].at.Before(cutoff) {
+			i++
+		}
+		pool.peakSamples = pool.peakSamples[i:]
+
+		hwm := 1
+		for _, s := range pool.peakSamples {
+			if s.active > hwm {
+				hwm = s.active
+			}
+		}
+
+		idle := pool.idleConnections()
+		total := len(pool.allConns)
+		contended := total == 0 || active == total
+		excess := idle - (hwm + 1)
+		if excess < 0 {
+			excess = 0
+		}
+
+		states = append(states, poolState{pool, active, idle, total, hwm, contended, excess})
+	}
+
+	var contendedPools []poolState
+	var idlePools []poolState
+	for _, s := range states {
+		if s.contended {
+			contendedPools = append(contendedPools, s)
+		}
+		if s.excess > 0 {
+			idlePools = append(idlePools, s)
+		}
+	}
+
+	// Open one connection per contended pool — recycling idle slots first.
+	idleIdx := 0
+	for _, cs := range contendedPools {
+		if t.totalOpen >= t.MaxConnections || serverAvailable <= 1 {
+			break
+		}
+
+		recycled := false
+		for idleIdx < len(idlePools) {
+			is := idlePools[idleIdx]
+			if is.pool == cs.pool {
+				idleIdx++
+				continue
+			}
+			if t.closeOneIdle(p, is.pool, logger) {
+				logger.Debug("Recycling slot",
+					"from", is.pool.config.Name+"/"+is.pool.username,
+					"to", cs.pool.config.Name+"/"+cs.pool.username)
+				idlePools[idleIdx].excess--
+				if idlePools[idleIdx].excess == 0 {
+					idleIdx++
+				}
+				recycled = true
+			}
+			break
+		}
+
+		if recycled || (t.totalOpen < t.MaxConnections && serverAvailable > 1) {
+			reason := "growth"
+			if recycled {
+				reason = "recycled"
+			}
+			t.openOne(p, cs.pool, logger, reason)
+		}
+	}
+
+	// Shrink only when nothing is contended.
+	if len(contendedPools) == 0 {
+		for _, is := range idlePools {
+			t.closeOneIdle(p, is.pool, logger)
+		}
 	}
 }
 
-// openOne opens a single new backend connection, adds it to allConns, and
-// places it in backendPool. reason is used only for logging.
-// Must only be called from the pool manager goroutine.
-func (pool *Pool) openOne(p *Server, logger *Logger, reason string) {
+// healthCheck runs on the healthTicker. Validates idle connections and replaces
+// dead ones. Also checks and replaces the privileged connection if needed.
+func (t *Target) healthCheck(p *Server, logger *Logger) {
+	// Check privileged connection.
+	if t.conn != nil && !t.conn.IsAlive() {
+		logger.Warn("Privileged connection dead, replacing")
+		t.conn.conn.Close()
+		t.totalOpen--
+		t.conn = nil
+
+		pgfoxCert, err := p.loadOrGenerateUserCert(p.config.Server.PgFoxRole)
+		if err == nil {
+			if conn, err := p.createCertBackendConnection(t, "postgres", p.config.Server.PgFoxRole, pgfoxCert); err == nil {
+				t.conn = conn
+				t.totalOpen++
+				logger.Info("Privileged connection replaced")
+			} else {
+				logger.WithError(err).Warn("Failed to replace privileged connection")
+			}
+		}
+	}
+
+	idleTimeout := p.config.Server.IdleTimeout
+	cutoff := time.Now().Add(-idleTimeout)
+
+	t.poolsMu.RLock()
+	pools := t.allPools()
+	t.poolsMu.RUnlock()
+
+	for _, pool := range pools {
+		poolLen := len(pool.backendPool)
+		for i := 0; i < poolLen; i++ {
+			select {
+			case conn := <-pool.backendPool:
+				dead := !conn.IsAlive()
+				tooOld := idleTimeout > 0 && conn.LastUsedAt().Before(cutoff)
+
+				if dead || tooOld {
+					reason := "dead"
+					if tooOld {
+						reason = "idle timeout"
+					}
+					logger.Debug("Health check closing connection",
+						"reason", reason,
+						"database", pool.config.Name,
+						"user", pool.username)
+					conn.conn.Close()
+					t.totalOpen--
+					pool.removeFromAllConns(conn)
+					atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
+				} else {
+					select {
+					case pool.backendPool <- conn:
+					default:
+						conn.conn.Close()
+						t.totalOpen--
+						pool.removeFromAllConns(conn)
+					}
+				}
+			default:
+			}
+		}
+	}
+}
+
+// updateServerStats queries pg_stat_activity on the privileged connection to
+// get the real PostgreSQL server capacity regardless of non-pgfox clients.
+func (t *Target) updateServerStats(p *Server, logger *Logger) {
+	if t.conn == nil {
+		return
+	}
+
+	query := "SELECT current_setting('max_connections')::int, count(*) FROM pg_stat_activity\x00"
+	if err := t.conn.WriteMessage('Q', []byte(query)); err != nil {
+		logger.WithError(err).Warn("Failed to send stats query")
+		return
+	}
+
+	if err := t.conn.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return
+	}
+	defer t.conn.conn.SetReadDeadline(time.Time{})
+
+	var maxConns, openConns int
+
+	for {
+		msgType, body, err := t.conn.ReadMessage()
+		if err != nil {
+			logger.WithError(err).Warn("Failed to read stats response")
+			return
+		}
+		switch msgType {
+		case 'T': // RowDescription — skip
+		case 'D': // DataRow
+			if len(body) < 2 {
+				continue
+			}
+			colCount := int(body[0])<<8 | int(body[1])
+			if colCount < 2 {
+				continue
+			}
+			pos := 2
+			// col 0: max_connections
+			if pos+4 > len(body) {
+				continue
+			}
+			col0Len := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 | int32(body[pos+2])<<8 | int32(body[pos+3]))
+			pos += 4
+			if col0Len > 0 && pos+col0Len <= len(body) {
+				fmt.Sscanf(string(body[pos:pos+col0Len]), "%d", &maxConns)
+				pos += col0Len
+			}
+			// col 1: count(*)
+			if pos+4 > len(body) {
+				continue
+			}
+			col1Len := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 | int32(body[pos+2])<<8 | int32(body[pos+3]))
+			pos += 4
+			if col1Len > 0 && pos+col1Len <= len(body) {
+				fmt.Sscanf(string(body[pos:pos+col1Len]), "%d", &openConns)
+			}
+		case 'C': // CommandComplete
+		case 'Z': // ReadyForQuery
+			if maxConns > 0 {
+				t.serverMaxConns = maxConns
+				t.serverOpenConns = openConns
+				logger.Debug("Server stats updated",
+					"max_connections", maxConns,
+					"open_connections", openConns,
+					"available", maxConns-openConns)
+			}
+			return
+		case 'E':
+			logger.Warn("Stats query error", "error", parseErrorMessage(body))
+			return
+		}
+	}
+}
+
+// drain closes all connections on shutdown.
+func (t *Target) drain(p *Server, logger *Logger) {
+	// Drain in-flight returns and closes first.
+	for {
+		select {
+		case conn := <-t.returnCh:
+			conn.conn.Close()
+			t.totalOpen--
+		case conn := <-t.closeCh:
+			conn.conn.Close()
+			t.totalOpen--
+		default:
+			goto drainPools
+		}
+	}
+
+drainPools:
+	t.poolsMu.RLock()
+	pools := t.allPools()
+	t.poolsMu.RUnlock()
+
+	for _, pool := range pools {
+		for {
+			select {
+			case conn := <-pool.backendPool:
+				conn.conn.Close()
+				t.totalOpen--
+			default:
+				goto nextPool
+			}
+		}
+	nextPool:
+	}
+
+	if t.conn != nil {
+		t.conn.conn.Close()
+		t.totalOpen--
+		t.conn = nil
+	}
+
+	logger.Info("Target drained", "remaining_open", t.totalOpen)
+}
+
+// openOne opens a single new backend connection for pool and adds it to the
+// pool. Must only be called from the target goroutine.
+func (t *Target) openOne(p *Server, pool *Pool, logger *Logger, reason string) {
 	conn, err := pool.newConn(p)
 	if err != nil {
-		logger.WithError(err).Warn("Failed to open backend connection", "reason", reason)
+		logger.WithError(err).Warn("Failed to open backend connection",
+			"reason", reason,
+			"database", pool.config.Name,
+			"user", pool.username)
 		return
 	}
 
-	pool.allConnsMu.Lock()
-	// Double-check cap under lock — the ticker may have already filled the slot.
-	if len(pool.allConns) >= pool.config.MaxConnections {
-		pool.allConnsMu.Unlock()
-		conn.conn.Close()
-		return
-	}
+	conn.pool = pool
 	pool.allConns = append(pool.allConns, conn)
-	pool.allConnsMu.Unlock()
+	t.totalOpen++
 
 	select {
 	case pool.backendPool <- conn:
-		logger.Debug("Opened backend connection",
+		t.signalConnReady()
+		logger.Debug("Opened connection",
 			"reason", reason,
-			"total", pool.totalConnections(),
-			"idle", pool.idleConnections())
+			"database", pool.config.Name,
+			"user", pool.username,
+			"pool_total", len(pool.allConns),
+			"target_total", t.totalOpen)
 	default:
-		// backendPool full — shouldn't happen since we checked the cap, but guard.
+		// backendPool full — shouldn't happen but guard.
 		conn.conn.Close()
-		pool.allConnsMu.Lock()
+		t.totalOpen--
+		pool.allConns = pool.allConns[:len(pool.allConns)-1]
+	}
+}
+
+// closeOneIdle closes one idle connection from pool and removes it.
+// Returns true if a connection was closed.
+func (t *Target) closeOneIdle(p *Server, pool *Pool, logger *Logger) bool {
+	select {
+	case conn := <-pool.backendPool:
+		conn.conn.Close()
+		t.totalOpen--
 		pool.removeFromAllConns(conn)
-		pool.allConnsMu.Unlock()
+		atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
+		logger.Debug("Shrunk pool",
+			"database", pool.config.Name,
+			"user", pool.username,
+			"pool_total", len(pool.allConns),
+			"target_total", t.totalOpen)
+		return true
+	default:
+		return false
 	}
 }
 
-// healthCheck runs on the ticker. It:
-//  1. Scans idle connections in backendPool, closing dead or timed-out ones.
-//  2. Grows the pool toward MaxConnections if there is headroom, one connection
-//     at a time per tick — natural demand-driven growth without a burst.
-func (pool *Pool) healthCheck(p *Server, logger *Logger) {
-	idleTimeout := p.config.Server.IdleTimeout
-	cutoff := time.Now().Add(-idleTimeout)
-	closed := 0
-
-	// Scan idle connections — read exactly as many as were in the channel at
-	// the start of the tick so we don't loop forever.
-	poolLen := len(pool.backendPool)
-	for i := 0; i < poolLen; i++ {
-		select {
-		case conn := <-pool.backendPool:
-			dead := !conn.IsAlive()
-			tooOld := idleTimeout > 0 && conn.LastUsedAt().Before(cutoff)
-
-			if dead || tooOld {
-				reason := "dead"
-				if tooOld {
-					reason = "idle timeout"
-				}
-				logger.Debug("Closing connection during health check", "reason", reason)
-				conn.conn.Close()
-
-				pool.allConnsMu.Lock()
-				pool.removeFromAllConns(conn)
-				pool.allConnsMu.Unlock()
-
-				atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
-				closed++
-			} else {
-				// Healthy — put it back.
-				select {
-				case pool.backendPool <- conn:
-				default:
-					// Pool channel full — close the extra (shouldn't happen).
-					conn.conn.Close()
-					pool.allConnsMu.Lock()
-					pool.removeFromAllConns(conn)
-					pool.allConnsMu.Unlock()
-				}
-			}
-		default:
-			break
-		}
-	}
-
-	if closed > 0 {
-		logger.Info("Health check closed connections",
-			"closed", closed,
-			"remaining", pool.totalConnections())
+// signalConnReady does a non-blocking send on connReady to wake borrowConn waiters.
+func (t *Target) signalConnReady() {
+	select {
+	case t.connReady <- struct{}{}:
+	default:
 	}
 }
 
-// drain closes all connections owned by this pool. Called on shutdown.
-func (pool *Pool) drain(logger *Logger) {
-	// Drain returnCh and closeCh first so in-flight connections are accounted for.
-	for {
-		select {
-		case conn := <-pool.returnCh:
-			conn.conn.Close()
-		case conn := <-pool.closeCh:
-			conn.conn.Close()
-		default:
-			goto drainPool
+// allPools returns a flat slice of all pools on this target.
+// Caller must hold poolsMu at least RLock.
+func (t *Target) allPools() []*Pool {
+	var pools []*Pool
+	for _, dbMap := range t.pools {
+		for _, pool := range dbMap {
+			pools = append(pools, pool)
 		}
 	}
+	return pools
+}
 
-drainPool:
-	for {
-		select {
-		case conn := <-pool.backendPool:
-			conn.conn.Close()
-		default:
-			pool.allConnsMu.Lock()
-			remaining := len(pool.allConns)
-			pool.allConns = pool.allConns[:0]
-			pool.allConnsMu.Unlock()
-			logger.Info("Pool drained", "closed", remaining)
+// --- Pool helpers ---
+
+// removeFromAllConns removes conn from pool.allConns.
+// Must be called from the target goroutine.
+func (pool *Pool) removeFromAllConns(conn *BackendConnection) {
+	for i, c := range pool.allConns {
+		if c == conn {
+			pool.allConns[i] = pool.allConns[len(pool.allConns)-1]
+			pool.allConns = pool.allConns[:len(pool.allConns)-1]
 			return
 		}
 	}
@@ -662,91 +884,182 @@ func (pool *Pool) newConn(p *Server) (*BackendConnection, error) {
 	return p.createCertBackendConnection(pool.target, pool.config.Name, pool.username, cert)
 }
 
-// --- Stats helpers ---
+// borrowConn takes a connection from the pool, blocking until one is available,
+// the timeout fires, or ctx is cancelled. Never creates connections — that is
+// the target goroutine's exclusive responsibility.
+func (pool *Pool) borrowConn(ctx context.Context) (*BackendConnection, error) {
+	timeout := pool.target.ConnectTimeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
 
-// totalConnections returns the count of all connections owned by this pool
-// (idle + active). Uses allConns as the authoritative source.
-func (pool *Pool) totalConnections() int {
-	pool.allConnsMu.Lock()
-	defer pool.allConnsMu.Unlock()
-	return len(pool.allConns)
+	deadline := time.Now().Add(timeout)
+
+	for {
+		select {
+		case conn := <-pool.backendPool:
+			conn.SetInUse(true)
+			return conn, nil
+		default:
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("timed out waiting for connection for %s/%s",
+				pool.config.Name, pool.username)
+		}
+
+		select {
+		case conn := <-pool.backendPool:
+			conn.SetInUse(true)
+			return conn, nil
+		case <-pool.target.connReady:
+			// A connection was returned somewhere on this target — retry.
+			continue
+		case <-time.After(remaining):
+			return nil, fmt.Errorf("timed out waiting for connection for %s/%s",
+				pool.config.Name, pool.username)
+		case <-ctx.Done():
+			return nil, fmt.Errorf("server shutting down")
+		}
+	}
 }
 
-// idleConnections returns connections currently sitting in backendPool.
 func (pool *Pool) idleConnections() int {
 	return len(pool.backendPool)
 }
 
-// activeConnections returns connections currently checked out from the pool.
+// activeConnections returns connections currently checked out.
 func (pool *Pool) activeConnections() int {
-	total := pool.totalConnections()
-	idle := pool.idleConnections()
+	total := len(pool.allConns)
+	idle := len(pool.backendPool)
 	if idle > total {
 		return 0
 	}
 	return total - idle
 }
 
-// queriesExecuted returns the query counter.
+// totalConnections returns all connections owned by this pool.
+func (pool *Pool) totalConnections() int {
+	return len(pool.allConns)
+}
+
 func (pool *Pool) queriesExecuted() int64 {
 	return atomic.LoadInt64(&pool.stats.QueriesExecuted)
 }
 
-// errorCount returns the error counter.
 func (pool *Pool) errorCount() int64 {
 	return atomic.LoadInt64(&pool.stats.ErrorCount)
 }
 
-// --- Server helpers ---
+// --- Server pool management ---
 
-// getSortedTargets returns targets sorted by priority (lower = higher priority).
-func (p *Server) getSortedTargets() []*Target {
-	sorted := make([]*Target, len(p.targetConfigs))
-	copy(sorted, p.targetConfigs)
-
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Priority == sorted[j].Priority {
-			return sorted[i].Name < sorted[j].Name
+// getPool returns the existing Pool for (dbName, user), or creates a new one
+// under the highest-priority target that serves dbName. Returns nil if no
+// target serves the database.
+func (p *Server) getPool(dbName, user string) *Pool {
+	// Fast path: read-only lookup across all targets.
+	for _, target := range p.targets {
+		if !p.targetServesDatabase(target, dbName) {
+			continue
 		}
-		return sorted[i].Priority < sorted[j].Priority
-	})
+		target.poolsMu.RLock()
+		if dbMap, ok := target.pools[dbName]; ok {
+			if pool, ok := dbMap[user]; ok {
+				target.poolsMu.RUnlock()
+				return pool
+			}
+		}
+		target.poolsMu.RUnlock()
+	}
 
-	return sorted
+	// Not found — create under the first matching target.
+	var selectedTarget *Target
+	for _, t := range p.targets {
+		if p.targetServesDatabase(t, dbName) {
+			selectedTarget = t
+			break
+		}
+	}
+	if selectedTarget == nil {
+		return nil
+	}
+
+	selectedTarget.poolsMu.Lock()
+	defer selectedTarget.poolsMu.Unlock()
+
+	// Re-check under write lock.
+	if dbMap, ok := selectedTarget.pools[dbName]; ok {
+		if pool, ok := dbMap[user]; ok {
+			return pool
+		}
+	}
+
+	if selectedTarget.pools[dbName] == nil {
+		selectedTarget.pools[dbName] = make(map[string]*Pool)
+	}
+
+	pool := &Pool{
+		config: DatabaseConfig{
+			Name:           dbName,
+			Host:           selectedTarget.Host,
+			Port:           selectedTarget.Port,
+			User:           user,
+			MaxConnections: selectedTarget.MaxConnections,
+			ConnectTimeout: selectedTarget.ConnectTimeout,
+			Parameters:     selectedTarget.Parameters,
+		},
+		target:      selectedTarget,
+		username:    user,
+		backendPool: make(chan *BackendConnection, selectedTarget.MaxConnections),
+		allConns:    make([]*BackendConnection, 0, selectedTarget.MaxConnections),
+	}
+
+	selectedTarget.pools[dbName][user] = pool
+	atomic.AddInt64(&p.stats.TotalPools, 1)
+
+	return pool
 }
+
+// --- Server helpers ---
 
 // targetServesDatabase checks if a target serves a specific database.
 func (p *Server) targetServesDatabase(target *Target, dbName string) bool {
 	if len(target.IncludeDatabases) > 0 {
-		found := false
 		for _, included := range target.IncludeDatabases {
 			if included == dbName {
-				found = true
-				break
+				goto checkExclude
 			}
 		}
-		if !found {
-			return false
-		}
+		return false
 	}
-
+checkExclude:
 	for _, excluded := range target.ExcludeDatabases {
 		if excluded == dbName {
 			return false
 		}
 	}
-
 	return true
+}
+
+// Stats returns current pooler statistics.
+func (p *Server) Stats() GlobalStats {
+	return GlobalStats{
+		TotalClients:          atomic.LoadInt64(&p.stats.TotalClients),
+		ActiveClients:         atomic.LoadInt64(&p.stats.ActiveClients),
+		TotalPools:            atomic.LoadInt64(&p.stats.TotalPools),
+		TotalQueries:          atomic.LoadInt64(&p.stats.TotalQueries),
+		NotificationsSent:     atomic.LoadInt64(&p.stats.NotificationsSent),
+		IdleConnectionsClosed: atomic.LoadInt64(&p.stats.IdleConnectionsClosed),
+	}
 }
 
 // startMetricsServer starts the metrics/web server.
 func (p *Server) startMetricsServer(ctx context.Context) {
 	defer p.wg.Done()
-
 	addr := fmt.Sprintf(":%d", p.config.Metrics.Port)
 	server := NewWebServer(p, addr, p.logger)
-
 	p.logger.Info("Starting web server", "addr", addr)
-
 	if err := server.Start(ctx); err != nil {
 		p.logger.WithError(err).Error("Web server failed")
 	}
@@ -762,14 +1075,10 @@ func (p *Server) isSSLSupported() bool {
 func (p *Server) upgradeToTLS(client *ClientConnection) error {
 	cert, err := tls.LoadX509KeyPair(p.pgfoxTLSCertPath(), p.pgfoxTLSKeyPath())
 	if err != nil {
-		return fmt.Errorf("failed to load pgfox TLS cert %s: %w", p.pgfoxTLSCertPath(), err)
+		return fmt.Errorf("failed to load pgfox TLS cert: %w", err)
 	}
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	tlsConn := tls.Server(client.conn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
 		return fmt.Errorf("TLS handshake failed: %w", err)
@@ -786,53 +1095,54 @@ func (p *Server) upgradeToTLS(client *ClientConnection) error {
 	return nil
 }
 
-// findBackendByKey finds a backend connection matching processID and secretKey.
-// Searches idle pool connections then active client-pinned connections.
+// isClientGone returns true for errors that mean the client disconnected
+// cleanly — EOF, broken pipe, connection reset. These are not real errors.
+func isClientGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return msg == "EOF" ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "use of closed network connection")
+}
 func (p *Server) findBackendByKey(processID, secretKey int32) (*Target, *BackendConnection) {
-	p.targetsMu.RLock()
-	for _, targetMap := range p.targets {
-		for _, dbMap := range targetMap {
-			for _, pool := range dbMap {
-				poolLen := len(pool.backendPool)
-				for i := 0; i < poolLen; i++ {
+	for _, target := range p.targets {
+		target.poolsMu.RLock()
+		pools := target.allPools()
+		target.poolsMu.RUnlock()
+
+		for _, pool := range pools {
+			poolLen := len(pool.backendPool)
+			for i := 0; i < poolLen; i++ {
+				select {
+				case conn := <-pool.backendPool:
+					match := conn.GetProcessID() == processID && conn.GetSecretKey() == secretKey
 					select {
-					case conn := <-pool.backendPool:
-						match := conn.GetProcessID() == processID &&
-							conn.GetSecretKey() == secretKey
-						select {
-						case pool.backendPool <- conn:
-						default:
-							conn.conn.Close()
-							pool.allConnsMu.Lock()
-							pool.removeFromAllConns(conn)
-							pool.allConnsMu.Unlock()
-						}
-						if match {
-							p.targetsMu.RUnlock()
-							return pool.target, conn
-						}
+					case pool.backendPool <- conn:
 					default:
+						conn.conn.Close()
+						pool.removeFromAllConns(conn)
 					}
+					if match {
+						return target, conn
+					}
+				default:
 				}
 			}
 		}
 	}
-	p.targetsMu.RUnlock()
 
 	p.clientsMu.RLock()
 	defer p.clientsMu.RUnlock()
 
 	for _, client := range p.clients {
 		backend := client.GetBackendConnection()
-		if backend == nil {
-			continue
-		}
-		if backend.GetProcessID() == processID && backend.GetSecretKey() == secretKey {
-			for _, target := range p.targetConfigs {
-				if target.Name == backend.targetName {
-					return target, backend
-				}
-			}
+		if backend != nil &&
+			backend.GetProcessID() == processID &&
+			backend.GetSecretKey() == secretKey {
+			return backend.pool.target, backend
 		}
 	}
 

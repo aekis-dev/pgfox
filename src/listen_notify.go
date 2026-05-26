@@ -14,7 +14,7 @@ type Channel struct {
 }
 
 // Listen monitors one PostgreSQL channel for a database.
-// It owns exactly one backend connection and one goroutine.
+// It owns exactly one dedicated backend connection and one goroutine.
 // All clients subscribed to this channel share the single backend connection.
 type Listen struct {
 	channel Channel
@@ -24,7 +24,7 @@ type Listen struct {
 	done    chan struct{}
 }
 
-// addClient registers a client as a subscriber of this listen monitor.
+// addClient registers a client as a subscriber.
 func (l *Listen) addClient(client *ClientConnection) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -58,8 +58,7 @@ func (l *Listen) copyClients() []*ClientConnection {
 }
 
 // run is the goroutine that owns the backend connection exclusively.
-// It blocks on ReadMessage and fans out notifications to all subscribed clients.
-// On backend failure it attempts one reconnect; if that fails it tears down.
+// It blocks on ReadMessage and fans notifications out to all subscribed clients.
 func (l *Listen) run(p *Server) {
 	defer p.wg.Done()
 	defer close(l.done)
@@ -72,10 +71,25 @@ func (l *Listen) run(p *Server) {
 	logger.Info("Listen monitor started")
 
 	for {
-		msgType, body, err := l.backend.ReadMessage()
+		l.mu.RLock()
+		backend := l.backend
+		l.mu.RUnlock()
+
+		if backend == nil {
+			logger.Debug("Listen monitor stopping — backend cleared")
+			return
+		}
+
+		msgType, body, err := backend.ReadMessage()
 		if err != nil {
 			if p.ctx.Err() != nil {
 				logger.Debug("Listen monitor stopping — server shutdown")
+				return
+			}
+
+			// No clients left means tearDownListen closed the connection.
+			if l.clientCount() == 0 {
+				logger.Debug("Listen monitor stopping — no clients remaining")
 				return
 			}
 
@@ -84,11 +98,13 @@ func (l *Listen) run(p *Server) {
 			newBackend, reconnErr := p.reconnectListen(l)
 			if reconnErr == nil {
 				logger.Info("Reconnected listen monitor successfully")
+				l.mu.Lock()
 				l.backend = newBackend
+				l.mu.Unlock()
 				continue
 			}
 
-			logger.WithError(reconnErr).Error("Reconnect failed, notifying clients and tearing down")
+			logger.WithError(reconnErr).Error("Reconnect failed, tearing down")
 			p.failListen(l, fmt.Errorf("lost connection to database %q: %w", l.channel.Database, reconnErr))
 			return
 		}
@@ -103,12 +119,10 @@ func (l *Listen) run(p *Server) {
 			logger.Debug("Notification received, fanning out", "payload", notification.Payload)
 			l.fanOut(p, *notification)
 
-		case 'Z', 'S', 'N': // ReadyForQuery, ParameterStatus, NoticeResponse — normal idle traffic
+		case 'Z', 'S', 'N': // ReadyForQuery, ParameterStatus, NoticeResponse
 			continue
-
 		case 'E':
 			logger.Warn("Error from listen backend", "error", parseErrorMessage(body))
-
 		default:
 			logger.Warn("Unexpected message in listen monitor", "type", string([]byte{msgType}))
 		}
@@ -141,9 +155,9 @@ func (l *Listen) fanOut(p *Server, notification NotificationMessage) {
 
 // --- Server-level listen management ---
 
-// getOrCreateListen returns the existing Listen monitor for the given channel,
-// or creates a new one. The lock is held only for the lookup and final
-// registration — the backend connection is acquired outside the lock.
+// getOrCreateListen returns the existing monitor or creates a new one.
+// The backend connection is opened via pool.newConn(p) — bypassing backendPool
+// so it never competes with query connections for pool slots.
 func (p *Server) getOrCreateListen(ch Channel, client *ClientConnection) (*Listen, bool, error) {
 	// Fast path: monitor already exists.
 	p.listenersMu.RLock()
@@ -154,34 +168,46 @@ func (p *Server) getOrCreateListen(ch Channel, client *ClientConnection) (*Liste
 	}
 	p.listenersMu.RUnlock()
 
-	// Slow path: create a new monitor.
-	// Acquire a backend connection BEFORE taking the write lock so we don't
-	// block all listener operations while waiting for a pool connection.
-	backend, err := p.borrowConn(client)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to acquire backend for listen monitor: %w", err)
+	// Slow path: open a dedicated connection directly, outside the pool channel.
+	pool := p.getPool(ch.Database, client.GetUser())
+	if pool == nil {
+		return nil, false, fmt.Errorf("no pool for database %s", ch.Database)
 	}
 
-	listenQuery := fmt.Sprintf("LISTEN %s", ch.Name)
+	// Budget check — include both pool and listen connections.
+	listenOpen := int(atomic.LoadInt32(&pool.target.listenOpen))
+	if pool.target.totalOpen+listenOpen >= pool.target.MaxConnections {
+		return nil, false, fmt.Errorf("target %s at connection limit", pool.target.Name)
+	}
+
+	backend, err := pool.newConn(p)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to open listen connection: %w", err)
+	}
+	atomic.AddInt32(&pool.target.listenOpen, 1)
+
+	listenQuery := fmt.Sprintf("LISTEN %q", ch.Name)
 	if err := backend.WriteMessage('Q', []byte(listenQuery+"\x00")); err != nil {
-		p.returnOrCloseListenConn(backend, ch.Database, client.GetUser(), false)
+		backend.Close()
+		atomic.AddInt32(&pool.target.listenOpen, -1)
 		return nil, false, fmt.Errorf("failed to send LISTEN to backend: %w", err)
 	}
 
 	if err := p.drainUntilReady(backend); err != nil {
-		p.returnOrCloseListenConn(backend, ch.Database, client.GetUser(), false)
+		backend.Close()
+		atomic.AddInt32(&pool.target.listenOpen, -1)
 		return nil, false, fmt.Errorf("backend rejected LISTEN: %w", err)
 	}
 
-	// Take write lock only to register the monitor.
+	// Write lock only for registration — race guard re-checks under lock.
 	p.listenersMu.Lock()
 
 	// Race guard: another goroutine may have created the monitor while we
 	// were acquiring the backend connection.
 	if existing, ok := p.listeners[ch]; ok {
 		p.listenersMu.Unlock()
-		// We don't need our backend — return it to the pool.
-		p.returnOrCloseListenConn(backend, ch.Database, client.GetUser(), true)
+		backend.Close()
+		atomic.AddInt32(&pool.target.listenOpen, -1)
 		existing.addClient(client)
 		return existing, false, nil
 	}
@@ -199,28 +225,13 @@ func (p *Server) getOrCreateListen(ch Channel, client *ClientConnection) (*Liste
 	p.wg.Add(1)
 	go l.run(p)
 
-	p.logger.Info("Created listen monitor", "database", ch.Database, "channel", ch.Name)
+	p.logger.Info("Created listen monitor",
+		"database", ch.Database,
+		"channel", ch.Name)
 
 	return l, true, nil
 }
 
-// returnOrCloseListenConn returns a backend connection to its pool (healthy=true)
-// or signals the pool manager to close it (healthy=false).
-func (p *Server) returnOrCloseListenConn(backend *BackendConnection, dbName, user string, healthy bool) {
-	pool := p.getPool(dbName, user)
-	if pool == nil {
-		backend.Close()
-		return
-	}
-	if healthy {
-		pool.returnCh <- backend
-	} else {
-		pool.closeCh <- backend
-	}
-}
-
-// removeClientFromListen removes a client from a channel's monitor.
-// If the monitor becomes empty it is torn down.
 func (p *Server) removeClientFromListen(ch Channel, client *ClientConnection) {
 	p.listenersMu.Lock()
 	l, ok := p.listeners[ch]
@@ -255,10 +266,12 @@ func (p *Server) tearDownListen(l *Listen) {
 
 	if backend != nil {
 		// Best-effort UNLISTEN before closing.
-		unlistenQuery := fmt.Sprintf("UNLISTEN %s\x00", l.channel.Name)
+		unlistenQuery := fmt.Sprintf("UNLISTEN %q\x00", l.channel.Name)
 		_ = backend.WriteMessage('Q', []byte(unlistenQuery))
-		// Close via pool manager so stats stay consistent.
-		p.returnOrCloseListenConn(backend, l.channel.Database, "", false)
+		backend.Close()
+		if backend.pool != nil {
+			atomic.AddInt32(&backend.pool.target.listenOpen, -1)
+		}
 	}
 
 	<-l.done
@@ -301,19 +314,24 @@ func (p *Server) reconnectListen(l *Listen) (*BackendConnection, error) {
 		return nil, fmt.Errorf("no clients to reconnect for")
 	}
 
-	backend, err := p.borrowConn(sample)
-	if err != nil {
-		return nil, fmt.Errorf("failed to acquire backend: %w", err)
+	pool := p.getPool(l.channel.Database, sample.GetUser())
+	if pool == nil {
+		return nil, fmt.Errorf("no pool for database %s", l.channel.Database)
 	}
 
-	listenQuery := fmt.Sprintf("LISTEN %s\x00", l.channel.Name)
+	backend, err := pool.newConn(p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open reconnect connection: %w", err)
+	}
+
+	listenQuery := fmt.Sprintf("LISTEN %q\x00", l.channel.Name)
 	if err := backend.WriteMessage('Q', []byte(listenQuery)); err != nil {
-		p.returnOrCloseListenConn(backend, l.channel.Database, sample.GetUser(), false)
+		backend.Close()
 		return nil, fmt.Errorf("failed to send LISTEN on reconnect: %w", err)
 	}
 
 	if err := p.drainUntilReady(backend); err != nil {
-		p.returnOrCloseListenConn(backend, l.channel.Database, sample.GetUser(), false)
+		backend.Close()
 		return nil, fmt.Errorf("backend rejected LISTEN on reconnect: %w", err)
 	}
 
@@ -364,6 +382,9 @@ func (p *Server) shutdownListeners() {
 
 		if backend != nil {
 			backend.Close()
+			if backend.pool != nil {
+				atomic.AddInt32(&backend.pool.target.listenOpen, -1)
+			}
 		}
 	}
 
@@ -444,7 +465,12 @@ func (p *Server) handleUnlisten(client *ClientConnection, query string) error {
 func (p *Server) handleNotify(client *ClientConnection, query string) error {
 	logger := client.Logger()
 
-	backend, err := p.borrowConn(client)
+	pool := p.getPool(client.GetDatabase(), client.GetUser())
+	if pool == nil {
+		return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+	}
+
+	backend, err := pool.borrowConn(p.ctx)
 	if err != nil {
 		logger.WithError(err).Error("Failed to borrow backend for NOTIFY")
 		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
@@ -452,19 +478,22 @@ func (p *Server) handleNotify(client *ClientConnection, query string) error {
 
 	if err := p.forwardQueryToBackend(backend, query); err != nil {
 		logger.WithError(err).Error("Failed to send NOTIFY to backend")
-		p.closeConn(client, backend)
+		backend.Release()
 		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
 	if _, err := p.forwardCompleteBackendResponse(client, backend); err != nil {
+		backend.Release()
+		if isClientGone(err) {
+			return err
+		}
 		logger.WithError(err).Error("Failed to forward NOTIFY response")
-		p.closeConn(client, backend)
 		return err
 	}
 
 	// NOTIFY is always outside a transaction from the pool's perspective —
 	// we borrowed for one query and return immediately regardless of status.
-	p.returnConn(client, backend)
+	backend.pool.target.returnCh <- backend
 
 	logger.Debug("NOTIFY executed successfully")
 	return nil

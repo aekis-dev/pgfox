@@ -23,7 +23,7 @@ func (ws *WebServer) handleMetrics(c *gin.Context) {
 	metrics += "# TYPE pgfox_clients_active gauge\n"
 	metrics += fmt.Sprintf("pgfox_clients_active %d\n\n", stats.ActiveClients)
 
-	metrics += "# HELP pgfox_pools Total number of pools (target/database/user combinations)\n"
+	metrics += "# HELP pgfox_pools Total number of pools\n"
 	metrics += "# TYPE pgfox_pools gauge\n"
 	metrics += fmt.Sprintf("pgfox_pools %d\n\n", stats.TotalPools)
 
@@ -35,79 +35,44 @@ func (ws *WebServer) handleMetrics(c *gin.Context) {
 	metrics += "# TYPE pgfox_notifications_sent_total counter\n"
 	metrics += fmt.Sprintf("pgfox_notifications_sent_total %d\n\n", stats.NotificationsSent)
 
-	metrics += "# HELP pgfox_idle_connections_closed_total Total number of idle connections closed\n"
+	metrics += "# HELP pgfox_idle_connections_closed_total Total idle connections closed\n"
 	metrics += "# TYPE pgfox_idle_connections_closed_total counter\n"
 	metrics += fmt.Sprintf("pgfox_idle_connections_closed_total %d\n\n", stats.IdleConnectionsClosed)
 
-	// Per-pool metrics.
-	ws.pooler.targetsMu.RLock()
+	// Per-target metrics.
+	for _, target := range ws.pooler.targets {
+		target.poolsMu.RLock()
 
-	metrics += "# HELP pgfox_pool_connections_total Total connections open in pool\n"
-	metrics += "# TYPE pgfox_pool_connections_total gauge\n"
-	for targetName, targetMap := range ws.pooler.targets {
-		for dbName, dbMap := range targetMap {
+		metrics += "# HELP pgfox_target_connections_total Total open connections on target\n"
+		metrics += "# TYPE pgfox_target_connections_total gauge\n"
+		metrics += fmt.Sprintf("pgfox_target_connections_total{target=%q} %d\n\n",
+			target.Name, target.totalOpen)
+
+		metrics += "# HELP pgfox_target_server_max_connections PostgreSQL max_connections\n"
+		metrics += "# TYPE pgfox_target_server_max_connections gauge\n"
+		metrics += fmt.Sprintf("pgfox_target_server_max_connections{target=%q} %d\n\n",
+			target.Name, target.serverMaxConns)
+
+		metrics += "# HELP pgfox_target_server_open_connections PostgreSQL open connections\n"
+		metrics += "# TYPE pgfox_target_server_open_connections gauge\n"
+		metrics += fmt.Sprintf("pgfox_target_server_open_connections{target=%q} %d\n\n",
+			target.Name, target.serverOpenConns)
+
+		for dbName, dbMap := range target.pools {
 			for userName, pool := range dbMap {
-				metrics += fmt.Sprintf(
-					"pgfox_pool_connections_total{target=%q,database=%q,user=%q} %d\n",
-					targetName, dbName, userName, pool.totalConnections())
+				labels := fmt.Sprintf("target=%q,database=%q,user=%q", target.Name, dbName, userName)
+
+				metrics += fmt.Sprintf("pgfox_pool_connections_total{%s} %d\n", labels, pool.totalConnections())
+				metrics += fmt.Sprintf("pgfox_pool_connections_active{%s} %d\n", labels, pool.activeConnections())
+				metrics += fmt.Sprintf("pgfox_pool_connections_idle{%s} %d\n", labels, pool.idleConnections())
+				metrics += fmt.Sprintf("pgfox_pool_queries_total{%s} %d\n", labels, pool.queriesExecuted())
+				metrics += fmt.Sprintf("pgfox_pool_errors_total{%s} %d\n", labels, pool.errorCount())
 			}
 		}
+
+		target.poolsMu.RUnlock()
 	}
 	metrics += "\n"
-
-	metrics += "# HELP pgfox_pool_connections_active Connections currently checked out\n"
-	metrics += "# TYPE pgfox_pool_connections_active gauge\n"
-	for targetName, targetMap := range ws.pooler.targets {
-		for dbName, dbMap := range targetMap {
-			for userName, pool := range dbMap {
-				metrics += fmt.Sprintf(
-					"pgfox_pool_connections_active{target=%q,database=%q,user=%q} %d\n",
-					targetName, dbName, userName, pool.activeConnections())
-			}
-		}
-	}
-	metrics += "\n"
-
-	metrics += "# HELP pgfox_pool_connections_idle Connections currently idle in pool\n"
-	metrics += "# TYPE pgfox_pool_connections_idle gauge\n"
-	for targetName, targetMap := range ws.pooler.targets {
-		for dbName, dbMap := range targetMap {
-			for userName, pool := range dbMap {
-				metrics += fmt.Sprintf(
-					"pgfox_pool_connections_idle{target=%q,database=%q,user=%q} %d\n",
-					targetName, dbName, userName, pool.idleConnections())
-			}
-		}
-	}
-	metrics += "\n"
-
-	metrics += "# HELP pgfox_pool_queries_total Total queries executed on pool\n"
-	metrics += "# TYPE pgfox_pool_queries_total counter\n"
-	for targetName, targetMap := range ws.pooler.targets {
-		for dbName, dbMap := range targetMap {
-			for userName, pool := range dbMap {
-				metrics += fmt.Sprintf(
-					"pgfox_pool_queries_total{target=%q,database=%q,user=%q} %d\n",
-					targetName, dbName, userName, pool.queriesExecuted())
-			}
-		}
-	}
-	metrics += "\n"
-
-	metrics += "# HELP pgfox_pool_errors_total Total errors on pool\n"
-	metrics += "# TYPE pgfox_pool_errors_total counter\n"
-	for targetName, targetMap := range ws.pooler.targets {
-		for dbName, dbMap := range targetMap {
-			for userName, pool := range dbMap {
-				metrics += fmt.Sprintf(
-					"pgfox_pool_errors_total{target=%q,database=%q,user=%q} %d\n",
-					targetName, dbName, userName, pool.errorCount())
-			}
-		}
-	}
-	metrics += "\n"
-
-	ws.pooler.targetsMu.RUnlock()
 
 	// Listener metrics.
 	listenerStats := ws.pooler.getListenerStats()

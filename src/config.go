@@ -57,6 +57,16 @@ type ServerConfig struct {
 	// This role must have pg_read_all_auth_data (PG14+) or superuser privilege.
 	PgFoxRole string `yaml:"pgfox_role"`
 
+	// StatsInterval is how often the target goroutine queries pg_stat_activity
+	// to update the available connection slots on the PostgreSQL server.
+	// Default: 10s
+	StatsInterval time.Duration `yaml:"stats_interval"`
+
+	// PeakWindow is the rolling window over which peak active connections are
+	// tracked per pool for smart shrink decisions.
+	// Default: 5m
+	PeakWindow time.Duration `yaml:"peak_window"`
+
 	// Certs contains certificate generation settings for user certificates.
 	Certs CertsConfig `yaml:"certs"`
 }
@@ -72,26 +82,6 @@ type CertsConfig struct {
 	Organization       string `yaml:"organization"`
 	OrganizationalUnit string `yaml:"organizational_unit"`
 	Country            string `yaml:"country"`
-}
-
-// Target represents a PostgreSQL server that can serve one or more databases.
-// Backend connections always use verify-full TLS with client certificate auth.
-// If IncludeDatabases is specified, only those databases are accessible.
-// If IncludeDatabases is empty, all databases are accessible (wildcard mode).
-type Target struct {
-	Name           string            `yaml:"name"`
-	Host           string            `yaml:"host"`
-	Port           int               `yaml:"port"`
-	MaxConnections int               `yaml:"max_connections"`
-	ConnectTimeout time.Duration     `yaml:"connect_timeout"`
-	Parameters     map[string]string `yaml:"parameters"`
-
-	// Database filtering (both optional)
-	IncludeDatabases []string `yaml:"include_databases"`
-	ExcludeDatabases []string `yaml:"exclude_databases"`
-
-	// Priority for multi-target scenarios (lower = higher priority)
-	Priority int `yaml:"priority"`
 }
 
 // LoggingConfig contains logging configuration
@@ -120,6 +110,8 @@ func LoadConfig(configPath string) (*Config, error) {
 			IdleTimeout:    10 * time.Minute,
 			QueryTimeout:   0, // disabled — no fixed deadline on query execution
 			MaxMessageSize: 256 * 1024 * 1024,
+			StatsInterval:  10 * time.Second,
+			PeakWindow:     5 * time.Minute,
 			PgFoxDir:       "/etc/pgfox",
 			Hostname:       "localhost",
 			PgFoxRole:      "postgres",

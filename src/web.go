@@ -122,11 +122,11 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(mc.notificationsSent, prometheus.CounterValue, float64(stats.NotificationsSent))
 	ch <- prometheus.MustNewConstMetric(mc.idleConnectionsClosed, prometheus.CounterValue, float64(stats.IdleConnectionsClosed))
 
-	mc.pooler.targetsMu.RLock()
-	for targetName, targetMap := range mc.pooler.targets {
-		for dbName, dbMap := range targetMap {
+	for _, target := range mc.pooler.targets {
+		target.poolsMu.RLock()
+		for dbName, dbMap := range target.pools {
 			for userName, pool := range dbMap {
-				labels := []string{targetName, dbName, userName}
+				labels := []string{target.Name, dbName, userName}
 
 				ch <- prometheus.MustNewConstMetric(mc.poolConnectionsTotal, prometheus.GaugeValue,
 					float64(pool.totalConnections()), labels...)
@@ -140,8 +140,8 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 					float64(pool.errorCount()), labels...)
 			}
 		}
+		target.poolsMu.RUnlock()
 	}
-	mc.pooler.targetsMu.RUnlock()
 }
 
 // WebServer provides HTTP endpoints.

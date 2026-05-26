@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -105,8 +106,7 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 	client.SetDatabase(startupMsg.Database)
 
 	logger := client.Logger().WithUser(startupMsg.User).WithDatabase(startupMsg.Database)
-	logger.Info("Client startup",
-		"protocol_version", protocolVersion,
+	logger.Debug("Client startup",
 		"remote_addr", client.RemoteAddr(),
 		"database", startupMsg.Database,
 		"user", startupMsg.User)
@@ -116,9 +116,8 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 
 // authenticateClientWithBackend authenticates a client using SCRAM-SHA-256,
 // then ensures the backend pool for this (database, user) exists.
-// No backend connection is opened here — parameters come from targetParams
-// (captured at startup from the privileged connection) and the pool manager
-// goroutine owns all connection creation.
+// No backend connection is opened here — the target goroutine owns all
+// connection creation. Parameters come from target.params captured at startup.
 func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, database string) error {
 	logger := client.Logger()
 
@@ -129,10 +128,10 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 		return sendErrorResponse(client, "FATAL", "3D000", "database not found")
 	}
 
-	selectedTarget := pool.target
+	target := pool.target
 
-	// Fetch live SCRAM verifier from pg_shadow.
-	verifier, err := p.getSCRAMVerifier(selectedTarget.Name, user)
+	// Fetch live SCRAM verifier from pg_shadow via target.conn.
+	verifier, err := p.getSCRAMVerifier(target, user)
 	if err != nil {
 		logger.WithError(err).Error("Failed to fetch SCRAM verifier")
 		return sendErrorResponse(client, "FATAL", "28P01", "authentication failed")
@@ -143,34 +142,18 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 		logger.WithError(err).Warn("Client SCRAM authentication failed")
 		return sendErrorResponse(client, "FATAL", "28P01", "password authentication failed")
 	}
-	logger.Info("Client SCRAM authentication successful")
+	logger.Debug("Client SCRAM authentication successful")
 
-	// Block until the pool manager has at least one connection ready.
-	select {
-	case <-pool.ready:
-	case <-time.After(selectedTarget.ConnectTimeout):
-		return sendErrorResponse(client, "FATAL", "08006", "timed out waiting for backend pool")
-	case <-p.ctx.Done():
-		return sendErrorResponse(client, "FATAL", "08006", "server shutting down")
-	}
-
-	// Peek the first idle connection's BackendKeyData without consuming it.
-	var processID, secretKey int32
-	select {
-	case conn := <-pool.backendPool:
-		processID = conn.GetProcessID()
-		secretKey = conn.GetSecretKey()
-		pool.backendPool <- conn
-	default:
-	}
-
+	// Send authentication success to the client. The client will block
+	// naturally on borrowConn when it sends its first query if no connection
+	// is available yet — no need to wait here.
 	if err := sendAuthenticationOK(client); err != nil {
 		return fmt.Errorf("failed to send AuthenticationOK: %w", err)
 	}
-	if err := sendBackendKeyData(client, processID, secretKey); err != nil {
+	if err := sendBackendKeyData(client, 0, 0); err != nil {
 		return fmt.Errorf("failed to send BackendKeyData: %w", err)
 	}
-	if err := p.sendTargetParameterStatuses(client, user, selectedTarget.Name); err != nil {
+	if err := p.sendTargetParameterStatuses(client, user, target); err != nil {
 		return err
 	}
 	if err := sendReadyForQuery(client, 'I'); err != nil {
@@ -178,22 +161,22 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 	}
 
 	client.SetAuthenticated(true)
-	logger.Info("Client authenticated",
-		"target", selectedTarget.Name,
+	logger.Debug("Client authenticated",
+		"target", target.Name,
 		"database", database,
-		"total_pool", pool.totalConnections())
+		"total_pool", pool.totalConnections(),
+		"active_clients", atomic.LoadInt64(&p.stats.ActiveClients))
 
 	return nil
 }
 
 // sendTargetParameterStatuses sends ParameterStatus messages to the client
-// using the values captured from the privileged connection at startup.
+// using the values captured from the target's privileged connection at startup.
 // session_authorization is overridden to reflect the authenticated client user.
-func (p *Server) sendTargetParameterStatuses(client *ClientConnection, user, targetName string) error {
-	params := p.targetParams[targetName]
+func (p *Server) sendTargetParameterStatuses(client *ClientConnection, user string, target *Target) error {
 	overrides := map[string]string{"session_authorization": user}
 
-	for name, value := range params {
+	for name, value := range target.params {
 		if ov, ok := overrides[name]; ok {
 			value = ov
 		}
@@ -201,15 +184,74 @@ func (p *Server) sendTargetParameterStatuses(client *ClientConnection, user, tar
 			return fmt.Errorf("failed to send parameter status %s: %w", name, err)
 		}
 	}
-	// Send any overrides not already covered by the captured params.
 	for name, value := range overrides {
-		if _, sent := params[name]; !sent {
+		if _, sent := target.params[name]; !sent {
 			if err := sendParameterStatus(client, name, value); err != nil {
 				return fmt.Errorf("failed to send parameter status %s: %w", name, err)
 			}
 		}
 	}
 	return nil
+}
+
+// getSCRAMVerifier fetches the SCRAM-SHA-256 verifier for a user from pg_authid
+// via the target's privileged connection (target.conn).
+func (p *Server) getSCRAMVerifier(target *Target, username string) (*SCRAMVerifier, error) {
+	if target.conn == nil {
+		return nil, fmt.Errorf("privileged connection not ready for target %s", target.Name)
+	}
+
+	query := fmt.Sprintf(
+		"SELECT rolpassword FROM pg_authid WHERE rolname = '%s'",
+		escapeSingleQuote(username))
+
+	if err := target.conn.WriteMessage('Q', []byte(query+"\x00")); err != nil {
+		return nil, fmt.Errorf("failed to send pg_shadow query: %w", err)
+	}
+
+	if err := target.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return nil, fmt.Errorf("failed to set read deadline: %w", err)
+	}
+	defer target.conn.conn.SetReadDeadline(time.Time{})
+
+	var rolpassword string
+	found := false
+
+	for {
+		msgType, body, err := target.conn.ReadMessage()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read pg_shadow response: %w", err)
+		}
+		switch msgType {
+		case 'T':
+		case 'D':
+			if len(body) < 2 {
+				continue
+			}
+			pos := 2
+			if pos+4 > len(body) {
+				continue
+			}
+			colLen := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
+				int32(body[pos+2])<<8 | int32(body[pos+3]))
+			pos += 4
+			if colLen < 0 || pos+colLen > len(body) {
+				continue
+			}
+			rolpassword = string(body[pos : pos+colLen])
+			found = true
+		case 'C':
+		case 'Z':
+			if !found {
+				return nil, fmt.Errorf("user %q not found in pg_authid", username)
+			}
+			return parseSCRAMVerifier(rolpassword)
+		case 'E':
+			return nil, fmt.Errorf("pg_shadow query error: %s", parseErrorMessage(body))
+		case 'N':
+			continue
+		}
+	}
 }
 
 // createCertBackendConnection opens a new backend connection using TLS client
@@ -323,212 +365,6 @@ func (p *Server) drainBackendStartup(backend *BackendConnection) error {
 			return nil
 		case 'E':
 			return fmt.Errorf("backend error during startup: %s", parseErrorMessage(body))
-		case 'N':
-			continue
-		}
-	}
-}
-
-// initPrivilegedConnections opens one persistent backend connection per target
-// using the pgfox_role certificate, used exclusively for pg_shadow queries.
-// It also captures the ParameterStatus values from the connection startup into
-// p.targetParams so auth flows can send them to clients without opening extra
-// backend connections.
-func (p *Server) initPrivilegedConnections() error {
-	pgfoxCert, err := p.loadOrGenerateUserCert(p.config.Server.PgFoxRole)
-	if err != nil {
-		return fmt.Errorf("failed to load/generate pgfox cert for role %q: %w",
-			p.config.Server.PgFoxRole, err)
-	}
-
-	for _, target := range p.targetConfigs {
-		p.logger.Info("Opening privileged connection",
-			"target", target.Name, "role", p.config.Server.PgFoxRole)
-
-		conn, err := p.createCertBackendConnection(
-			target, "postgres", p.config.Server.PgFoxRole, pgfoxCert)
-		if err != nil {
-			return fmt.Errorf("privileged connection to %s failed: %w", target.Name, err)
-		}
-
-		// Capture ParameterStatus values — these are server-wide and don't
-		// change per-user, so we reuse them for all client auth handshakes on
-		// this target instead of opening a backend connection per auth.
-		params := make(map[string]string, len(conn.parameters))
-		for k, v := range conn.parameters {
-			params[k] = v
-		}
-		p.targetParams[target.Name] = params
-
-		p.privilegedConnsMu.Lock()
-		p.privilegedConns[target.Name] = conn
-		p.privilegedConnsMu.Unlock()
-
-		readyCh := make(chan struct{})
-		close(readyCh)
-		p.privilegedReadyMu.Lock()
-		p.privilegedReady[target.Name] = readyCh
-		p.privilegedReadyMu.Unlock()
-
-		p.logger.Info("Privileged connection ready",
-			"target", target.Name,
-			"params", len(params))
-
-		p.wg.Add(1)
-		go p.maintainPrivilegedConnection(target, pgfoxCert)
-	}
-
-	return nil
-}
-
-// maintainPrivilegedConnection watches the privileged connection for a target
-// and reconnects if it drops.
-func (p *Server) maintainPrivilegedConnection(target *Target, pgfoxCert tls.Certificate) {
-	defer p.wg.Done()
-
-	logger := p.logger.
-		WithField("component", "priv_conn").
-		WithField("target", target.Name)
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			logger.Debug("Privileged connection maintenance stopping — shutdown")
-			return
-
-		case <-ticker.C:
-			p.privilegedConnsMu.RLock()
-			conn := p.privilegedConns[target.Name]
-			p.privilegedConnsMu.RUnlock()
-
-			if conn != nil && conn.IsAlive() {
-				continue
-			}
-
-			logger.Warn("Privileged connection lost, reconnecting")
-
-			notReady := make(chan struct{})
-			p.privilegedReadyMu.Lock()
-			p.privilegedReady[target.Name] = notReady
-			p.privilegedReadyMu.Unlock()
-
-			for {
-				if p.ctx.Err() != nil {
-					return
-				}
-
-				newConn, err := p.createCertBackendConnection(
-					target, "postgres", p.config.Server.PgFoxRole, pgfoxCert)
-				if err != nil {
-					logger.WithError(err).Warn("Reconnect failed, retrying in 5s")
-					select {
-					case <-p.ctx.Done():
-						return
-					case <-time.After(5 * time.Second):
-					}
-					continue
-				}
-
-				p.privilegedConnsMu.Lock()
-				p.privilegedConns[target.Name] = newConn
-				p.privilegedConnsMu.Unlock()
-
-				readyCh := make(chan struct{})
-				close(readyCh)
-				p.privilegedReadyMu.Lock()
-				p.privilegedReady[target.Name] = readyCh
-				p.privilegedReadyMu.Unlock()
-
-				logger.Info("Privileged connection re-established")
-				break
-			}
-		}
-	}
-}
-
-// getSCRAMVerifier fetches the SCRAM-SHA-256 verifier for a user from pg_authid
-// via the privileged connection. Always live — no cache.
-func (p *Server) getSCRAMVerifier(targetName, username string) (*SCRAMVerifier, error) {
-	const waitTimeout = 10 * time.Second
-
-	p.privilegedReadyMu.RLock()
-	readyCh := p.privilegedReady[targetName]
-	p.privilegedReadyMu.RUnlock()
-
-	if readyCh == nil {
-		return nil, fmt.Errorf("no privileged connection for target %s", targetName)
-	}
-
-	select {
-	case <-readyCh:
-	case <-time.After(waitTimeout):
-		return nil, fmt.Errorf("timed out waiting for privileged connection to %s", targetName)
-	case <-p.ctx.Done():
-		return nil, fmt.Errorf("server shutting down")
-	}
-
-	p.privilegedConnsMu.RLock()
-	conn := p.privilegedConns[targetName]
-	p.privilegedConnsMu.RUnlock()
-
-	if conn == nil {
-		return nil, fmt.Errorf("privileged connection unavailable for %s", targetName)
-	}
-
-	query := fmt.Sprintf(
-		"SELECT rolpassword FROM pg_authid WHERE rolname = '%s'",
-		escapeSingleQuote(username))
-
-	if err := conn.WriteMessage('Q', []byte(query+"\x00")); err != nil {
-		return nil, fmt.Errorf("failed to send pg_shadow query: %w", err)
-	}
-
-	if err := conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return nil, fmt.Errorf("failed to set read deadline on privileged conn: %w", err)
-	}
-	defer conn.conn.SetReadDeadline(time.Time{})
-
-	var rolpassword string
-	found := false
-
-	for {
-		msgType, body, err := conn.ReadMessage()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read pg_shadow response: %w", err)
-		}
-		switch msgType {
-		case 'T': // RowDescription
-		case 'D': // DataRow
-			if len(body) < 2 {
-				continue
-			}
-			colCount := int(body[0])<<8 | int(body[1])
-			if colCount < 1 {
-				continue
-			}
-			pos := 2
-			if pos+4 > len(body) {
-				continue
-			}
-			colLen := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
-				int32(body[pos+2])<<8 | int32(body[pos+3]))
-			pos += 4
-			if colLen < 0 || pos+colLen > len(body) {
-				continue
-			}
-			rolpassword = string(body[pos : pos+colLen])
-			found = true
-		case 'C': // CommandComplete
-		case 'Z': // ReadyForQuery
-			if !found {
-				return nil, fmt.Errorf("user %q not found in pg_authid", username)
-			}
-			return parseSCRAMVerifier(rolpassword)
-		case 'E':
-			return nil, fmt.Errorf("pg_shadow query error: %s", parseErrorMessage(body))
 		case 'N':
 			continue
 		}

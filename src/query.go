@@ -82,17 +82,25 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 		if backend == nil {
 			// Defensive: transaction flag set but no pinned conn — borrow one.
 			logger.Warn("In transaction but no pinned backend, borrowing from pool")
+			pool := p.getPool(client.GetDatabase(), client.GetUser())
+			if pool == nil {
+				return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+			}
 			var err error
-			backend, err = p.borrowConn(client)
+			backend, err = pool.borrowConn(p.ctx)
 			if err != nil {
 				return sendErrorResponse(client, "FATAL", "53300", "too many connections")
 			}
 			client.SetBackendConnection(backend)
-			backend.SetClientRef(client)
+			backend.SetClient(client)
 		}
 	} else {
+		pool := p.getPool(client.GetDatabase(), client.GetUser())
+		if pool == nil {
+			return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+		}
 		var err error
-		backend, err = p.borrowConn(client)
+		backend, err = pool.borrowConn(p.ctx)
 		if err != nil {
 			logger.WithError(err).Error("Failed to borrow backend connection")
 			return sendErrorResponse(client, "FATAL", "53300", "too many connections")
@@ -108,14 +116,14 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 
 	if err := p.forwardQueryToBackend(backend, query); err != nil {
 		logger.WithError(err).Error("Failed to forward query to backend")
-		p.closeConn(client, backend)
+		backend.Release()
 		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
 	txStatus, err := p.forwardCompleteBackendResponse(client, backend)
 	if err != nil {
 		logger.WithError(err).Error("Failed to forward backend response")
-		p.closeConn(client, backend)
+		backend.Release()
 		return err
 	}
 
@@ -144,14 +152,13 @@ func (p *Server) reconcileConn(
 	wasPinned bool,
 	logger *Logger,
 ) {
-
 	switch txStatus {
 	case 'T', 'E':
 		// Inside a transaction — pin if not already pinned.
 		if !wasPinned {
 			logger.Debug("Transaction opened — pinning connection", "tx_status", string(txStatus))
 			client.SetBackendConnection(backend)
-			backend.SetClientRef(client)
+			backend.SetClient(client)
 			client.SetInTransaction(true)
 		}
 		// Already pinned — nothing to change.
@@ -161,12 +168,12 @@ func (p *Server) reconcileConn(
 			// Transaction closed — unpin and return to pool.
 			logger.Debug("Transaction closed — returning connection to pool")
 			client.SetBackendConnection(nil)
-			backend.SetClientRef(nil)
+			backend.SetClient(nil)
 			client.SetInTransaction(false)
-			p.returnConn(client, backend)
+			backend.pool.target.returnCh <- backend
 		} else {
 			// Regular borrowed connection — return to pool.
-			p.returnConn(client, backend)
+			backend.pool.target.returnCh <- backend
 		}
 
 	default:
@@ -174,36 +181,10 @@ func (p *Server) reconcileConn(
 		logger.Warn("Unknown ReadyForQuery status, returning connection", "status", string(txStatus))
 		if wasPinned {
 			client.SetBackendConnection(nil)
-			backend.SetClientRef(nil)
+			backend.SetClient(nil)
 			client.SetInTransaction(false)
 		}
-		p.returnConn(client, backend)
-	}
-}
-
-// returnConn returns a healthy connection to the pool.
-func (p *Server) returnConn(client *ClientConnection, backend *BackendConnection) {
-	pool := p.getPool(client.GetDatabase(), client.GetUser())
-	if pool != nil {
-		pool.returnCh <- backend
-	} else {
-		backend.Close()
-	}
-}
-
-// closeConn signals the pool manager that a connection is dead and should be
-// replaced. Also clears any pinned reference on the client.
-func (p *Server) closeConn(client *ClientConnection, backend *BackendConnection) {
-	if client.GetBackendConnection() == backend {
-		client.SetBackendConnection(nil)
-		backend.SetClientRef(nil)
-		client.SetInTransaction(false)
-	}
-	pool := p.getPool(client.GetDatabase(), client.GetUser())
-	if pool != nil {
-		pool.closeCh <- backend
-	} else {
-		backend.Close()
+		backend.pool.target.returnCh <- backend
 	}
 }
 
@@ -221,14 +202,18 @@ func (p *Server) executeExtendedQuery(client *ClientConnection, msgType byte, bo
 	wasPinned := backend != nil
 
 	if backend == nil {
+		pool := p.getPool(client.GetDatabase(), client.GetUser())
+		if pool == nil {
+			return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+		}
 		var err error
-		backend, err = p.borrowConn(client)
+		backend, err = pool.borrowConn(p.ctx)
 		if err != nil {
 			logger.WithError(err).Error("Failed to borrow backend for extended query")
 			return sendErrorResponse(client, "FATAL", "53300", "too many connections")
 		}
 		client.SetBackendConnection(backend)
-		backend.SetClientRef(client)
+		backend.SetClient(client)
 		client.SetInTransaction(true) // treat as in-transaction until Sync says otherwise
 		logger.Debug("Pinned backend for extended query sequence")
 	}
@@ -242,7 +227,7 @@ func (p *Server) executeExtendedQuery(client *ClientConnection, msgType byte, bo
 
 	if err := backend.WriteMessage(msgType, body); err != nil {
 		logger.WithError(err).Error("Failed to forward extended query message")
-		p.closeConn(client, backend)
+		backend.Release()
 		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 	}
 
@@ -264,7 +249,7 @@ func (p *Server) executeExtendedQuery(client *ClientConnection, msgType byte, bo
 	}
 
 	if err != nil {
-		p.closeConn(client, backend)
+		backend.Release()
 		return err
 	}
 
@@ -275,31 +260,6 @@ func (p *Server) executeExtendedQuery(client *ClientConnection, msgType byte, bo
 	}
 
 	return nil
-}
-
-// borrowConn takes a connection from the client's pool, blocking until one is
-// available or the timeout fires. Never creates connections — that is the pool
-// manager's exclusive responsibility.
-func (p *Server) borrowConn(client *ClientConnection) (*BackendConnection, error) {
-	pool := p.getPool(client.GetDatabase(), client.GetUser())
-	if pool == nil {
-		return nil, fmt.Errorf("no pool for database %s user %s", client.GetDatabase(), client.GetUser())
-	}
-
-	timeout := pool.target.ConnectTimeout
-	if timeout == 0 {
-		timeout = p.config.Server.ConnectTimeout
-	}
-
-	select {
-	case conn := <-pool.backendPool:
-		conn.SetInUse(true)
-		return conn, nil
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("timed out waiting for backend connection for %s", client.GetDatabase())
-	case <-p.ctx.Done():
-		return nil, fmt.Errorf("server shutting down")
-	}
 }
 
 // forwardQueryToBackend sends a simple query to the backend.
@@ -324,6 +284,9 @@ func (p *Server) forwardCompleteBackendResponse(client *ClientConnection, backen
 		}
 
 		if err := client.WriteMessage(msgType, body); err != nil {
+			if isClientGone(err) {
+				return 0, err
+			}
 			return 0, err
 		}
 

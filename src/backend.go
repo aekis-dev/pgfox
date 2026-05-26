@@ -17,14 +17,15 @@ type BackendConnection struct {
 	dbName         string
 	username       string
 	targetName     string
+	pool           *Pool // pool that owns this connection
 	inUse          bool
 	createdAt      time.Time
 	lastUsedAt     time.Time
 	processID      int32
 	secretKey      int32
-	clientRef      *ClientConnection
-	maxMessageSize int               // maximum allowed PostgreSQL message body size in bytes
-	parameters     map[string]string // ParameterStatus values received during backend auth
+	client         *ClientConnection
+	maxMessageSize int
+	parameters     map[string]string
 	mu             sync.Mutex
 }
 
@@ -136,18 +137,18 @@ func (b *BackendConnection) SetSecretKey(secretKey int32) {
 	b.secretKey = secretKey
 }
 
-// GetClientRef returns the associated client connection
-func (b *BackendConnection) GetClientRef() *ClientConnection {
+// GetClient returns the associated client connection
+func (b *BackendConnection) GetClient() *ClientConnection {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.clientRef
+	return b.client
 }
 
-// SetClientRef sets the associated client connection
-func (b *BackendConnection) SetClientRef(client *ClientConnection) {
+// SetClient sets the associated client connection
+func (b *BackendConnection) SetClient(client *ClientConnection) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.clientRef = client
+	b.client = client
 }
 
 // WriteMessage writes a message to the backend
@@ -279,4 +280,19 @@ func (b *BackendConnection) IsAlive() bool {
 
 func (b *BackendConnection) Peek(n int) ([]byte, error) {
 	return b.reader.Peek(n)
+}
+
+// Release signals the target that a connection is dead and should be replaced.
+// Also clears any pinned reference on the client.
+func (b *BackendConnection) Release() {
+	if b.client != nil {
+		b.client.SetBackendConnection(nil)
+		b.client.SetInTransaction(false)
+		b.SetClient(nil)
+	}
+	if b.pool != nil {
+		b.pool.target.closeCh <- b
+	} else {
+		b.Close()
+	}
 }
