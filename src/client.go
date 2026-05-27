@@ -20,6 +20,7 @@ type ClientConnection struct {
 	user           string
 	password       string
 	inTransaction  bool
+	namedStmts     int // count of named prepared statements active on pinned backend
 	isListening    bool
 	listenChannels map[Channel]bool
 	logger         *Logger
@@ -127,6 +128,29 @@ func (c *ClientConnection) IsInTransaction() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.inTransaction
+}
+
+// AddNamedStatement increments the named prepared statement counter.
+func (c *ClientConnection) AddNamedStatement() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.namedStmts++
+}
+
+// RemoveNamedStatement decrements the named prepared statement counter.
+func (c *ClientConnection) RemoveNamedStatement() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.namedStmts > 0 {
+		c.namedStmts--
+	}
+}
+
+// HasNamedStatements returns true if any named prepared statements are active.
+func (c *ClientConnection) HasNamedStatements() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.namedStmts > 0
 }
 
 // SetInTransaction sets the transaction state
