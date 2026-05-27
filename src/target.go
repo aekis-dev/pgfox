@@ -59,6 +59,10 @@ type Target struct {
 	// allowed to complete until query_timeout, then force-closed.
 	draining atomic.Bool
 
+	// scramCh serialises pg_shadow queries through the target goroutine so that
+	// target.conn is never accessed concurrently from client goroutines.
+	scramCh chan scramRequest
+
 	// returnCh and closeCh are target-level. conn.pool identifies which pool
 	// the connection belongs to. The target goroutine is the sole reader.
 	returnCh chan *BackendConnection
@@ -72,6 +76,18 @@ type Target struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// scramRequest is sent by a client goroutine to the target goroutine to fetch
+// a SCRAM verifier from pg_shadow via the privileged connection.
+type scramRequest struct {
+	username string
+	reply    chan scramReply
+}
+
+type scramReply struct {
+	verifier *SCRAMVerifier
+	err      error
 }
 
 // activeConnections returns the total number of connections currently checked
@@ -192,6 +208,72 @@ func extractIP(addr net.Addr) net.IP {
 //  1. Opens and maintains the privileged connection (conn).
 //  2. Manages all pool connections: growth, shrink, recycling, health checks.
 //  3. Periodically queries pg_stat_activity to track real server capacity.
+//
+// fetchSCRAMVerifier queries pg_shadow for the SCRAM verifier of username.
+// Must only be called from the target goroutine — target.conn is not
+// safe to access from other goroutines concurrently.
+func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
+	if t.conn == nil {
+		return nil, fmt.Errorf("privileged connection not ready for target %s", t.Name)
+	}
+
+	query := fmt.Sprintf(
+		"SELECT rolpassword FROM pg_authid WHERE rolname = '%s'\x00",
+		escapeSingleQuote(username),
+	)
+
+	if err := t.conn.WriteMessage('Q', []byte(query)); err != nil {
+		return nil, fmt.Errorf("failed to send pg_shadow query: %w", err)
+	}
+
+	if err := t.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return nil, fmt.Errorf("failed to set read deadline: %w", err)
+	}
+	defer t.conn.conn.SetReadDeadline(time.Time{})
+
+	var rolpassword string
+
+	for {
+		msgType, body, err := t.conn.ReadMessage()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read pg_shadow response: %w", err)
+		}
+
+		switch msgType {
+		case 'T': // RowDescription — skip
+		case 'D': // DataRow
+			if len(body) < 2 {
+				continue
+			}
+			colCount := int(body[0])<<8 | int(body[1])
+			if colCount < 1 {
+				continue
+			}
+			pos := 2
+			if pos+4 > len(body) {
+				continue
+			}
+			colLen := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
+				int32(body[pos+2])<<8 | int32(body[pos+3]))
+			pos += 4
+			if colLen < 0 {
+				return nil, fmt.Errorf("user %q not found in pg_authid", username)
+			}
+			if pos+colLen <= len(body) {
+				rolpassword = string(body[pos : pos+colLen])
+			}
+		case 'C': // CommandComplete
+		case 'Z': // ReadyForQuery
+			if rolpassword == "" {
+				return nil, fmt.Errorf("user %q not found in pg_authid", username)
+			}
+			return parseSCRAMVerifier(rolpassword)
+		case 'E':
+			return nil, fmt.Errorf("pg_shadow query error: %s", parseErrorMessage(body))
+		}
+	}
+}
+
 func (t *Target) run(p *Server) {
 	logger := p.logger.
 		WithField("component", "target").
@@ -218,6 +300,10 @@ func (t *Target) run(p *Server) {
 			logger.Info("Target manager stopping")
 			t.drain(p, logger)
 			return
+
+		case req := <-t.scramCh:
+			verifier, err := t.fetchSCRAMVerifier(req.username)
+			req.reply <- scramReply{verifier: verifier, err: err}
 
 		case conn := <-t.returnCh:
 			t.handleReturn(p, conn, logger)

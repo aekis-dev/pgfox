@@ -200,63 +200,21 @@ func (p *Server) sendTargetParameterStatuses(client *ClientConnection, user stri
 	return nil
 }
 
-// getSCRAMVerifier fetches the SCRAM-SHA-256 verifier for a user from pg_authid
-// via the target's privileged connection (target.conn).
+// getSCRAMVerifier fetches the SCRAM-SHA-256 verifier for a user from pg_authid.
+// Routes the query through the target goroutine via scramCh so that target.conn
+// is never accessed concurrently from multiple client goroutines.
 func (p *Server) getSCRAMVerifier(target *Target, username string) (*SCRAMVerifier, error) {
-	if target.conn == nil {
-		return nil, fmt.Errorf("privileged connection not ready for target %s", target.Name)
+	reply := make(chan scramReply, 1)
+	select {
+	case target.scramCh <- scramRequest{username: username, reply: reply}:
+	case <-p.ctx.Done():
+		return nil, fmt.Errorf("server shutting down")
 	}
-
-	query := fmt.Sprintf(
-		"SELECT rolpassword FROM pg_authid WHERE rolname = '%s'",
-		escapeSingleQuote(username))
-
-	if err := target.conn.WriteMessage('Q', []byte(query+"\x00")); err != nil {
-		return nil, fmt.Errorf("failed to send pg_shadow query: %w", err)
-	}
-
-	if err := target.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return nil, fmt.Errorf("failed to set read deadline: %w", err)
-	}
-	defer target.conn.conn.SetReadDeadline(time.Time{})
-
-	var rolpassword string
-	found := false
-
-	for {
-		msgType, body, err := target.conn.ReadMessage()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read pg_shadow response: %w", err)
-		}
-		switch msgType {
-		case 'T':
-		case 'D':
-			if len(body) < 2 {
-				continue
-			}
-			pos := 2
-			if pos+4 > len(body) {
-				continue
-			}
-			colLen := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
-				int32(body[pos+2])<<8 | int32(body[pos+3]))
-			pos += 4
-			if colLen < 0 || pos+colLen > len(body) {
-				continue
-			}
-			rolpassword = string(body[pos : pos+colLen])
-			found = true
-		case 'C':
-		case 'Z':
-			if !found {
-				return nil, fmt.Errorf("user %q not found in pg_authid", username)
-			}
-			return parseSCRAMVerifier(rolpassword)
-		case 'E':
-			return nil, fmt.Errorf("pg_shadow query error: %s", parseErrorMessage(body))
-		case 'N':
-			continue
-		}
+	select {
+	case r := <-reply:
+		return r.verifier, r.err
+	case <-p.ctx.Done():
+		return nil, fmt.Errorf("server shutting down")
 	}
 }
 

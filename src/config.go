@@ -204,6 +204,7 @@ func LoadConfig(configPath string) (*Config, error) {
 		t.returnCh = make(chan *BackendConnection, t.MaxConnections)
 		t.closeCh = make(chan *BackendConnection, t.MaxConnections)
 		t.connReady = make(chan struct{}, 1)
+		t.scramCh = make(chan scramRequest)
 	}
 
 	// Sort targets by priority (lower value = higher priority, ties by name).
