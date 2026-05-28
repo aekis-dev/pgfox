@@ -28,6 +28,12 @@ type ClientConnection struct {
 	connectedAt    time.Time
 	lastActivity   time.Time
 	maxMessageSize int // maximum allowed PostgreSQL message body size in bytes
+
+	// stmtNameMap maps client-visible statement names to internal pgfox hashes.
+	// stmtRevMap is the reverse: hash → client name. Both are written only from
+	// the goroutine handling this client connection, so no lock is needed.
+	stmtNameMap map[string]string // clientName → hash
+	stmtRevMap  map[string]string // hash → clientName
 }
 
 // NewClientConnection creates a new client connection
@@ -42,6 +48,8 @@ func NewClientConnection(conn net.Conn, logger *Logger, maxMessageSize int) *Cli
 		connectedAt:    now,
 		lastActivity:   now,
 		maxMessageSize: maxMessageSize,
+		stmtNameMap:    make(map[string]string),
+		stmtRevMap:     make(map[string]string),
 	}
 }
 
@@ -358,4 +366,41 @@ func (c *ClientConnection) GetLastActivity() time.Time {
 // Logger returns the client's logger
 func (c *ClientConnection) Logger() *Logger {
 	return c.logger
+}
+
+// --- Prepared statement name mapping ---
+// These methods are NOT guarded by c.mu because they are only ever called
+// from the single goroutine that owns this client connection.
+
+// MapStmtName registers a mapping from a client-visible name to an internal
+// pgfox hash, and the reverse. Replaces any previous mapping for clientName.
+func (c *ClientConnection) MapStmtName(clientName, hash string) {
+	// Remove any previous reverse entry for this clientName.
+	if old, ok := c.stmtNameMap[clientName]; ok {
+		delete(c.stmtRevMap, old)
+	}
+	c.stmtNameMap[clientName] = hash
+	c.stmtRevMap[hash] = clientName
+}
+
+// LookupInternalName returns the internal hash for a client-visible statement
+// name, or ("", false) if not found.
+func (c *ClientConnection) LookupInternalName(clientName string) (string, bool) {
+	hash, ok := c.stmtNameMap[clientName]
+	return hash, ok
+}
+
+// LookupClientName returns the client-visible name for an internal hash,
+// or ("", false) if not found.
+func (c *ClientConnection) LookupClientName(hash string) (string, bool) {
+	name, ok := c.stmtRevMap[hash]
+	return name, ok
+}
+
+// UnmapStmtName removes the mapping for clientName and its reverse entry.
+func (c *ClientConnection) UnmapStmtName(clientName string) {
+	if hash, ok := c.stmtNameMap[clientName]; ok {
+		delete(c.stmtRevMap, hash)
+	}
+	delete(c.stmtNameMap, clientName)
 }

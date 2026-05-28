@@ -59,6 +59,12 @@ type Target struct {
 	// allowed to complete until query_timeout, then force-closed.
 	draining atomic.Bool
 
+	// stmtCache is the target-level prepared statement registry. It maps a
+	// canonical query hash to the parsed/parameterized form and usage stats.
+	// All pools on this target share one cache — the same logical query sent
+	// against any (database, user) combination maps to a single entry.
+	stmtCache *StmtCache
+
 	// scramCh serialises pg_shadow queries through the target goroutine so that
 	// target.conn is never accessed concurrently from client goroutines.
 	scramCh chan scramRequest

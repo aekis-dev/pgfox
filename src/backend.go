@@ -27,6 +27,14 @@ type BackendConnection struct {
 	maxMessageSize int
 	parameters     map[string]string
 	mu             sync.Mutex
+
+	// deployedStmts tracks which prepared statement hashes have been successfully
+	// deployed (Parse sent and acknowledged) on this specific backend connection.
+	// No cleanup is needed when the connection is destroyed — new connections
+	// always start with an empty map. Written only while the connection is
+	// checked out (inUse=true), so no additional locking is needed beyond the
+	// existing inUse contract.
+	deployedStmts map[string]bool
 }
 
 // NewBackendConnection creates a new backend connection
@@ -42,6 +50,7 @@ func NewBackendConnection(conn net.Conn, dbName, targetName, username string, ma
 		lastUsedAt:     time.Now(),
 		maxMessageSize: maxMessageSize,
 		parameters:     make(map[string]string),
+		deployedStmts:  make(map[string]bool),
 	}
 }
 
@@ -295,4 +304,18 @@ func (b *BackendConnection) Release() {
 	} else {
 		b.Close()
 	}
+}
+
+// HasStmt returns true if the prepared statement identified by hash has been
+// successfully deployed (Parse acknowledged) on this connection.
+// Safe to call without holding mu — only called while the connection is
+// checked out (inUse=true), which is single-goroutine by contract.
+func (b *BackendConnection) HasStmt(hash string) bool {
+	return b.deployedStmts[hash]
+}
+
+// MarkStmt records that the prepared statement identified by hash has been
+// successfully deployed on this connection.
+func (b *BackendConnection) MarkStmt(hash string) {
+	b.deployedStmts[hash] = true
 }
