@@ -210,12 +210,78 @@ func extractIP(addr net.Addr) net.IP {
 	}
 }
 
+// Prepared statement hashes for the two privileged-connection queries.
+// These are deployed once on t.conn at startup and on every reconnect.
+// Binary format is used for all result columns — both queries return
+// text/varchar values which arrive as raw UTF-8 bytes in binary mode,
+// identical to text mode, so no additional decoding is needed.
+const (
+	scramStmtSQL  = "SELECT rolpassword FROM pg_authid WHERE rolname = $1 AND rolcanlogin = true"
+	scramStmtHash = "pgfox_scram" // fixed name — no hash needed, single-param
+
+	statsStmtSQL  = "SELECT current_setting('max_connections')::int, count(*)::int FROM pg_stat_activity"
+	statsStmtHash = "pgfox_stats" // fixed name — zero params
+)
+
+// deployPrivilegedStmts sends Parse for both privileged-connection prepared
+// statements and reads their ParseComplete responses. Called after every
+// successful (re)connection of t.conn so the statements are always ready.
+// Must only be called from the target goroutine.
+func (t *Target) deployPrivilegedStmts(logger *Logger) error {
+	stmts := []struct {
+		hash string
+		sql  string
+	}{
+		{scramStmtHash, scramStmtSQL},
+		{statsStmtHash, statsStmtSQL},
+	}
+
+	if err := t.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return fmt.Errorf("failed to set deadline: %w", err)
+	}
+	defer t.conn.conn.SetReadDeadline(time.Time{})
+
+	// Send all Parse messages then a single Sync — pipeline them in one shot.
+	for _, s := range stmts {
+		parseBody := BuildParseBody(s.hash, s.sql, nil)
+		if err := t.conn.WriteMessage('P', parseBody); err != nil {
+			return fmt.Errorf("failed to send Parse for %s: %w", s.hash, err)
+		}
+	}
+	if err := t.conn.WriteMessage('S', SyncBody); err != nil {
+		return fmt.Errorf("failed to send Sync: %w", err)
+	}
+
+	// Read responses: ParseComplete × 2, then ReadyForQuery.
+	deployed := 0
+	for {
+		msgType, body, err := t.conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("failed to read Parse response: %w", err)
+		}
+		switch msgType {
+		case '1': // ParseComplete
+			deployed++
+			t.conn.MarkStmt(stmts[deployed-1].hash)
+			logger.Debug("Privileged stmt deployed", "stmt", stmts[deployed-1].hash)
+		case 'Z': // ReadyForQuery
+			if deployed != len(stmts) {
+				return fmt.Errorf("expected %d ParseComplete, got %d", len(stmts), deployed)
+			}
+			return nil
+		case 'E':
+			return fmt.Errorf("Parse error for privileged stmt: %s", parseErrorMessage(body))
+		}
+	}
+}
+
 // run is the target manager goroutine. It:
 //  1. Opens and maintains the privileged connection (conn).
 //  2. Manages all pool connections: growth, shrink, recycling, health checks.
 //  3. Periodically queries pg_stat_activity to track real server capacity.
 //
-// fetchSCRAMVerifier queries pg_shadow for the SCRAM verifier of username.
+// fetchSCRAMVerifier queries pg_authid for the SCRAM verifier of username
+// using the extended protocol with binary result format.
 // Must only be called from the target goroutine — target.conn is not
 // safe to access from other goroutines concurrently.
 func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
@@ -223,35 +289,65 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 		return nil, fmt.Errorf("privileged connection not ready for target %s", t.Name)
 	}
 
-	query := fmt.Sprintf(
-		"SELECT rolpassword FROM pg_authid WHERE rolname = '%s'\x00",
-		escapeSingleQuote(username),
-	)
-
-	if err := t.conn.WriteMessage('Q', []byte(query)); err != nil {
-		return nil, fmt.Errorf("failed to send pg_shadow query: %w", err)
-	}
-
 	if err := t.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline: %w", err)
 	}
 	defer t.conn.conn.SetReadDeadline(time.Time{})
+
+	// Re-deploy if the statement was lost (e.g. after a reconnect that
+	// called deployPrivilegedStmts, this should never trigger, but guard
+	// defensively in case t.conn was replaced without going through
+	// openPrivilegedConn).
+	if !t.conn.HasStmt(scramStmtHash) {
+		parseBody := BuildParseBody(scramStmtHash, scramStmtSQL, nil)
+		if err := t.conn.WriteMessage('P', parseBody); err != nil {
+			return nil, fmt.Errorf("failed to send Parse for scram stmt: %w", err)
+		}
+	}
+
+	// Bind: $1 = username (text format), result column in binary.
+	bindBody := BuildBindBody(
+		"", // unnamed portal
+		scramStmtHash,
+		nil, // default text format for params
+		[]string{username},
+		[]int16{1}, // binary result
+	)
+	if err := t.conn.WriteMessage('B', bindBody); err != nil {
+		return nil, fmt.Errorf("failed to send Bind for scram stmt: %w", err)
+	}
+
+	execBody := BuildExecuteBody("", 0)
+	if err := t.conn.WriteMessage('E', execBody); err != nil {
+		return nil, fmt.Errorf("failed to send Execute for scram stmt: %w", err)
+	}
+
+	if err := t.conn.WriteMessage('S', SyncBody); err != nil {
+		return nil, fmt.Errorf("failed to send Sync: %w", err)
+	}
 
 	var rolpassword string
 
 	for {
 		msgType, body, err := t.conn.ReadMessage()
 		if err != nil {
-			return nil, fmt.Errorf("failed to read pg_shadow response: %w", err)
+			return nil, fmt.Errorf("failed to read pg_authid response: %w", err)
 		}
 
 		switch msgType {
-		case 'T': // RowDescription — skip
-		case 'D': // DataRow
+		case '1': // ParseComplete (only present on first call after redeploy)
+			t.conn.MarkStmt(scramStmtHash)
+		case '2': // BindComplete
+		case 'D': // DataRow — binary format
+			// Binary DataRow layout:
+			//   Int16  num_columns
+			//   for each column:
+			//     Int32  col_length  (-1 = NULL)
+			//     bytes  col_data
 			if len(body) < 2 {
 				continue
 			}
-			colCount := int(body[0])<<8 | int(body[1])
+			colCount := int(int16(body[0])<<8 | int16(body[1]))
 			if colCount < 1 {
 				continue
 			}
@@ -263,9 +359,11 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 				int32(body[pos+2])<<8 | int32(body[pos+3]))
 			pos += 4
 			if colLen < 0 {
-				return nil, fmt.Errorf("user %q not found in pg_authid", username)
+				// NULL — user exists but has no password set
+				return nil, fmt.Errorf("user %q has no password set in pg_authid", username)
 			}
 			if pos+colLen <= len(body) {
+				// Binary text/varchar is raw UTF-8 — identical to text mode.
 				rolpassword = string(body[pos : pos+colLen])
 			}
 		case 'C': // CommandComplete
@@ -275,7 +373,7 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 			}
 			return parseSCRAMVerifier(rolpassword)
 		case 'E':
-			return nil, fmt.Errorf("pg_shadow query error: %s", parseErrorMessage(body))
+			return nil, fmt.Errorf("pg_authid query error: %s", parseErrorMessage(body))
 		}
 	}
 }
@@ -358,6 +456,13 @@ func (t *Target) openPrivilegedConn(p *Server, logger *Logger) error {
 
 		for k, v := range conn.parameters {
 			t.params[k] = v
+		}
+
+		// Deploy both privileged prepared statements immediately so
+		// fetchSCRAMVerifier and updateServerStats can use extended protocol
+		// from the very first call.
+		if err := t.deployPrivilegedStmts(logger); err != nil {
+			logger.WithError(err).Warn("Failed to deploy privileged stmts, will retry on next use")
 		}
 
 		close(t.ready)
@@ -541,6 +646,9 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 			if conn, err := p.createCertBackendConnection(t, "postgres", p.config.Server.PgFoxRole, pgfoxCert); err == nil {
 				t.conn = conn
 				t.totalOpen++
+				if err := t.deployPrivilegedStmts(logger); err != nil {
+					logger.WithError(err).Warn("Failed to deploy privileged stmts after reconnect")
+				}
 				logger.Info("Privileged connection replaced")
 			} else {
 				logger.WithError(err).Warn("Failed to replace privileged connection")
@@ -591,16 +699,11 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 	}
 }
 
-// updateServerStats queries pg_stat_activity on the privileged connection to
-// get the real PostgreSQL server capacity regardless of non-pgfox clients.
+// updateServerStats queries pg_stat_activity on the privileged connection using
+// the extended protocol with binary result format to get real PostgreSQL server
+// capacity regardless of non-pgfox clients.
 func (t *Target) updateServerStats(p *Server, logger *Logger) {
 	if t.conn == nil {
-		return
-	}
-
-	query := "SELECT current_setting('max_connections')::int, count(*) FROM pg_stat_activity\x00"
-	if err := t.conn.WriteMessage('Q', []byte(query)); err != nil {
-		logger.WithError(err).Warn("Failed to send stats query")
 		return
 	}
 
@@ -608,6 +711,39 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 		return
 	}
 	defer t.conn.conn.SetReadDeadline(time.Time{})
+
+	// Re-deploy statement if needed (defensive guard, same as fetchSCRAMVerifier).
+	if !t.conn.HasStmt(statsStmtHash) {
+		parseBody := BuildParseBody(statsStmtHash, statsStmtSQL, nil)
+		if err := t.conn.WriteMessage('P', parseBody); err != nil {
+			logger.WithError(err).Warn("Failed to send Parse for stats stmt")
+			return
+		}
+	}
+
+	// Zero params, binary results for both integer columns.
+	bindBody := BuildBindBody(
+		"", // unnamed portal
+		statsStmtHash,
+		nil,        // no params
+		nil,        // no param values
+		[]int16{1}, // binary result for all columns
+	)
+	if err := t.conn.WriteMessage('B', bindBody); err != nil {
+		logger.WithError(err).Warn("Failed to send Bind for stats stmt")
+		return
+	}
+
+	execBody := BuildExecuteBody("", 0)
+	if err := t.conn.WriteMessage('E', execBody); err != nil {
+		logger.WithError(err).Warn("Failed to send Execute for stats stmt")
+		return
+	}
+
+	if err := t.conn.WriteMessage('S', SyncBody); err != nil {
+		logger.WithError(err).Warn("Failed to send Sync for stats stmt")
+		return
+	}
 
 	var maxConns, openConns int
 
@@ -618,34 +754,53 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 			return
 		}
 		switch msgType {
-		case 'T': // RowDescription — skip
-		case 'D': // DataRow
+		case '1': // ParseComplete (only on redeploy)
+			t.conn.MarkStmt(statsStmtHash)
+		case '2': // BindComplete
+		case 'D': // DataRow — binary format
+			// Two int4 columns in binary:
+			//   Int16  num_columns  (= 2)
+			//   Int32  col0_len     (= 4)
+			//   Int32  col0_val     (max_connections)
+			//   Int32  col1_len     (= 4)
+			//   Int32  col1_val     (count(*))
 			if len(body) < 2 {
 				continue
 			}
-			colCount := int(body[0])<<8 | int(body[1])
+			colCount := int(int16(body[0])<<8 | int16(body[1]))
 			if colCount < 2 {
 				continue
 			}
 			pos := 2
-			// col 0: max_connections
+			// col 0: max_connections (int4 → 4 bytes big-endian)
 			if pos+4 > len(body) {
 				continue
 			}
-			col0Len := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 | int32(body[pos+2])<<8 | int32(body[pos+3]))
+			col0Len := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
+				int32(body[pos+2])<<8 | int32(body[pos+3]))
 			pos += 4
-			if col0Len > 0 && pos+col0Len <= len(body) {
-				fmt.Sscanf(string(body[pos:pos+col0Len]), "%d", &maxConns)
+			if col0Len == 4 && pos+4 <= len(body) {
+				maxConns = int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
+					int32(body[pos+2])<<8 | int32(body[pos+3]))
+				pos += 4
+			} else {
 				pos += col0Len
 			}
-			// col 1: count(*)
+			// col 1: count(*) (int8 → 8 bytes, or int4 → 4 bytes depending on PG version)
 			if pos+4 > len(body) {
 				continue
 			}
-			col1Len := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 | int32(body[pos+2])<<8 | int32(body[pos+3]))
+			col1Len := int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
+				int32(body[pos+2])<<8 | int32(body[pos+3]))
 			pos += 4
-			if col1Len > 0 && pos+col1Len <= len(body) {
-				fmt.Sscanf(string(body[pos:pos+col1Len]), "%d", &openConns)
+			if col1Len == 4 && pos+4 <= len(body) {
+				openConns = int(int32(body[pos])<<24 | int32(body[pos+1])<<16 |
+					int32(body[pos+2])<<8 | int32(body[pos+3]))
+			} else if col1Len == 8 && pos+8 <= len(body) {
+				openConns = int(int64(body[pos])<<56 | int64(body[pos+1])<<48 |
+					int64(body[pos+2])<<40 | int64(body[pos+3])<<32 |
+					int64(body[pos+4])<<24 | int64(body[pos+5])<<16 |
+					int64(body[pos+6])<<8 | int64(body[pos+7]))
 			}
 		case 'C': // CommandComplete
 		case 'Z': // ReadyForQuery
