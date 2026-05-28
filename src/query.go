@@ -106,17 +106,15 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 			if result != nil {
 				// We can manage this statement in the cache.
 				pool := p.getPool(client.GetDatabase(), client.GetUser())
-				var targetStmtCache *StmtCache
 				if pool != nil {
-					targetStmtCache = pool.target.stmtCache
-					entry, isNew := targetStmtCache.GetOrRegister(
+					entry, isNew := pool.target.stmtCache.GetOrRegister(
 						result.Hash, result.CanonicalSQL, querySQL, len(result.Values))
 					if isNew {
 						logger.Debug("Registered prepared statement via extended protocol",
 							"hash", result.Hash,
 							"client_name", clientName)
 					}
-					_ = entry
+					entry.RecordExecution()
 				}
 
 				internalName := StmtName(result.Hash)
@@ -211,12 +209,9 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 		}
 	}
 
-	// --- Phase 3: ensure prepared statements are deployed on this backend ---
-	// For any Parse messages that were remapped, if this backend doesn't have
-	// the statement deployed yet, the rewritten Parse body will deploy it.
-	// (The backend will respond with ParseComplete '1', which forwardUntilReady
-	// will forward to the client as expected in extended protocol.)
-
+	// --- Phase 3: forward the rewritten pipeline ---
+	// Parse messages that were remapped to internal names will be deployed on
+	// this backend if not already present — the backend responds with ParseComplete.
 	// --- Phase 4: forward the rewritten pipeline ---
 	for _, m := range rewritten {
 		if err := backend.WriteMessage(m.msgType, m.body); err != nil {
@@ -270,20 +265,6 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 			return 0, sendErrorResponse(client, "ERROR", "08006", "connection failure")
 		}
 
-		// For ParseComplete, we need to figure out which statement was just
-		// deployed. We do this by checking which Parse message in the pipeline
-		// the backend is responding to — but since we process them in order and
-		// the backend responds in order, we track via backend.HasStmt as we go.
-		// The simpler approach: on ParseComplete, scan the backend's deployed
-		// stmts against the cache and mark any that are missing. We record
-		// ParseComplete by passing it through and letting the hash-tracking in
-		// the pipeline phase handle it. The backend.MarkStmt is called lazily
-		// from the next time HasStmt is checked for that hash — acceptable since
-		// the deploy tracking is for optimizing future connections, not correctness.
-		//
-		// For now: forward ParseComplete as-is; the backend will correctly deploy
-		// the statement regardless of whether we call MarkStmt here.
-
 		if err := client.WriteMessage(msgType, body); err != nil {
 			if isClientGone(err) {
 				return 0, err
@@ -305,8 +286,7 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 func (p *Server) executeQuery(client *ClientConnection, query string) error {
 	logger := client.Logger()
 
-	// Classify the query using the keyword detector — replaces the old
-	// strings.HasPrefix / containsPgNotify approach.
+	// Classify the query for special-case handling.
 	switch DetectSimpleQueryCommand(query) {
 	case SimpleQueryListen:
 		return p.handleListen(client, query)
