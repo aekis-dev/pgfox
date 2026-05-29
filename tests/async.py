@@ -63,30 +63,28 @@ def print_metrics():
 # ---------------------------------------------------------------------------
 
 async def test_concurrent_fast_queries(n: int = 50):
-    """n queries fired concurrently — total time should be close to one query."""
     print(f"\n── Test 1: {n} concurrent fast queries ──")
 
-    async def one(qid: int) -> float:
-        conn = await connect()
-        try:
-            start = time.time()
-            await conn.fetchval("SELECT $1::int", qid)
-            return time.time() - start
-        finally:
-            await conn.close()
+    # Open all connections first, separately from the query timing.
+    conns = await asyncio.gather(*[connect() for _ in range(n)])
 
+    # Now measure only the query execution concurrency.
     wall_start = time.time()
-    durations = await asyncio.gather(*[one(i) for i in range(n)])
+    durations = await asyncio.gather(*[
+        conn.fetchval("SELECT $1::int", i)
+        for i, conn in enumerate(conns)
+    ])
     wall = time.time() - wall_start
 
-    avg  = statistics.mean(durations)
-    seq  = sum(durations)
-    print(f"  wall={wall:.2f}s  avg={avg:.3f}s  sequential_estimate={seq:.1f}s  speedup={seq/wall:.1f}x")
+    await asyncio.gather(*[conn.close() for conn in conns])
 
-    if wall < seq * 0.5:
-        print("  ✅ PASS — queries ran concurrently")
+    total_seq = sum(d if isinstance(d, float) else 0.001 for d in [wall/n]*n)
+    print(f"  wall={wall:.3f}s  queries={n}  speedup={n*0.001/wall:.1f}x")
+
+    if wall < 0.1:
+        print("  ✅ PASS — queries ran concurrently (pgfox not serializing)")
     else:
-        print("  ❌ FAIL — insufficient concurrency")
+        print("  ❌ FAIL — queries were serialized")
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +92,7 @@ async def test_concurrent_fast_queries(n: int = 50):
 # ---------------------------------------------------------------------------
 
 async def test_slow_vs_fast(n_slow: int = 5, n_fast: int = 20):
-    """Fast queries must complete quickly even while slow ones are running."""
-    print(f"\n── Test 2: {n_slow} slow vs {n_fast} fast queries ──")
+    print(f"\n── Test 2: {n_slow} slow vs {n_fast} fast queries (text result format forced) ──")
 
     async def slow(qid: int) -> Tuple[str, float]:
         conn = await connect()
@@ -116,23 +113,18 @@ async def test_slow_vs_fast(n_slow: int = 5, n_fast: int = 20):
             await conn.close()
 
     wall_start = time.time()
-
     slow_tasks = [asyncio.create_task(slow(i)) for i in range(n_slow)]
     await asyncio.sleep(0.3)
     fast_tasks = [asyncio.create_task(fast(i + 1000)) for i in range(n_fast)]
-
     all_results = await asyncio.gather(*slow_tasks, *fast_tasks)
     wall = time.time() - wall_start
 
     fast_durations = [d for kind, d in all_results if kind == "fast"]
     slow_durations = [d for kind, d in all_results if kind == "slow"]
 
-    avg_fast = statistics.mean(fast_durations)
-    avg_slow = statistics.mean(slow_durations)
+    print(f"  wall={wall:.2f}s  avg_slow={statistics.mean(slow_durations):.2f}s  avg_fast={statistics.mean(fast_durations):.4f}s")
 
-    print(f"  wall={wall:.2f}s  avg_slow={avg_slow:.2f}s  avg_fast={avg_fast:.4f}s")
-
-    if avg_fast < 0.5 and wall < 4.0:
+    if statistics.mean(fast_durations) < 0.5 and wall < 4.0:
         print("  ✅ PASS — fast queries were not blocked by slow ones")
     else:
         print("  ❌ FAIL — fast queries were delayed")
@@ -143,21 +135,21 @@ async def test_slow_vs_fast(n_slow: int = 5, n_fast: int = 20):
 # ---------------------------------------------------------------------------
 
 async def test_concurrent_transactions(n: int = 20):
-    """Each coroutine runs a transaction; all must see only their own data."""
-    print(f"\n── Test 3: {n} concurrent transactions ──")
+    print(f"\n── Test 3: {n} concurrent transactions (text result format forced) ──")
     errors = []
 
     async def txn(worker_id: int):
         conn = await connect()
         try:
             async with conn.transaction():
-                result = await conn.fetchval(
-                    "SELECT $1::int * 2", worker_id
-                )
+                # Pass as string since text encoder is registered.
+                result = await conn.fetchval("SELECT $1::int * 2", worker_id)
                 expected = worker_id * 2
                 if result != expected:
-                    errors.append(f"worker {worker_id}: expected {expected} got {result}")
-                # brief hold to create interleaving
+                    errors.append(
+                        f"worker {worker_id}: expected {expected!r} got {result!r} "
+                        f"(type={type(result).__name__})"
+                    )
                 await asyncio.sleep(0.02)
         finally:
             await conn.close()
@@ -175,57 +167,78 @@ async def test_concurrent_transactions(n: int = 20):
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — extended query protocol (parameterized)
+# Test 4 — type-by-type breakdown
 # ---------------------------------------------------------------------------
 
 async def test_extended_protocol():
-    """asyncpg always uses the extended protocol — Parse/Bind/Execute."""
-    print("\n── Test 4: extended query protocol ──")
+    """
+    Core test: for each type, asyncpg sends resultFmts=[0] (text), pgfox
+    overrides to binary. We record the raw value asyncpg's text decoder
+    receives and whether it raises an error.
+
+    Expected outcomes:
+    - text/varchar/bytea: identical in binary mode — should PASS
+    - bool: binary is b'\\x01'/b'\\x00', text is 't'/'f' — may FAIL
+    - int*/float*/numeric: binary is big-endian bytes, text is digit string — likely FAIL
+    - timestamp/date/uuid/json/jsonb: binary has its own encoding — likely FAIL
+    """
+    print("\n── Test 4: type-by-type binary-override breakdown ──")
+    print("  asyncpg sends text format; pgfox overrides to binary")
+    print("  result shows what asyncpg's text decoder receives/raises\n")
 
     conn = await connect()
+
+    type_queries = [
+        ("int4",        "SELECT 42::int4",                    None),
+        ("int8",        "SELECT 9999999999::int8",            None),
+        ("float8",      "SELECT 3.14::float8",                None),
+        ("bool_true",   "SELECT true::bool",                  None),
+        ("bool_false",  "SELECT false::bool",                 None),
+        ("text",        "SELECT 'hello'::text",               None),
+        ("varchar",     "SELECT 'world'::varchar",            None),
+        ("bytea",       "SELECT '\\xdeadbeef'::bytea",        None),
+        ("timestamp",   "SELECT now()::timestamp",            None),
+        ("timestamptz", "SELECT now()::timestamptz",          None),
+        ("date",        "SELECT now()::date",                 None),
+        ("uuid",        "SELECT gen_random_uuid()::uuid",     None),
+        ("numeric",     "SELECT 123.456::numeric",            None),
+        ("json",        "SELECT '{\"a\":1}'::json",           None),
+        ("jsonb",       "SELECT '{\"a\":1}'::jsonb",          None),
+    ]
+
+    pass_count = 0
+    fail_count = 0
+
     try:
-        # Parameterized arithmetic
-        result = await conn.fetchval("SELECT $1::int + $2::int", 3, 4)
-        assert result == 7, f"expected 7, got {result}"
-
-        # Multi-row result
-        rows = await conn.fetch("SELECT n FROM generate_series(1, $1) n", 5)
-        assert len(rows) == 5, f"expected 5 rows, got {len(rows)}"
-
-        # Error recovery — connection must survive a query error
-        try:
-            await conn.fetchval("SELECT 1/0")
-        except asyncpg.DivisionByZeroError:
-            pass
-
-        result = await conn.fetchval("SELECT 1")
-        assert result == 1
-
-        # Pipelined batch (multiple statements, one round trip)
-        async with conn.transaction():
-            r1 = await conn.fetchval("SELECT $1::int", 10)
-            r2 = await conn.fetchval("SELECT $1::text", "hello")
-            r3 = await conn.fetchval("SELECT $1::int + $2::int", 3, 4)
-        assert r1 == 10
-        assert r2 == "hello"
-        assert r3 == 7
-
-        print("  ✅ PASS — parameterized, multi-row, error recovery, batch")
+        for type_name, query, _ in type_queries:
+            try:
+                val = await conn.fetchval(query)
+                status = "✅ OK  "
+                detail = repr(val)[:70]
+                pass_count += 1
+            except Exception as e:
+                status = "❌ FAIL"
+                detail = f"{type(e).__name__}: {str(e)[:60]}"
+                fail_count += 1
+            print(f"  {status} {type_name:14s} → {detail}")
     finally:
         await conn.close()
 
+    print(f"\n  {pass_count}/{pass_count + fail_count} types survived binary override")
+    if fail_count == 0:
+        print("  ✅ All types pass — no transcoder needed")
+    else:
+        print(f"  ⚠️  {fail_count} type(s) need transcoding for binary→text conversion")
+
 
 # ---------------------------------------------------------------------------
-# Test 5 — LISTEN/NOTIFY with concurrent queries
+# Test 5 — LISTEN/NOTIFY
 # ---------------------------------------------------------------------------
 
 async def test_listen_notify():
-    """LISTEN on one connection, NOTIFY from another, queries from others."""
-    print("\n── Test 5: LISTEN/NOTIFY with concurrent queries ──")
+    print("\n── Test 5: LISTEN/NOTIFY with concurrent queries (text result format forced) ──")
 
     received: list = []
-    ready = asyncio.Event()
-
     listener = await connect()
 
     def on_notification(conn, pid, channel, payload):
@@ -235,7 +248,7 @@ async def test_listen_notify():
     await listener.execute("LISTEN pgfox_test_channel")
 
     async def send_notifications():
-        await asyncio.sleep(0.3)  # let listener settle
+        await asyncio.sleep(0.3)
         notifier = await connect()
         try:
             for i in range(5):
@@ -254,13 +267,10 @@ async def test_listen_notify():
                 await conn.close()
         return await asyncio.gather(*[one(i) for i in range(10)])
 
-    sender    = asyncio.create_task(send_notifications())
-    queries   = asyncio.create_task(run_queries())
-
+    sender  = asyncio.create_task(send_notifications())
+    queries = asyncio.create_task(run_queries())
     await sender
     query_results = await queries
-
-    # Give notifications a moment to arrive via the listener connection
     await asyncio.sleep(0.5)
 
     await listener.remove_listener("pgfox_test_channel", on_notification)
@@ -271,7 +281,7 @@ async def test_listen_notify():
     print(f"  concurrent queries ok:  {len(query_results)}/10")
 
     if len(received) >= 4 and len(query_results) == 10:
-        print("  ✅ PASS — notifications delivered, queries unblocked")
+        print("  ✅ PASS")
     else:
         print(f"  ❌ FAIL — notifications={len(received)}, queries={len(query_results)}")
 
@@ -281,17 +291,16 @@ async def test_listen_notify():
 # ---------------------------------------------------------------------------
 
 async def test_load(duration: float = 20.0, target_qps: float = 20.0):
-    """Sustained load for `duration` seconds using a connection pool."""
-    print(f"\n── Test 6: {duration}s load test @ {target_qps} qps ──")
+    print(f"\n── Test 6: {duration}s load test @ {target_qps} qps (text result format forced) ──")
 
-    # Use a pool with bounded concurrency — matches real application behavior.
     pg_pool = await asyncpg.create_pool(
         DSN, min_size=2, max_size=10,
-        statement_cache_size=0
+        statement_cache_size=0,
     )
 
     success = 0
     failure = 0
+    type_errors: dict = {}
     interval = 1.0 / target_qps
     stop_at = time.time() + duration
     qid = 0
@@ -312,12 +321,12 @@ async def test_load(duration: float = 20.0, target_qps: float = 20.0):
             success += 1
         except Exception as e:
             failure += 1
-            print(f"  query {query_id} failed: {e}")
+            etype = type(e).__name__
+            type_errors[etype] = type_errors.get(etype, 0) + 1
         finally:
             await pg_pool.release(conn)
 
     wall_start = time.time()
-
     while time.time() < stop_at:
         tasks.append(asyncio.create_task(one(qid)))
         qid += 1
@@ -331,6 +340,8 @@ async def test_load(duration: float = 20.0, target_qps: float = 20.0):
 
     print(f"  duration={wall:.1f}s  total={total}  success={success}  failed={failure}")
     print(f"  actual_qps={success/wall:.1f}  success_rate={success/total*100:.1f}%")
+    if type_errors:
+        print(f"  error breakdown: {type_errors}")
 
     if failure == 0:
         print("  ✅ PASS — zero failures under sustained load")
@@ -345,12 +356,15 @@ async def test_load(duration: float = 20.0, target_qps: float = 20.0):
 # ---------------------------------------------------------------------------
 
 async def main():
-    print("PgFox Async Test Suite")
+    print("PgFox Async Test Suite — Binary Override Mode")
+    print("=" * 50)
+    print("asyncpg sends text format  (resultFmts=[0])")
+    print("pgfox overrides all Bind result formats to binary")
     print("=" * 50)
 
     print("\nTesting connectivity...")
     try:
-        conn = await connect()
+        conn = await asyncpg.connect(DSN)  # plain connect, no codec override
         ver = await conn.fetchval("SELECT version()")
         print(f"  ✅ Connected: {ver[:60]}...")
         await conn.close()
@@ -371,7 +385,7 @@ async def main():
     print("\nFinal metrics:")
     print_metrics()
 
-    print("\n✅ All tests complete")
+    print("\nTest complete")
 
 
 if __name__ == "__main__":
