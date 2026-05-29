@@ -61,8 +61,10 @@ func (pool *Pool) newConn(p *Server) (*BackendConnection, error) {
 }
 
 // borrowConn takes a connection from the pool, blocking until one is available,
-// the timeout fires, or ctx is cancelled. Refuses if the target is draining.
-// Never creates connections — that is the target goroutine's exclusive responsibility.
+// the timeout fires, or ctx is cancelled.
+//
+// A single timer is allocated for the entire wait to avoid the allocation-per-
+// iteration that time.After would cause under contention.
 func (pool *Pool) borrowConn(ctx context.Context) (*BackendConnection, error) {
 	if pool.target.draining.Load() {
 		return nil, fmt.Errorf("target %s is being removed, try again after reconnect",
@@ -73,30 +75,33 @@ func (pool *Pool) borrowConn(ctx context.Context) (*BackendConnection, error) {
 		timeout = 10 * time.Second
 	}
 
-	deadline := time.Now().Add(timeout)
+	// Fast path: connection available immediately.
+	select {
+	case conn := <-pool.backendPool:
+		conn.SetInUse(true)
+		return conn, nil
+	default:
+	}
+
+	// Slow path: wait with a single timer allocation.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	for {
 		select {
 		case conn := <-pool.backendPool:
 			conn.SetInUse(true)
 			return conn, nil
-		default:
-		}
-
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, fmt.Errorf("timed out waiting for connection for %s/%s",
-				pool.dbName, pool.username)
-		}
-
-		select {
-		case conn := <-pool.backendPool:
-			conn.SetInUse(true)
-			return conn, nil
 		case <-pool.target.connReady:
-			// A connection was returned somewhere on this target — retry.
-			continue
-		case <-time.After(remaining):
+			// A connection was returned somewhere on this target — retry fast path.
+			select {
+			case conn := <-pool.backendPool:
+				conn.SetInUse(true)
+				return conn, nil
+			default:
+				// Someone else grabbed it; keep waiting.
+			}
+		case <-timer.C:
 			return nil, fmt.Errorf("timed out waiting for connection for %s/%s",
 				pool.dbName, pool.username)
 		case <-ctx.Done():

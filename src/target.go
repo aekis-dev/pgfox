@@ -35,8 +35,15 @@ type Target struct {
 	params map[string]string // ParameterStatus values from conn startup
 
 	// --- Runtime: pools ---
-	pools   map[string]map[string]*Pool // database -> user -> pool
-	poolsMu sync.RWMutex
+	// pools maps "database\x00user" → *Pool. sync.Map is used because the
+	// map is read on every query but written only once per (database, user)
+	// pair — exactly the load profile sync.Map is optimised for.
+	pools sync.Map // key: dbUser string → *Pool
+
+	// cachedPools is a flat snapshot maintained exclusively by the target
+	// goroutine (growthCycle, healthCheck, drain). It avoids Range() overhead
+	// and the allocation of a new slice on every 50ms tick.
+	cachedPools []*Pool
 
 	// --- Runtime: connection budget ---
 	// totalOpen is the count of all open backend connections on this target
@@ -74,6 +81,15 @@ type Target struct {
 	returnCh chan *BackendConnection
 	closeCh  chan *BackendConnection
 
+	// poolRegistered receives newly created Pool pointers from getPool so the
+	// target goroutine can append them to cachedPools without a lock.
+	poolRegistered chan *Pool
+
+	// backendIndex maps processID (int32) → *BackendConnection for idle
+	// connections. Updated atomically when connections enter/leave backendPool.
+	// Allows O(1) cancel-request lookup without draining the channel.
+	backendIndex sync.Map // int32 → *BackendConnection
+
 	// connReady is signaled (non-blocking send) whenever a connection is
 	// returned to any pool, waking borrowConn waiters.
 	connReady chan struct{}
@@ -97,17 +113,35 @@ type scramReply struct {
 }
 
 // activeConnections returns the total number of connections currently checked
-// out across all pools on this target.
+// out across all pools on this target. Safe to call from any goroutine.
 func (t *Target) activeConnections() int {
-	t.poolsMu.RLock()
-	defer t.poolsMu.RUnlock()
 	total := 0
-	for _, dbMap := range t.pools {
-		for _, pool := range dbMap {
-			total += pool.activeConnections()
-		}
-	}
+	t.pools.Range(func(_, v any) bool {
+		total += v.(*Pool).activeConnections()
+		return true
+	})
 	return total
+}
+
+// poolKey builds the sync.Map key for a (dbName, user) pair.
+func poolKey(dbName, user string) string { return dbName + "\x00" + user }
+
+// lookupPool returns the Pool for (dbName, user), or nil if absent.
+func (t *Target) lookupPool(dbName, user string) *Pool {
+	v, ok := t.pools.Load(poolKey(dbName, user))
+	if !ok {
+		return nil
+	}
+	return v.(*Pool)
+}
+
+// storePool registers a new pool in the sync.Map and appends it to cachedPools.
+// cachedPools is used by the target goroutine for lock-free iteration; it must
+// only be written from that goroutine (or during pool creation while the
+// caller holds no pool lock, which is always the case in getPool).
+func (t *Target) storePool(pool *Pool) {
+	t.pools.Store(poolKey(pool.dbName, pool.username), pool)
+	t.cachedPools = append(t.cachedPools, pool)
 }
 
 // waitDrained blocks until all active connections on this target complete or
@@ -405,6 +439,11 @@ func (t *Target) run(p *Server) {
 			t.drain(p, logger)
 			return
 
+		case pool := <-t.poolRegistered:
+			// A new pool was created by getPool — append to cachedPools so
+			// growthCycle and healthCheck see it on the next tick.
+			t.cachedPools = append(t.cachedPools, pool)
+
 		case req := <-t.scramCh:
 			verifier, err := t.fetchSCRAMVerifier(req.username)
 			req.reply <- scramReply{verifier: verifier, err: err}
@@ -478,6 +517,7 @@ func (t *Target) handleReturn(p *Server, conn *BackendConnection, logger *Logger
 
 	if !conn.IsAlive() {
 		logger.Warn("Returned connection is dead, closing")
+		t.backendIndex.Delete(conn.GetProcessID())
 		conn.conn.Close()
 		t.totalOpen--
 		pool.removeFromAllConns(conn)
@@ -485,18 +525,18 @@ func (t *Target) handleReturn(p *Server, conn *BackendConnection, logger *Logger
 		return
 	}
 
-	conn.mu.Lock()
-	conn.inUse = false
-	conn.lastUsedAt = time.Now()
-	conn.client = nil
-	conn.mu.Unlock()
+	conn.SetInUse(false)
+	conn.SetClient(nil)
 
 	select {
 	case pool.backendPool <- conn:
+		// Index idle connection for O(1) cancel lookup.
+		t.backendIndex.Store(conn.GetProcessID(), conn)
 		t.signalConnReady()
 	default:
 		// backendPool full — shouldn't happen, close defensively.
 		logger.Warn("backendPool full on return, closing extra connection")
+		t.backendIndex.Delete(conn.GetProcessID())
 		conn.conn.Close()
 		t.totalOpen--
 		pool.removeFromAllConns(conn)
@@ -507,6 +547,7 @@ func (t *Target) handleReturn(p *Server, conn *BackendConnection, logger *Logger
 // connReady so waiting borrowers can react (e.g. trigger growth).
 func (t *Target) handleClose(p *Server, conn *BackendConnection, logger *Logger) {
 	pool := conn.pool
+	t.backendIndex.Delete(conn.GetProcessID())
 	conn.conn.Close()
 	t.totalOpen--
 	pool.removeFromAllConns(conn)
@@ -524,9 +565,8 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 	now := time.Now()
 	peakWindow := p.config.Server.PeakWindow
 
-	t.poolsMu.RLock()
+	// cachedPools is maintained exclusively by the target goroutine — no lock.
 	pools := t.allPools()
-	t.poolsMu.RUnlock()
 
 	serverAvailable := 0
 	if t.serverMaxConns > 0 {
@@ -659,9 +699,7 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 	idleTimeout := p.config.Server.IdleTimeout
 	cutoff := time.Now().Add(-idleTimeout)
 
-	t.poolsMu.RLock()
 	pools := t.allPools()
-	t.poolsMu.RUnlock()
 
 	for _, pool := range pools {
 		poolLen := len(pool.backendPool)
@@ -837,9 +875,7 @@ func (t *Target) drain(p *Server, logger *Logger) {
 	}
 
 drainPools:
-	t.poolsMu.RLock()
 	pools := t.allPools()
-	t.poolsMu.RUnlock()
 
 	for _, pool := range pools {
 		for {
@@ -924,14 +960,8 @@ func (t *Target) signalConnReady() {
 	}
 }
 
-// allPools returns a flat slice of all pools on this target.
-// Caller must hold poolsMu at least RLock.
+// allPools returns the target goroutine's cached pool slice.
+// Must only be called from the target goroutine — no lock needed.
 func (t *Target) allPools() []*Pool {
-	var pools []*Pool
-	for _, dbMap := range t.pools {
-		for _, pool := range dbMap {
-			pools = append(pools, pool)
-		}
-	}
-	return pools
+	return t.cachedPools
 }

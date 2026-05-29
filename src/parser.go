@@ -40,71 +40,86 @@ type ParameterizeResult struct {
 //   - Queries the parser cannot parse
 //
 // The caller must treat a nil result as "use simple query protocol as-is".
-func ParameterizeQuery(sql string) (*ParameterizeResult, error) {
+// ClassifyAndParameterize performs a single parse pass and returns both the
+// SimpleQueryCommand classification and the ParameterizeResult. This replaces
+// the previous two-pass pattern (DetectSimpleQueryCommand + ParameterizeQuery)
+// which parsed the SQL twice on every simple query.
+//
+// If the query is LISTEN/UNLISTEN/NOTIFY, result is always nil.
+// If the query is parameterizable DML, cmd is SimpleQueryOther and result is set.
+// If neither, both are SimpleQueryOther and nil respectively.
+func ClassifyAndParameterize(sql string) (SimpleQueryCommand, *ParameterizeResult) {
 	sql = strings.TrimSpace(sql)
 	if sql == "" {
-		return nil, nil
+		return SimpleQueryOther, nil
 	}
 
-	// Strip trailing semicolons — PostgreSQL accepts them but we don't need
-	// them and they complicate the scan.
 	trimmed := strings.TrimRight(sql, " \t\n\r;")
 
 	list, err := parser.Parse(trimmed)
-	if err != nil {
-		// Parse error — passthrough, not a pgfox error.
-		return nil, nil //nolint:nilerr
+	if err != nil || list == nil || len(list.Items) == 0 {
+		return SimpleQueryOther, nil
 	}
 
-	if list == nil || len(list.Items) == 0 {
-		return nil, nil
-	}
-
-	// Multi-statement — passthrough.
+	// Multi-statement: passthrough as-is.
 	if len(list.Items) > 1 {
-		return nil, nil
+		return SimpleQueryOther, nil
 	}
 
 	stmt := list.Items[0]
 
-	// Classify: only pure DML is parameterizable.
+	// Classify special commands first.
+	switch stmt.(type) {
+	case *nodes.ListenStmt:
+		return SimpleQueryListen, nil
+	case *nodes.UnlistenStmt:
+		return SimpleQueryUnlisten, nil
+	case *nodes.NotifyStmt:
+		return SimpleQueryNotify, nil
+	case *nodes.SelectStmt:
+		// Catch SELECT pg_notify(...) — check before attempting parameterization.
+		upper := strings.ToUpper(strings.ReplaceAll(trimmed, " ", ""))
+		if strings.Contains(upper, "PG_NOTIFY(") {
+			return SimpleQueryNotify, nil
+		}
+	}
+
+	// Attempt parameterization for DML.
 	if !isDMLStatement(stmt) {
-		return nil, nil
+		return SimpleQueryOther, nil
 	}
-
-	// If already parameterized, pass through.
 	if containsParam(stmt) {
-		return nil, nil
+		return SimpleQueryOther, nil
 	}
 
-	// Walk the AST to collect literal values in left-to-right source order.
 	var litValues []literalValue
 	collectLiterals(stmt, &litValues, false)
 
 	if len(litValues) == 0 {
-		// No literals — still cache as a prepared statement so the backend
-		// can reuse the parse plan.
 		h := sha256.Sum256([]byte(trimmed))
-		return &ParameterizeResult{
+		return SimpleQueryOther, &ParameterizeResult{
 			CanonicalSQL: trimmed,
 			Values:       nil,
 			Hash:         fmt.Sprintf("%x", h[:8]),
-		}, nil
+		}
 	}
 
-	// Rewrite the SQL text, scanning left-to-right for each literal token.
 	canonical, values, err := rewriteLiterals(trimmed, litValues)
 	if err != nil {
-		// Could not safely rewrite — passthrough.
-		return nil, nil //nolint:nilerr
+		return SimpleQueryOther, nil //nolint:nilerr
 	}
 
 	h := sha256.Sum256([]byte(canonical))
-	return &ParameterizeResult{
+	return SimpleQueryOther, &ParameterizeResult{
 		CanonicalSQL: canonical,
 		Values:       values,
 		Hash:         fmt.Sprintf("%x", h[:8]),
-	}, nil
+	}
+}
+
+func ParameterizeQuery(sql string) (*ParameterizeResult, error) {
+	_, result := ClassifyAndParameterize(sql)
+	return result, nil
 }
 
 // StmtName returns the backend prepared statement name for a hash.
@@ -120,40 +135,7 @@ func QueryHash(canonicalSQL string) string {
 	return fmt.Sprintf("%x", h[:8])
 }
 
-// DetectSimpleQueryCommand classifies a SQL query for pgfox's special-case
-// handling (LISTEN, UNLISTEN, NOTIFY, pg_notify). Uses the real parser so it
-// correctly handles leading whitespace, comments, and case variations.
-func DetectSimpleQueryCommand(sql string) SimpleQueryCommand {
-	trimmed := strings.TrimSpace(sql)
-	if trimmed == "" {
-		return SimpleQueryOther
-	}
-
-	list, err := parser.Parse(strings.TrimRight(trimmed, " \t\n\r;"))
-	if err != nil || list == nil || len(list.Items) == 0 {
-		return SimpleQueryOther
-	}
-
-	switch list.Items[0].(type) {
-	case *nodes.ListenStmt:
-		return SimpleQueryListen
-	case *nodes.UnlistenStmt:
-		return SimpleQueryUnlisten
-	case *nodes.NotifyStmt:
-		return SimpleQueryNotify
-	case *nodes.SelectStmt:
-		// Catch SELECT pg_notify(...).
-		upper := strings.ToUpper(strings.ReplaceAll(trimmed, " ", ""))
-		if strings.Contains(upper, "PG_NOTIFY(") {
-			return SimpleQueryNotify
-		}
-		return SimpleQueryOther
-	default:
-		return SimpleQueryOther
-	}
-}
-
-// SimpleQueryCommand is the classification result from DetectSimpleQueryCommand.
+// SimpleQueryCommand is the classification result from ClassifyAndParameterize.
 type SimpleQueryCommand int
 
 const (

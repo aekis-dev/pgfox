@@ -286,8 +286,11 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 func (p *Server) executeQuery(client *ClientConnection, query string) error {
 	logger := client.Logger()
 
-	// Classify the query for special-case handling.
-	switch DetectSimpleQueryCommand(query) {
+	// Single parse pass: classify special commands AND attempt parameterization
+	// simultaneously — avoids the previous double-parse overhead.
+	cmd, result := ClassifyAndParameterize(query)
+
+	switch cmd {
 	case SimpleQueryListen:
 		return p.handleListen(client, query)
 	case SimpleQueryUnlisten:
@@ -298,13 +301,10 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 
 	pinned := client.IsInTransaction()
 
-	// Try to parameterize the query and serve it through the prepared statement
-	// cache — but only when we're not already inside a transaction (where we
-	// must use the pinned backend regardless).
-	if !pinned {
-		if result, _ := ParameterizeQuery(query); result != nil {
-			return p.executeAsPrepared(client, query, result, logger)
-		}
+	// Serve through the prepared statement cache when not in a transaction
+	// and the query was successfully parameterized.
+	if !pinned && result != nil {
+		return p.executeAsPrepared(client, query, result, logger)
 	}
 
 	// --- Fallback: simple query protocol (original path) ---

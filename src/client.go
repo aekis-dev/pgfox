@@ -6,10 +6,24 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// ClientConnection represents a client connection
+// ClientConnection represents a client connection.
+//
+// Lock discipline — two separate locks instead of one coarse mutex:
+//
+//   - writeMu: serialises concurrent writers on the underlying TCP connection.
+//     Only WriteMessage acquires it. The listen-monitor goroutine is the one
+//     concurrent writer; every other write is from the owning client goroutine.
+//
+//   - sharedMu: protects the small set of fields that genuinely cross goroutine
+//     boundaries: backendConn, lastActivity, listenChannels/isListening.
+//
+// All other fields (authenticated, database, user, password, inTransaction,
+// namedStmts, connectedAt, stmtNameMap/stmtRevMap) are owned exclusively by
+// the single goroutine handling this client and need no locking.
 type ClientConnection struct {
 	conn           net.Conn
 	reader         *bufio.Reader
@@ -24,9 +38,11 @@ type ClientConnection struct {
 	isListening    bool
 	listenChannels map[Channel]bool
 	logger         *Logger
-	mu             sync.Mutex
+	writeMu        sync.Mutex
+	sharedMu       sync.Mutex
 	connectedAt    time.Time
 	lastActivity   time.Time
+
 	maxMessageSize int // maximum allowed PostgreSQL message body size in bytes
 
 	// stmtNameMap maps client-visible statement names to internal pgfox hashes.
@@ -34,6 +50,10 @@ type ClientConnection struct {
 	// the goroutine handling this client connection, so no lock is needed.
 	stmtNameMap map[string]string // clientName → hash
 	stmtRevMap  map[string]string // hash → clientName
+
+	// msgsSent is incremented atomically for metrics. Kept here for cache
+	// locality; the owning goroutine is the sole writer so atomic is enough.
+	msgsSent int64
 }
 
 // NewClientConnection creates a new client connection
@@ -60,115 +80,38 @@ func (c *ClientConnection) RemoteAddr() net.Addr {
 
 // Close closes the client connection
 func (c *ClientConnection) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.sharedMu.Lock()
+	bc := c.backendConn
+	c.backendConn = nil
+	c.sharedMu.Unlock()
 
-	// If we have a dedicated backend connection, close it
-	if c.backendConn != nil {
-		c.backendConn.Close()
-		c.backendConn = nil
+	if bc != nil {
+		bc.Close()
 	}
-
 	return c.conn.Close()
 }
 
-// IsAuthenticated returns whether the client is authenticated
-func (c *ClientConnection) IsAuthenticated() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.authenticated
-}
+func (c *ClientConnection) IsAuthenticated() bool   { return c.authenticated }
+func (c *ClientConnection) SetAuthenticated(v bool) { c.authenticated = v }
 
-// SetAuthenticated sets the authentication status
-func (c *ClientConnection) SetAuthenticated(auth bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.authenticated = auth
-	if auth {
-		c.lastActivity = time.Now()
-	}
-}
+func (c *ClientConnection) GetDatabase() string   { return c.database }
+func (c *ClientConnection) SetDatabase(v string)  { c.database = v }
+func (c *ClientConnection) GetUser() string       { return c.user }
+func (c *ClientConnection) SetUser(v string)      { c.user = v }
+func (c *ClientConnection) SetPassword(v string)  { c.password = v }
+func (c *ClientConnection) GetPassword() string   { return c.password }
+func (c *ClientConnection) IsInTransaction() bool { return c.inTransaction }
 
-// GetDatabase returns the requested database name
-func (c *ClientConnection) GetDatabase() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.database
-}
-
-// SetDatabase sets the requested database name
-func (c *ClientConnection) SetDatabase(database string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.database = database
-}
-
-// GetUser returns the client username
-func (c *ClientConnection) GetUser() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.user
-}
-
-// SetUser sets the client username
-func (c *ClientConnection) SetUser(user string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.user = user
-}
-
-// SetPassword stores the client's password (for backend authentication)
-func (c *ClientConnection) SetPassword(password string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.password = password
-}
-
-// GetPassword returns the client's password
-func (c *ClientConnection) GetPassword() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.password
-}
-
-// IsInTransaction returns whether the client is in a transaction
-func (c *ClientConnection) IsInTransaction() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.inTransaction
-}
-
-// AddNamedStatement increments the named prepared statement counter.
-func (c *ClientConnection) AddNamedStatement() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.namedStmts++
-}
-
-// RemoveNamedStatement decrements the named prepared statement counter.
+func (c *ClientConnection) AddNamedStatement() { c.namedStmts++ }
 func (c *ClientConnection) RemoveNamedStatement() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.namedStmts > 0 {
 		c.namedStmts--
 	}
 }
+func (c *ClientConnection) HasNamedStatements() bool { return c.namedStmts > 0 }
 
-// HasNamedStatements returns true if any named prepared statements are active.
-func (c *ClientConnection) HasNamedStatements() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.namedStmts > 0
-}
-
-// SetInTransaction sets the transaction state
 func (c *ClientConnection) SetInTransaction(inTx bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.inTransaction = inTx
-	c.lastActivity = time.Now()
-
-	// Log transaction state changes for debugging
 	if inTx {
 		c.logger.Debug("Client entered transaction")
 	} else {
@@ -176,81 +119,36 @@ func (c *ClientConnection) SetInTransaction(inTx bool) {
 	}
 }
 
-// IsListening returns whether the client is listening for notifications
-func (c *ClientConnection) IsListening() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.isListening
+func (c *ClientConnection) GetConnectedAt() time.Time { return c.connectedAt }
+
+// --- sharedMu-protected accessors ---
+
+func (c *ClientConnection) GetLastActivity() time.Time {
+	c.sharedMu.Lock()
+	t := c.lastActivity
+	c.sharedMu.Unlock()
+	return t
 }
 
-// SetListening sets the listening state
-func (c *ClientConnection) SetListening(listening bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.isListening = listening
-}
-
-// AddListenChannel adds a channel to the listen set
-func (c *ClientConnection) AddListenChannel(channel Channel) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.listenChannels[channel] = true
-	c.isListening = true
-	c.lastActivity = time.Now()
-}
-
-// RemoveListenChannel removes a channel from the listen set
-func (c *ClientConnection) RemoveListenChannel(channel Channel) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.listenChannels, channel)
-	if len(c.listenChannels) == 0 {
-		c.isListening = false
-	}
-}
-
-// GetListenChannels returns a copy of the listen channels
-func (c *ClientConnection) GetListenChannels() map[Channel]bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	channels := make(map[Channel]bool)
-	for ch, active := range c.listenChannels {
-		channels[ch] = active
-	}
-	return channels
-}
-
-// ClearListenChannels removes all listen channels
-func (c *ClientConnection) ClearListenChannels() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.listenChannels = make(map[Channel]bool)
-	c.isListening = false
-}
-
-// GetBackendConnection returns the associated backend connection
 func (c *ClientConnection) GetBackendConnection() *BackendConnection {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.backendConn
+	c.sharedMu.Lock()
+	bc := c.backendConn
+	c.sharedMu.Unlock()
+	return bc
 }
 
-// SetBackendConnection sets the associated backend connection
 func (c *ClientConnection) SetBackendConnection(conn *BackendConnection) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.sharedMu.Lock()
 	if c.backendConn != nil && c.backendConn != conn {
 		if conn != nil {
 			c.logger.Debug("Replacing existing backend connection")
 		} else {
 			c.logger.Debug("Clearing backend connection reference")
 		}
-		// Don't close the old connection here - let the pooler handle it
 	}
-
 	c.backendConn = conn
 	c.lastActivity = time.Now()
+	c.sharedMu.Unlock()
 
 	if conn != nil {
 		c.logger.Debug("Backend connection assigned",
@@ -259,56 +157,99 @@ func (c *ClientConnection) SetBackendConnection(conn *BackendConnection) {
 	}
 }
 
-// ShouldKeepBackendConnection returns true if the backend connection should be kept
 func (c *ClientConnection) ShouldKeepBackendConnection() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Keep connection only if in transaction — listening is managed by Listen monitors
-	return c.inTransaction
+	return c.inTransaction // single-goroutine field, no lock needed
 }
 
-// WriteMessage writes a message to the client
-func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// --- Listen channel accessors (sharedMu) ---
 
-	// Update activity timestamp
+func (c *ClientConnection) IsListening() bool {
+	c.sharedMu.Lock()
+	v := c.isListening
+	c.sharedMu.Unlock()
+	return v
+}
+
+func (c *ClientConnection) SetListening(v bool) {
+	c.sharedMu.Lock()
+	c.isListening = v
+	c.sharedMu.Unlock()
+}
+
+func (c *ClientConnection) AddListenChannel(ch Channel) {
+	c.sharedMu.Lock()
+	c.listenChannels[ch] = true
+	c.isListening = true
 	c.lastActivity = time.Now()
+	c.sharedMu.Unlock()
+}
 
-	// Validate message parameters
+func (c *ClientConnection) RemoveListenChannel(ch Channel) {
+	c.sharedMu.Lock()
+	delete(c.listenChannels, ch)
+	if len(c.listenChannels) == 0 {
+		c.isListening = false
+	}
+	c.sharedMu.Unlock()
+}
+
+func (c *ClientConnection) GetListenChannels() map[Channel]bool {
+	c.sharedMu.Lock()
+	out := make(map[Channel]bool, len(c.listenChannels))
+	for ch, active := range c.listenChannels {
+		out[ch] = active
+	}
+	c.sharedMu.Unlock()
+	return out
+}
+
+func (c *ClientConnection) ClearListenChannels() {
+	c.sharedMu.Lock()
+	c.listenChannels = make(map[Channel]bool)
+	c.isListening = false
+	c.sharedMu.Unlock()
+}
+
+// --- I/O ---
+
+// WriteMessage writes a PostgreSQL protocol message to the client.
+// writeMu serialises concurrent callers (owning goroutine + listen fan-out).
+func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
 	if len(body) > c.maxMessageSize {
 		return fmt.Errorf("message body too large: %d bytes", len(body))
 	}
 
-	// Write message type
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	if err := c.writer.WriteByte(msgType); err != nil {
 		return fmt.Errorf("failed to write message type %c to client: %w", msgType, err)
 	}
-
-	// Write message length (including length field itself)
 	length := uint32(len(body) + 4)
 	if err := writeUint32(c.writer, length); err != nil {
 		return fmt.Errorf("failed to write message length %d to client: %w", length, err)
 	}
-
-	// Write message body
 	if len(body) > 0 {
 		if _, err := c.writer.Write(body); err != nil {
 			return fmt.Errorf("failed to write message body (%d bytes) to client: %w", len(body), err)
 		}
 	}
-
 	if err := c.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush message type=%c len=%d to client: %w", msgType, length, err)
 	}
 
+	atomic.AddInt64(&c.msgsSent, 1)
+
+	c.sharedMu.Lock()
+	c.lastActivity = time.Now()
+	c.sharedMu.Unlock()
+
 	return nil
 }
 
-// Enhanced ReadMessage for client connections
+// ReadMessage reads a PostgreSQL protocol message from the client.
+// Only the owning goroutine calls this — no locking needed.
 func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
-	// Read message type
 	msgType, err := c.reader.ReadByte()
 	if err != nil {
 		if err == io.EOF {
@@ -317,22 +258,17 @@ func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("failed to read message type from client: %w", err)
 	}
 
-	// Read message length
 	length, err := readUint32(c.reader)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to read message length after type %c from client: %w", msgType, err)
 	}
-
-	// Validate message length
 	if length < 4 {
 		return 0, nil, fmt.Errorf("invalid message length %d for type %c from client (must be >= 4)", length, msgType)
 	}
-
 	if length > uint32(c.maxMessageSize) {
 		return 0, nil, fmt.Errorf("message length %d exceeds max_message_size %d for type %c from client", length, c.maxMessageSize, msgType)
 	}
 
-	// Read message body (length includes the length field itself)
 	bodyLength := int(length - 4)
 	body := make([]byte, bodyLength)
 	if bodyLength > 0 {
@@ -341,32 +277,17 @@ func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
 		}
 	}
 
-	// Update activity timestamp
-	c.mu.Lock()
+	c.sharedMu.Lock()
 	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.sharedMu.Unlock()
 
 	return msgType, body, nil
 }
 
-// GetConnectedAt returns when the client connected
-func (c *ClientConnection) GetConnectedAt() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connectedAt
-}
+// Logger returns the client's logger.
+func (c *ClientConnection) Logger() *Logger { return c.logger }
 
-// GetLastActivity returns the last activity time
-func (c *ClientConnection) GetLastActivity() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastActivity
-}
-
-// Logger returns the client's logger
-func (c *ClientConnection) Logger() *Logger {
-	return c.logger
-}
+// --- Prepared statement name mapping (single-goroutine, no lock) ---
 
 // --- Prepared statement name mapping ---
 // These methods are NOT guarded by c.mu because they are only ever called

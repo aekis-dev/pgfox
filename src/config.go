@@ -198,11 +198,11 @@ func LoadConfig(configPath string) (*Config, error) {
 			}
 		}
 		// Initialize runtime fields.
-		t.pools = make(map[string]map[string]*Pool)
 		t.ready = make(chan struct{})
 		t.params = make(map[string]string)
 		t.returnCh = make(chan *BackendConnection, t.MaxConnections)
 		t.closeCh = make(chan *BackendConnection, t.MaxConnections)
+		t.poolRegistered = make(chan *Pool, 64)
 		t.connReady = make(chan struct{}, 1)
 		t.scramCh = make(chan scramRequest)
 		t.stmtCache = NewStmtCache()

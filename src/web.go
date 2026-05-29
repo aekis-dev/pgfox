@@ -123,24 +123,23 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(mc.idleConnectionsClosed, prometheus.CounterValue, float64(stats.IdleConnectionsClosed))
 
 	for _, target := range mc.pooler.targets {
-		target.poolsMu.RLock()
-		for dbName, dbMap := range target.pools {
-			for userName, pool := range dbMap {
-				labels := []string{target.Name, dbName, userName}
+		// pools is now a sync.Map; Range is the safe iteration API.
+		target.pools.Range(func(_, v any) bool {
+			pool := v.(*Pool)
+			labels := []string{target.Name, pool.dbName, pool.username}
 
-				ch <- prometheus.MustNewConstMetric(mc.poolConnectionsTotal, prometheus.GaugeValue,
-					float64(pool.totalConnections()), labels...)
-				ch <- prometheus.MustNewConstMetric(mc.poolConnectionsActive, prometheus.GaugeValue,
-					float64(pool.activeConnections()), labels...)
-				ch <- prometheus.MustNewConstMetric(mc.poolConnectionsIdle, prometheus.GaugeValue,
-					float64(pool.idleConnections()), labels...)
-				ch <- prometheus.MustNewConstMetric(mc.poolQueriesTotal, prometheus.CounterValue,
-					float64(pool.queriesExecuted()), labels...)
-				ch <- prometheus.MustNewConstMetric(mc.poolErrorsTotal, prometheus.CounterValue,
-					float64(pool.errorCount()), labels...)
-			}
-		}
-		target.poolsMu.RUnlock()
+			ch <- prometheus.MustNewConstMetric(mc.poolConnectionsTotal, prometheus.GaugeValue,
+				float64(pool.totalConnections()), labels...)
+			ch <- prometheus.MustNewConstMetric(mc.poolConnectionsActive, prometheus.GaugeValue,
+				float64(pool.activeConnections()), labels...)
+			ch <- prometheus.MustNewConstMetric(mc.poolConnectionsIdle, prometheus.GaugeValue,
+				float64(pool.idleConnections()), labels...)
+			ch <- prometheus.MustNewConstMetric(mc.poolQueriesTotal, prometheus.CounterValue,
+				float64(pool.queriesExecuted()), labels...)
+			ch <- prometheus.MustNewConstMetric(mc.poolErrorsTotal, prometheus.CounterValue,
+				float64(pool.errorCount()), labels...)
+			return true
+		})
 	}
 }
 

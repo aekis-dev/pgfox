@@ -31,8 +31,12 @@ type Server struct {
 	listenerMu sync.RWMutex // protects listener during live address changes
 	targets    []*Target
 
-	clients     map[net.Conn]*ClientConnection
-	clientsMu   sync.RWMutex
+	// clients maps net.Conn → *ClientConnection. sync.Map is used because
+	// writes (connect/disconnect) are rare compared to reads (cancel lookup,
+	// shutdown), and high connection churn no longer serialises through a
+	// single RWMutex.
+	clients sync.Map // net.Conn → *ClientConnection
+
 	listeners   map[Channel]*Listen
 	listenersMu sync.RWMutex
 
@@ -54,7 +58,6 @@ func NewServer(config Config, logger *Logger) (*Server, error) {
 		config:    config,
 		listener:  listener,
 		targets:   config.Targets,
-		clients:   make(map[net.Conn]*ClientConnection),
 		listeners: make(map[Channel]*Listen),
 		logger:    logger,
 	}, nil
@@ -154,11 +157,10 @@ func (p *Server) shutdown() error {
 	p.cancel()
 	p.shutdownListeners()
 
-	p.clientsMu.Lock()
-	for conn := range p.clients {
-		conn.Close()
-	}
-	p.clientsMu.Unlock()
+	p.clients.Range(func(conn, _ any) bool {
+		conn.(net.Conn).Close()
+		return true
+	})
 
 	// Cancel all target goroutines — each drains and closes its own connections.
 	for _, target := range p.targets {
@@ -182,14 +184,10 @@ func (p *Server) handleClient(conn net.Conn) {
 	clientLogger := p.logger.WithClient(conn.RemoteAddr().String())
 	client := NewClientConnection(conn, clientLogger, p.config.Server.MaxMessageSize)
 
-	p.clientsMu.Lock()
-	p.clients[conn] = client
-	p.clientsMu.Unlock()
+	p.clients.Store(conn, client)
 
 	defer func() {
-		p.clientsMu.Lock()
-		delete(p.clients, conn)
-		p.clientsMu.Unlock()
+		p.clients.Delete(conn)
 
 		duration := time.Since(client.GetConnectedAt())
 		clientLogger.Info("Client disconnected",
@@ -240,8 +238,11 @@ func (p *Server) handleClient(conn net.Conn) {
 // getPool returns the existing Pool for (dbName, user), or creates a new one
 // under the highest-priority target that serves dbName. Returns nil if no
 // target serves the database.
+//
+// The hot path (pool already exists) is a single sync.Map.Load per target —
+// no mutex, no allocation.
 func (p *Server) getPool(dbName, user string) *Pool {
-	// Fast path: read-only lookup across all targets.
+	// Fast path: pool already exists in the first matching target.
 	for _, target := range p.targets {
 		if target.draining.Load() {
 			continue
@@ -249,17 +250,12 @@ func (p *Server) getPool(dbName, user string) *Pool {
 		if !p.targetServesDatabase(target, dbName) {
 			continue
 		}
-		target.poolsMu.RLock()
-		if dbMap, ok := target.pools[dbName]; ok {
-			if pool, ok := dbMap[user]; ok {
-				target.poolsMu.RUnlock()
-				return pool
-			}
+		if pool := target.lookupPool(dbName, user); pool != nil {
+			return pool
 		}
-		target.poolsMu.RUnlock()
 	}
 
-	// Not found — create under the first matching non-draining target.
+	// Slow path: select a target and create the pool.
 	var selectedTarget *Target
 	for _, t := range p.targets {
 		if t.draining.Load() {
@@ -274,20 +270,8 @@ func (p *Server) getPool(dbName, user string) *Pool {
 		return nil
 	}
 
-	selectedTarget.poolsMu.Lock()
-	defer selectedTarget.poolsMu.Unlock()
-
-	// Re-check under write lock.
-	if dbMap, ok := selectedTarget.pools[dbName]; ok {
-		if pool, ok := dbMap[user]; ok {
-			return pool
-		}
-	}
-
-	if selectedTarget.pools[dbName] == nil {
-		selectedTarget.pools[dbName] = make(map[string]*Pool)
-	}
-
+	// LoadOrStore ensures exactly one Pool is created even under concurrent
+	// first-access for the same (dbName, user) pair.
 	pool := &Pool{
 		target:      selectedTarget,
 		dbName:      dbName,
@@ -295,10 +279,22 @@ func (p *Server) getPool(dbName, user string) *Pool {
 		backendPool: make(chan *BackendConnection, selectedTarget.MaxConnections),
 		allConns:    make([]*BackendConnection, 0, selectedTarget.MaxConnections),
 	}
+	actual, loaded := selectedTarget.pools.LoadOrStore(poolKey(dbName, user), pool)
+	if loaded {
+		// Another goroutine created it first — discard ours.
+		return actual.(*Pool)
+	}
+	// We stored the new pool. Register it in cachedPools via a non-blocking
+	// send to the target goroutine so it can append to cachedPools safely.
+	select {
+	case selectedTarget.poolRegistered <- pool:
+	default:
+		// Channel full is benign — the target goroutine will pick it up on
+		// the next drain. cachedPools is only used for the growth/health ticks
+		// which run every 50ms/30s, so a brief delay is harmless.
+	}
 
-	selectedTarget.pools[dbName][user] = pool
 	atomic.AddInt64(&p.stats.TotalPools, 1)
-
 	return pool
 }
 
@@ -499,11 +495,12 @@ func (p *Server) upgradeToTLS(client *ClientConnection) error {
 
 	p.logger.Debug("TLS connection established", "client", client.RemoteAddr())
 
-	client.mu.Lock()
+	// writeMu guards conn/reader/writer, which WriteMessage also holds.
+	client.writeMu.Lock()
 	client.conn = tlsConn
 	client.reader = bufio.NewReader(tlsConn)
 	client.writer = bufio.NewWriter(tlsConn)
-	client.mu.Unlock()
+	client.writeMu.Unlock()
 
 	return nil
 }
@@ -522,44 +519,39 @@ func isClientGone(err error) bool {
 }
 
 // findBackendByKey finds a backend connection matching processID and secretKey.
-// Used to route cancel requests. Searches idle pool connections and active
-// client-pinned connections.
+// Used to route cancel requests.
+//
+// Active (pinned) connections are found via the clients sync.Map.
+// Idle connections are found via the per-target backendIndex sync.Map, which
+// is updated atomically when connections enter/leave the idle pool.
 func (p *Server) findBackendByKey(processID, secretKey int32) (*Target, *BackendConnection) {
-	for _, target := range p.targets {
-		target.poolsMu.RLock()
-		pools := target.allPools()
-		target.poolsMu.RUnlock()
+	// Search active client-pinned connections first (most common for cancel).
+	var foundTarget *Target
+	var foundConn *BackendConnection
 
-		for _, pool := range pools {
-			poolLen := len(pool.backendPool)
-			for i := 0; i < poolLen; i++ {
-				select {
-				case conn := <-pool.backendPool:
-					match := conn.GetProcessID() == processID && conn.GetSecretKey() == secretKey
-					select {
-					case pool.backendPool <- conn:
-					default:
-						conn.conn.Close()
-						pool.removeFromAllConns(conn)
-					}
-					if match {
-						return target, conn
-					}
-				default:
-				}
-			}
-		}
-	}
-
-	p.clientsMu.RLock()
-	defer p.clientsMu.RUnlock()
-
-	for _, client := range p.clients {
+	p.clients.Range(func(_, v any) bool {
+		client := v.(*ClientConnection)
 		backend := client.GetBackendConnection()
 		if backend != nil &&
 			backend.GetProcessID() == processID &&
 			backend.GetSecretKey() == secretKey {
-			return backend.pool.target, backend
+			foundTarget = backend.pool.target
+			foundConn = backend
+			return false // stop iteration
+		}
+		return true
+	})
+	if foundConn != nil {
+		return foundTarget, foundConn
+	}
+
+	// Search idle connections via per-target index.
+	for _, target := range p.targets {
+		if v, ok := target.backendIndex.Load(processID); ok {
+			conn := v.(*BackendConnection)
+			if conn.GetSecretKey() == secretKey {
+				return target, conn
+			}
 		}
 	}
 

@@ -6,38 +6,58 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// BackendConnection represents a connection to PostgreSQL backend
+// BackendConnection represents a connection to a PostgreSQL backend.
+//
+// Lock discipline:
+//
+//   - No lock on WriteMessage / ReadMessage. A BackendConnection is owned by
+//     exactly one goroutine while inUse=true (the client handler). The listen
+//     monitor owns its dedicated backend exclusively. There is never concurrent
+//     I/O on a single BackendConnection.
+//
+//   - sharedMu protects only the fields read by goroutines other than the
+//     current owner: inUse, lastUsedAt, client. processID and secretKey are
+//     written once at startup and then read-only — they use atomic int32 to
+//     avoid locking on the cancel-request scan path.
+//
+//   - deployedStmts, parameters are single-owner and need no lock.
 type BackendConnection struct {
-	conn           net.Conn
-	reader         *bufio.Reader
-	writer         *bufio.Writer
-	dbName         string
-	username       string
-	targetName     string
-	pool           *Pool // pool that owns this connection
-	inUse          bool
-	createdAt      time.Time
-	lastUsedAt     time.Time
-	processID      int32
-	secretKey      int32
-	client         *ClientConnection
+	conn       net.Conn
+	reader     *bufio.Reader
+	writer     *bufio.Writer
+	dbName     string
+	username   string
+	targetName string
+	pool       *Pool
+	createdAt  time.Time
+
+	// sharedMu protects inUse, lastUsedAt, client — the fields that cross
+	// the ownership boundary (target goroutine ↔ client goroutine).
+	sharedMu   sync.Mutex
+	inUse      bool
+	lastUsedAt time.Time
+	client     *ClientConnection
+
+	// processID and secretKey are written once during startup and read from
+	// multiple goroutines (cancel scan). Atomic removes the need for sharedMu
+	// on the hot cancel-lookup path.
+	processID int32 // accessed via atomic
+	secretKey int32 // accessed via atomic
+
 	maxMessageSize int
 	parameters     map[string]string
-	mu             sync.Mutex
 
-	// deployedStmts tracks which prepared statement hashes have been successfully
-	// deployed (Parse sent and acknowledged) on this specific backend connection.
-	// No cleanup is needed when the connection is destroyed — new connections
-	// always start with an empty map. Written only while the connection is
-	// checked out (inUse=true), so no additional locking is needed beyond the
-	// existing inUse contract.
+	// deployedStmts tracks which prepared statement hashes have been
+	// successfully deployed (Parse acknowledged) on this specific connection.
+	// Single-owner while inUse; no lock needed.
 	deployedStmts map[string]bool
 }
 
-// NewBackendConnection creates a new backend connection
+// NewBackendConnection creates a new backend connection.
 func NewBackendConnection(conn net.Conn, dbName, targetName, username string, maxMessageSize int) *BackendConnection {
 	return &BackendConnection{
 		conn:           conn,
@@ -54,150 +74,122 @@ func NewBackendConnection(conn net.Conn, dbName, targetName, username string, ma
 	}
 }
 
-// Close closes the backend connection
+// Close closes the backend connection.
 func (b *BackendConnection) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if b.conn != nil {
 		addr := b.conn.RemoteAddr()
-		err := b.conn.Close()
-		if err != nil {
-			// Log with context about which connection closed
+		if err := b.conn.Close(); err != nil {
 			return fmt.Errorf("failed to close backend %v: %w", addr, err)
 		}
-		// Explicitly log successful close
-		return nil
 	}
 	return nil
 }
 
-// IsInUse returns whether the connection is currently in use
+// --- sharedMu-protected accessors ---
+
 func (b *BackendConnection) IsInUse() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.inUse
+	b.sharedMu.Lock()
+	v := b.inUse
+	b.sharedMu.Unlock()
+	return v
 }
 
-// SetInUse sets the in-use status
 func (b *BackendConnection) SetInUse(inUse bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.sharedMu.Lock()
 	b.inUse = inUse
 	if !inUse {
-		// Update last used time when released
 		b.lastUsedAt = time.Now()
 	}
+	b.sharedMu.Unlock()
 }
 
-// GetDatabase returns the database name
-func (b *BackendConnection) GetDatabase() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.dbName
-}
-
-// GetTarget returns the target name
-func (b *BackendConnection) GetTarget() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.targetName
-}
-
-// CreatedAt returns when the connection was created
-func (b *BackendConnection) CreatedAt() time.Time {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.createdAt
-}
-
-// LastUsedAt returns when the connection was last used
 func (b *BackendConnection) LastUsedAt() time.Time {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.lastUsedAt
+	b.sharedMu.Lock()
+	t := b.lastUsedAt
+	b.sharedMu.Unlock()
+	return t
 }
 
-// GetProcessID returns the backend process ID
-func (b *BackendConnection) GetProcessID() int32 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.processID
-}
-
-// SetProcessID sets the backend process ID
-func (b *BackendConnection) SetProcessID(processID int32) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.processID = processID
-}
-
-// GetSecretKey returns the backend secret key
-func (b *BackendConnection) GetSecretKey() int32 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.secretKey
-}
-
-// SetSecretKey sets the backend secret key
-func (b *BackendConnection) SetSecretKey(secretKey int32) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.secretKey = secretKey
-}
-
-// GetClient returns the associated client connection
 func (b *BackendConnection) GetClient() *ClientConnection {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.client
+	b.sharedMu.Lock()
+	c := b.client
+	b.sharedMu.Unlock()
+	return c
 }
 
-// SetClient sets the associated client connection
-func (b *BackendConnection) SetClient(client *ClientConnection) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.client = client
+func (b *BackendConnection) SetClient(c *ClientConnection) {
+	b.sharedMu.Lock()
+	b.client = c
+	b.sharedMu.Unlock()
 }
 
-// WriteMessage writes a message to the backend
+// --- Atomic accessors (processID / secretKey) ---
+
+func (b *BackendConnection) GetProcessID() int32 {
+	return atomic.LoadInt32(&b.processID)
+}
+
+func (b *BackendConnection) SetProcessID(v int32) {
+	atomic.StoreInt32(&b.processID, v)
+}
+
+func (b *BackendConnection) GetSecretKey() int32 {
+	return atomic.LoadInt32(&b.secretKey)
+}
+
+func (b *BackendConnection) SetSecretKey(v int32) {
+	atomic.StoreInt32(&b.secretKey, v)
+}
+
+// --- Lock-free accessors (immutable after construction) ---
+
+func (b *BackendConnection) GetDatabase() string  { return b.dbName }
+func (b *BackendConnection) GetTarget() string    { return b.targetName }
+func (b *BackendConnection) CreatedAt() time.Time { return b.createdAt }
+
+func (b *BackendConnection) RemoteAddr() net.Addr {
+	if b.conn != nil {
+		return b.conn.RemoteAddr()
+	}
+	return nil
+}
+
+func (b *BackendConnection) LocalAddr() net.Addr {
+	if b.conn != nil {
+		return b.conn.LocalAddr()
+	}
+	return nil
+}
+
+// --- I/O (no lock — single owner while inUse) ---
+
+// WriteMessage writes a message to the backend.
+// Must only be called by the goroutine that currently owns this connection.
 func (b *BackendConnection) WriteMessage(msgType byte, body []byte) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Validate message parameters
 	if len(body) > b.maxMessageSize {
 		return fmt.Errorf("message body %d bytes exceeds max_message_size %d", len(body), b.maxMessageSize)
 	}
-
-	// Write message type
 	if err := b.writer.WriteByte(msgType); err != nil {
 		return fmt.Errorf("failed to write message type %c: %w", msgType, err)
 	}
-
-	// Write message length (including length field itself)
 	length := uint32(len(body) + 4)
 	if err := writeUint32(b.writer, length); err != nil {
 		return fmt.Errorf("failed to write message length %d: %w", length, err)
 	}
-
-	// Write message body
 	if len(body) > 0 {
 		if _, err := b.writer.Write(body); err != nil {
 			return fmt.Errorf("failed to write message body (%d bytes): %w", len(body), err)
 		}
 	}
-
 	if err := b.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush message type=%c len=%d: %w", msgType, length, err)
 	}
-
 	return nil
 }
 
-// ReadMessage reads a message from the backend
+// ReadMessage reads a message from the backend.
+// Must only be called by the goroutine that currently owns this connection.
 func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
-	// Read message type
 	msgType, err := b.reader.ReadByte()
 	if err != nil {
 		if err == io.EOF {
@@ -205,23 +197,16 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 		}
 		return 0, nil, fmt.Errorf("failed to read message type: %w", err)
 	}
-
-	// Read message length
 	length, err := readUint32(b.reader)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to read message length after type %c: %w", msgType, err)
 	}
-
-	// Validate message length
 	if length < 4 {
 		return 0, nil, fmt.Errorf("invalid message length %d for type %c (must be >= 4)", length, msgType)
 	}
-
 	if length > uint32(b.maxMessageSize) {
 		return 0, nil, fmt.Errorf("message length %d exceeds max_message_size %d for type %c", length, b.maxMessageSize, msgType)
 	}
-
-	// Read message body (length includes the length field itself)
 	bodyLength := int(length - 4)
 	body := make([]byte, bodyLength)
 	if bodyLength > 0 {
@@ -229,61 +214,27 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 			return 0, nil, fmt.Errorf("failed to read message body (%d bytes) for type %c: %w", bodyLength, msgType, err)
 		}
 	}
-
 	return msgType, body, nil
 }
 
-// RemoteAddr returns the backend's remote address
-func (b *BackendConnection) RemoteAddr() net.Addr {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.conn != nil {
-		return b.conn.RemoteAddr()
-	}
-	return nil
-}
-
-// LocalAddr returns the backend's local address
-func (b *BackendConnection) LocalAddr() net.Addr {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.conn != nil {
-		return b.conn.LocalAddr()
-	}
-	return nil
-}
-
-// IsAlive checks if the connection is still alive
+// IsAlive checks if the connection is still alive via a non-blocking TCP peek.
 func (b *BackendConnection) IsAlive() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if b.conn == nil {
 		return false
 	}
-
-	// Quick non-blocking check
 	netConn, ok := b.conn.(net.Conn)
 	if !ok {
 		return false
 	}
-
-	// Set immediate deadline
 	if err := netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
 		return false
 	}
 	defer netConn.SetReadDeadline(time.Time{})
-
-	// Try to read one byte
 	one := make([]byte, 1)
 	_, err := netConn.Read(one)
-
-	// Check if timeout (good - no data means alive and idle)
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		return true
 	}
-
-	// Any other error = closed
 	return false
 }
 
@@ -292,12 +243,15 @@ func (b *BackendConnection) Peek(n int) ([]byte, error) {
 }
 
 // Release signals the target that a connection is dead and should be replaced.
-// Also clears any pinned reference on the client.
 func (b *BackendConnection) Release() {
-	if b.client != nil {
-		b.client.SetBackendConnection(nil)
-		b.client.SetInTransaction(false)
-		b.SetClient(nil)
+	b.sharedMu.Lock()
+	c := b.client
+	b.client = nil
+	b.sharedMu.Unlock()
+
+	if c != nil {
+		c.SetBackendConnection(nil)
+		c.SetInTransaction(false)
 	}
 	if b.pool != nil {
 		b.pool.target.closeCh <- b
@@ -306,16 +260,12 @@ func (b *BackendConnection) Release() {
 	}
 }
 
-// HasStmt returns true if the prepared statement identified by hash has been
-// successfully deployed (Parse acknowledged) on this connection.
-// Safe to call without holding mu — only called while the connection is
-// checked out (inUse=true), which is single-goroutine by contract.
+// HasStmt returns true if hash has been deployed on this connection.
 func (b *BackendConnection) HasStmt(hash string) bool {
 	return b.deployedStmts[hash]
 }
 
-// MarkStmt records that the prepared statement identified by hash has been
-// successfully deployed on this connection.
+// MarkStmt records that hash has been successfully deployed on this connection.
 func (b *BackendConnection) MarkStmt(hash string) {
 	b.deployedStmts[hash] = true
 }

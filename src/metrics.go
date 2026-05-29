@@ -41,8 +41,6 @@ func (ws *WebServer) handleMetrics(c *gin.Context) {
 
 	// Per-target metrics.
 	for _, target := range ws.pooler.targets {
-		target.poolsMu.RLock()
-
 		metrics += "# HELP pgfox_target_connections_total Total open connections on target\n"
 		metrics += "# TYPE pgfox_target_connections_total gauge\n"
 		metrics += fmt.Sprintf("pgfox_target_connections_total{target=%q} %d\n\n",
@@ -58,19 +56,18 @@ func (ws *WebServer) handleMetrics(c *gin.Context) {
 		metrics += fmt.Sprintf("pgfox_target_server_open_connections{target=%q} %d\n\n",
 			target.Name, target.serverOpenConns)
 
-		for dbName, dbMap := range target.pools {
-			for userName, pool := range dbMap {
-				labels := fmt.Sprintf("target=%q,database=%q,user=%q", target.Name, dbName, userName)
+		// pools is now a sync.Map; Range is the safe iteration API.
+		target.pools.Range(func(_, v any) bool {
+			pool := v.(*Pool)
+			labels := fmt.Sprintf("target=%q,database=%q,user=%q", target.Name, pool.dbName, pool.username)
 
-				metrics += fmt.Sprintf("pgfox_pool_connections_total{%s} %d\n", labels, pool.totalConnections())
-				metrics += fmt.Sprintf("pgfox_pool_connections_active{%s} %d\n", labels, pool.activeConnections())
-				metrics += fmt.Sprintf("pgfox_pool_connections_idle{%s} %d\n", labels, pool.idleConnections())
-				metrics += fmt.Sprintf("pgfox_pool_queries_total{%s} %d\n", labels, pool.queriesExecuted())
-				metrics += fmt.Sprintf("pgfox_pool_errors_total{%s} %d\n", labels, pool.errorCount())
-			}
-		}
-
-		target.poolsMu.RUnlock()
+			metrics += fmt.Sprintf("pgfox_pool_connections_total{%s} %d\n", labels, pool.totalConnections())
+			metrics += fmt.Sprintf("pgfox_pool_connections_active{%s} %d\n", labels, pool.activeConnections())
+			metrics += fmt.Sprintf("pgfox_pool_connections_idle{%s} %d\n", labels, pool.idleConnections())
+			metrics += fmt.Sprintf("pgfox_pool_queries_total{%s} %d\n", labels, pool.queriesExecuted())
+			metrics += fmt.Sprintf("pgfox_pool_errors_total{%s} %d\n", labels, pool.errorCount())
+			return true
+		})
 	}
 	metrics += "\n"
 
