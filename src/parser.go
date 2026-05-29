@@ -88,14 +88,12 @@ func ClassifyAndParameterize(sql string) (SimpleQueryCommand, *ParameterizeResul
 	if !isDMLStatement(stmt) {
 		return SimpleQueryOther, nil
 	}
+
+	// If the query already contains $N parameters it cannot be rewritten further,
+	// but it CAN still be registered in the stmt cache so pgfox manages it as a
+	// shared prepared statement. Return a ParameterizeResult with the SQL as-is
+	// and no extracted values — the caller supplies parameters via Bind as usual.
 	if containsParam(stmt) {
-		return SimpleQueryOther, nil
-	}
-
-	var litValues []literalValue
-	collectLiterals(stmt, &litValues, false)
-
-	if len(litValues) == 0 {
 		h := sha256.Sum256([]byte(trimmed))
 		return SimpleQueryOther, &ParameterizeResult{
 			CanonicalSQL: trimmed,
@@ -104,15 +102,38 @@ func ClassifyAndParameterize(sql string) (SimpleQueryCommand, *ParameterizeResul
 		}
 	}
 
-	canonical, values, err := rewriteLiterals(trimmed, litValues)
+	// Borrow scratch space from the pool to avoid per-query allocations for
+	// the literal slice, strings.Builder, and values slice. All three are reset
+	// and returned to the pool before this function returns; the ParameterizeResult
+	// that escapes to the heap contains only heap-allocated strings.
+	ws := getParamWorkspace()
+	defer putParamWorkspace(ws)
+
+	collectLiterals(stmt, &ws.litValues, false)
+
+	if len(ws.litValues) == 0 {
+		h := sha256.Sum256([]byte(trimmed))
+		return SimpleQueryOther, &ParameterizeResult{
+			CanonicalSQL: trimmed,
+			Values:       nil,
+			Hash:         fmt.Sprintf("%x", h[:8]),
+		}
+	}
+
+	canonical, values, err := rewriteLiteralsWS(trimmed, ws.litValues, ws)
 	if err != nil {
 		return SimpleQueryOther, nil //nolint:nilerr
 	}
 
+	// values slice elements are Go string literals (immutable, heap-safe) so we
+	// copy them into a fresh slice before returning the workspace to the pool.
+	heapValues := make([]string, len(values))
+	copy(heapValues, values)
+
 	h := sha256.Sum256([]byte(canonical))
 	return SimpleQueryOther, &ParameterizeResult{
 		CanonicalSQL: canonical,
-		Values:       values,
+		Values:       heapValues,
 		Hash:         fmt.Sprintf("%x", h[:8]),
 	}
 }
@@ -490,13 +511,16 @@ func collectInList(list *nodes.List, out *[]literalValue, inLimit bool) {
 // rewriteLiterals scans sql left-to-right and replaces each literal token
 // described by litValues[i] with $i+1. The scan works because the AST walk
 // order matches left-to-right source order for all DML statement types.
-func rewriteLiterals(sql string, litValues []literalValue) (string, []string, error) {
+// rewriteLiteralsWS is the pooled version of rewriteLiterals; it writes into
+// a caller-supplied workspace so the Builder and values slice are not allocated
+// per call. The caller must copy ws.values out before returning ws to the pool.
+func rewriteLiteralsWS(sql string, litValues []literalValue, ws *paramWorkspace) (string, []string, error) {
 	if len(litValues) == 0 {
 		return sql, nil, nil
 	}
 
-	var sb strings.Builder
-	values := make([]string, 0, len(litValues))
+	sb := &ws.sb
+	ws.values = ws.values[:0]
 	sb.Grow(len(sql))
 
 	src := []byte(sql)
@@ -516,7 +540,7 @@ func rewriteLiterals(sql string, litValues []literalValue) (string, []string, er
 		// Emit $N.
 		paramIdx++
 		sb.WriteString(fmt.Sprintf("$%d", paramIdx))
-		values = append(values, lit.value)
+		ws.values = append(ws.values, lit.value)
 
 		pos = end
 	}
@@ -524,7 +548,20 @@ func rewriteLiterals(sql string, litValues []literalValue) (string, []string, er
 	// Append remaining SQL after the last literal.
 	sb.Write(src[pos:])
 
-	return sb.String(), values, nil
+	return sb.String(), ws.values, nil
+}
+
+// rewriteLiterals is the original API kept for callers outside ClassifyAndParameterize.
+func rewriteLiterals(sql string, litValues []literalValue) (string, []string, error) {
+	ws := getParamWorkspace()
+	defer putParamWorkspace(ws)
+	result, vals, err := rewriteLiteralsWS(sql, litValues, ws)
+	if err != nil || vals == nil {
+		return result, vals, err
+	}
+	heap := make([]string, len(vals))
+	copy(heap, vals)
+	return result, heap, nil
 }
 
 // findNextLiteral scans src starting at startPos for the next occurrence of

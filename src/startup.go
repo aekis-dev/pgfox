@@ -302,19 +302,23 @@ func (p *Server) drainBackendStartup(backend *BackendConnection) error {
 		switch msgType {
 		case 'R':
 			if len(body) < 4 {
+				PutMsgBody(body)
 				return fmt.Errorf("invalid auth response")
 			}
 			authType := uint32(body[0])<<24 | uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
 			if authType == AuthenticationOK {
+				PutMsgBody(body)
 				authComplete = true
 				continue
 			}
+			PutMsgBody(body)
 			return fmt.Errorf("unexpected auth type %d on cert connection — check pg_hba.conf", authType)
 		case 'S':
 			parts := splitNullTerminated(body)
 			if len(parts) == 2 {
 				backend.parameters[parts[0]] = parts[1]
 			}
+			PutMsgBody(body)
 		case 'K':
 			if len(body) >= 8 {
 				processID := int32(body[0])<<24 | int32(body[1])<<16 | int32(body[2])<<8 | int32(body[3])
@@ -322,15 +326,22 @@ func (p *Server) drainBackendStartup(backend *BackendConnection) error {
 				backend.SetProcessID(processID)
 				backend.SetSecretKey(secretKey)
 			}
+			PutMsgBody(body)
 		case 'Z':
+			PutMsgBody(body)
 			if !authComplete {
 				return fmt.Errorf("received ReadyForQuery before AuthenticationOK")
 			}
 			return nil
 		case 'E':
-			return fmt.Errorf("backend error during startup: %s", parseErrorMessage(body))
+			errStr := parseErrorMessage(body)
+			PutMsgBody(body)
+			return fmt.Errorf("backend error during startup: %s", errStr)
 		case 'N':
+			PutMsgBody(body)
 			continue
+		default:
+			PutMsgBody(body)
 		}
 	}
 }

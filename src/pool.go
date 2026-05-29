@@ -87,19 +87,30 @@ func (pool *Pool) borrowConn(ctx context.Context) (*BackendConnection, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
+	// Signal the target goroutine that this pool is contended so it triggers
+	// an immediate growthCycle instead of waiting up to 50ms for the ticker.
+	select {
+	case pool.target.demand <- struct{}{}:
+	default: // already signalled by another waiter this tick — fine
+	}
+
 	for {
 		select {
 		case conn := <-pool.backendPool:
 			conn.SetInUse(true)
 			return conn, nil
 		case <-pool.target.connReady:
-			// A connection was returned somewhere on this target — retry fast path.
+			// A connection is available — retry.
 			select {
 			case conn := <-pool.backendPool:
 				conn.SetInUse(true)
 				return conn, nil
 			default:
-				// Someone else grabbed it; keep waiting.
+				// Grabbed by a concurrent waiter; re-signal demand and keep waiting.
+				select {
+				case pool.target.demand <- struct{}{}:
+				default:
+				}
 			}
 		case <-timer.C:
 			return nil, fmt.Errorf("timed out waiting for connection for %s/%s",
@@ -136,4 +147,34 @@ func (pool *Pool) queriesExecuted() int64 {
 
 func (pool *Pool) errorCount() int64 {
 	return atomic.LoadInt64(&pool.stats.ErrorCount)
+}
+
+// returnConn returns a backend connection to its pool directly from the calling
+// goroutine, bypassing the target goroutine's event loop for the common healthy
+// case. This eliminates the serialisation bottleneck where all concurrent
+// returns queue through the single target goroutine.
+//
+// If the connection is dead it is handed to the target via closeCh for proper
+// bookkeeping (totalOpen decrement, allConns removal). If the backendPool
+// channel is unexpectedly full (which should not happen given the channel is
+// sized to MaxConnections), it is also sent to closeCh rather than leaked.
+func returnConn(conn *BackendConnection) {
+	conn.SetInUse(false)
+	conn.SetClient(nil)
+
+	if !conn.IsAlive() {
+		conn.pool.target.closeCh <- conn
+		return
+	}
+
+	// Direct deposit into the pool channel — no target goroutine involvement.
+	select {
+	case conn.pool.backendPool <- conn:
+		// Update cancel-lookup index and wake any waiting borrowers.
+		conn.pool.target.backendIndex.Store(conn.GetProcessID(), conn)
+		conn.pool.target.signalConnReady()
+	default:
+		// backendPool full — let target goroutine close it cleanly.
+		conn.pool.target.closeCh <- conn
+	}
 }

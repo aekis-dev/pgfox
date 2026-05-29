@@ -50,22 +50,26 @@ func (p *Server) handleClientMessage(client *ClientConnection) error {
 
 	default:
 		// Extended query protocol — buffer full pipeline until Sync or Flush.
-		pipeline := []pipelineMsg{{msgType, body}}
+		// Borrow a pooled slice; executeExtendedPipeline returns it to the pool.
+		pp := getPipeline()
+		*pp = append(*pp, pipelineMsg{msgType, body})
 		complete := msgType == Sync || msgType == 'H'
 
 		for !complete {
 			next, nextBody, err := client.ReadMessage()
 			if err != nil {
+				putPipeline(pp)
 				return err
 			}
 			if next == Terminate {
+				putPipeline(pp)
 				return io.EOF
 			}
-			pipeline = append(pipeline, pipelineMsg{next, nextBody})
+			*pp = append(*pp, pipelineMsg{next, nextBody})
 			complete = next == Sync || next == 'H'
 		}
 
-		return p.executeExtendedPipeline(client, pipeline)
+		return p.executeExtendedPipeline(client, pp)
 	}
 }
 
@@ -85,15 +89,34 @@ func (p *Server) handleClientMessage(client *ClientConnection) error {
 //   - Named statements from the client that we can't remap → pin
 //   - Open transactions (ReadyForQuery reports 'T' or 'E') → pin
 //   - All other cases → return to pool after Sync
-func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pipelineMsg) error {
+func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelineMsg) error {
+	pipeline := *pp
 	logger := client.Logger()
 
 	// --- Phase 1: inspect and rewrite the pipeline ---
 	// We track whether any message requires pinning (non-remappable named stmt).
 	requiresPin := false
 
-	rewritten := make([]pipelineMsg, len(pipeline))
-	copy(rewritten, pipeline)
+	// remappedParses maps pipeline index → hash for Parse messages that were
+	// rewritten to internal names. Phase 4 uses this to skip forwarding the
+	// Parse to a backend that already has the statement deployed.
+	remappedParses := make(map[int]string, 4)
+
+	// bindRequiredHashes collects hashes that Bind messages reference but have
+	// no corresponding Parse in this pipeline. After Phase 2 (backend is known),
+	// we synthesize Parse messages for any hash the backend hasn't deployed yet.
+	bindRequiredHashes := make(map[string]bool, 4)
+
+	// Borrow a second pooled slice for the rewritten pipeline, then return both
+	// when this function exits regardless of error path.
+	rp := getPipeline()
+	*rp = (*rp)[:len(pipeline)]
+	copy(*rp, pipeline)
+	rewritten := *rp
+	defer func() {
+		putPipeline(pp)
+		putPipeline(rp)
+	}()
 
 	for i, m := range pipeline {
 		switch m.msgType {
@@ -101,10 +124,18 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 			clientName := ParseBodyStatementName(m.body)
 			querySQL := ParseBodyQuery(m.body)
 
+			// The unnamed statement ("") is per-connection and implicitly replaced
+			// on every Parse. It cannot be shared across backends via the cache —
+			// pass it through completely unchanged and pin to this backend.
+			if clientName == "" {
+				requiresPin = true
+				break
+			}
+
 			result, _ := ParameterizeQuery(querySQL)
 
 			if result != nil {
-				// We can manage this statement in the cache.
+				// Named statement that we can manage in the shared cache.
 				pool := p.getPool(client.GetDatabase(), client.GetUser())
 				if pool != nil {
 					entry, isNew := pool.target.stmtCache.GetOrRegister(
@@ -119,32 +150,25 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 
 				internalName := StmtName(result.Hash)
 
-				if clientName != "" {
-					// Named statement: register the mapping so Bind/Close can find it.
-					client.MapStmtName(clientName, result.Hash)
-					// Count it as a named stmt for pinning logic — we still need
-					// this backend if the client plans to Bind later in a different
-					// pipeline. BUT because we have the cache, a different backend
-					// can serve the Bind as long as it also has the stmt deployed.
-					// We track it but don't force-pin here; reconcileConn decides.
-					client.AddNamedStatement()
-					logger.Debug("Mapped client named statement",
-						"client_name", clientName,
-						"internal_name", internalName)
-				}
+				// Register name→hash so subsequent Bind/Describe/Close can find it.
+				// Do NOT call AddNamedStatement — remapped stmts live in the target
+				// cache and can be served by any backend, so they must not pin.
+				client.MapStmtName(clientName, result.Hash)
+				logger.Debug("Mapped client named statement",
+					"client_name", clientName,
+					"internal_name", internalName)
 
-				// Rewrite the Parse body to use the internal name.
+				// Rewrite the Parse body to use the internal name, and record the
+				// hash so phase 4 can skip sending it if this backend already has it.
 				rewritten[i].body = RewriteParseBodyName(m.body, internalName)
+				remappedParses[i] = result.Hash
 
 			} else {
-				// Can't parameterize — pass through with original name.
-				// If it's a named statement, we must pin to this specific backend.
-				if clientName != "" {
-					requiresPin = true
-					client.AddNamedStatement()
-					logger.Debug("Named statement passthrough (non-parameterizable), pinning",
-						"client_name", clientName)
-				}
+				// Can't cache — pass through and pin to this backend.
+				requiresPin = true
+				client.AddNamedStatement()
+				logger.Debug("Named statement passthrough (non-parameterizable), pinning",
+					"client_name", clientName)
 			}
 
 		case 'B': // Bind
@@ -152,6 +176,10 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 			if clientStmtName != "" {
 				if hash, ok := client.LookupInternalName(clientStmtName); ok {
 					rewritten[i].body = RewriteBindBodyName(m.body, StmtName(hash))
+					// Track hashes referenced by Bind so phase 3.5 can deploy them on
+					// backends that don't have the statement yet (e.g. asyncpg re-using
+					// a cached statement that was prepared on a different backend).
+					bindRequiredHashes[hash] = true
 				}
 				// If not in map, it's a passthrough named stmt — leave as-is.
 			}
@@ -167,12 +195,21 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 		case 'C': // Close
 			closeType, closeName := CloseBodyTarget(m.body)
 			if closeType == 'S' && closeName != "" {
-				if hash, ok := client.LookupInternalName(closeName); ok {
-					rewritten[i].body = RewriteCloseBodyName(m.body, StmtName(hash))
+				if _, ok := client.LookupInternalName(closeName); ok {
+					// Remapped statement — pgfox owns the backend lifetime of pfx_<hash>.
+					// Do NOT forward Close('S','pfx_hash') to the backend: that would
+					// evict the statement from this backend while deployedStmts still
+					// says it's deployed, causing InvalidSQLStatementNameError on reuse.
+					// Instead rewrite to Close('S','') — closing the unnamed statement
+					// is a no-op if it is empty, and PostgreSQL still sends CloseComplete.
+					rewritten[i].body = RewriteCloseBodyName(m.body, "")
 					client.UnmapStmtName(closeName)
+					logger.Debug("Remapped named statement close intercepted", "name", closeName)
+				} else {
+					// Passthrough named statement — was counted in namedStmts.
+					client.RemoveNamedStatement()
+					logger.Debug("Passthrough named statement closed", "name", closeName)
 				}
-				client.RemoveNamedStatement()
-				logger.Debug("Named statement closed", "name", closeName)
 			} else if closeType == 'S' && closeName == "" {
 				// Closing the unnamed statement — no mapping needed.
 			}
@@ -209,11 +246,82 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 		}
 	}
 
-	// --- Phase 3: forward the rewritten pipeline ---
-	// Parse messages that were remapped to internal names will be deployed on
-	// this backend if not already present — the backend responds with ParseComplete.
+	// --- Phase 3.5: inject missing Parses for Bind-referenced statements ---
+	// When a client pipeline contains Bind but no Parse (e.g. asyncpg re-using a
+	// cached statement across a different backend connection), the backend may not
+	// have the statement deployed. Synthesize and send Parse + wait for ParseComplete
+	// now, before forwarding the rest of the pipeline.
+	var sentParseHashes []string
+	for hash := range bindRequiredHashes {
+		// Skip if this hash also has a Parse in the pipeline (handled in phase 4).
+		hasParseInPipeline := false
+		for _, h := range remappedParses {
+			if h == hash {
+				hasParseInPipeline = true
+				break
+			}
+		}
+		if hasParseInPipeline {
+			continue
+		}
+		if backend.HasStmt(hash) {
+			continue
+		}
+		// Fetch the canonical SQL from the stmt cache.
+		pool := p.getPool(client.GetDatabase(), client.GetUser())
+		if pool == nil {
+			backend.Release()
+			return sendErrorResponse(client, "ERROR", "26000", "prepared statement not found")
+		}
+		entry := pool.target.stmtCache.Get(hash)
+		if entry == nil {
+			backend.Release()
+			return sendErrorResponse(client, "ERROR", "26000", "prepared statement not found")
+		}
+		// Send Parse + Sync to deploy the statement.
+		parseBody := BuildParseBody(StmtName(hash), entry.CanonicalSQL, nil)
+		if err := backend.WriteMessage('P', parseBody); err != nil {
+			backend.Release()
+			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		}
+		if err := backend.WriteMessage('S', []byte{}); err != nil {
+			backend.Release()
+			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		}
+		// Read until ReadyForQuery, expecting ParseComplete then ReadyForQuery.
+		for {
+			mt, body, err := backend.ReadMessage()
+			if err != nil {
+				backend.Release()
+				return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			}
+			PutMsgBody(body)
+			if mt == '1' { // ParseComplete
+				backend.MarkStmt(hash)
+				logger.Debug("Synthesized Parse deployed", "hash", hash)
+			} else if mt == 'E' { // ErrorResponse
+				backend.Release()
+				return sendErrorResponse(client, "ERROR", "26000", "failed to deploy prepared statement")
+			} else if mt == 'Z' { // ReadyForQuery
+				break
+			}
+		}
+	}
+
 	// --- Phase 4: forward the rewritten pipeline ---
-	for _, m := range rewritten {
+	// For remapped Parse messages, skip if the backend already has the statement
+	// deployed — sending Parse twice for the same name is a PostgreSQL error.
+	for i, m := range rewritten {
+		if m.msgType == 'P' {
+			if hash, ok := remappedParses[i]; ok {
+				if backend.HasStmt(hash) {
+					// Already deployed — skip Parse, backend won't send ParseComplete.
+					continue
+				}
+				// Will be sent — record hash so we can mark it on ParseComplete.
+				sentParseHashes = append(sentParseHashes, hash)
+			}
+		}
 		if err := backend.WriteMessage(m.msgType, m.body); err != nil {
 			logger.WithError(err).Error("Failed to forward extended query message",
 				"msg_type", string(m.msgType))
@@ -226,14 +334,17 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 	lastMsg := rewritten[len(rewritten)-1].msgType
 
 	if lastMsg == 'S' { // Sync
-		txStatus, err := p.forwardExtendedResponse(client, backend, logger)
+		txStatus, err := p.forwardExtendedResponse(client, backend, sentParseHashes, logger)
 		if err != nil {
 			backend.Release()
 			return err
 		}
-		p.reconcileConn(client, backend, txStatus, wasPinned, logger)
+		// wasPinned tracks state before this pipeline. If we pinned during this
+		// pipeline (requiresPin=true), reconcileConn must also treat it as pinned
+		// so it correctly unsets SetBackendConnection on a clean 'I' status.
+		p.reconcileConn(client, backend, txStatus, wasPinned || requiresPin, logger)
 	} else { // Flush ('H')
-		if err := p.drainFlushResponse(client, backend); err != nil {
+		if err := p.drainFlushResponse(client, backend, sentParseHashes); err != nil {
 			backend.Release()
 			return err
 		}
@@ -255,7 +366,12 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pipeline []pi
 //
 // This is separate from forwardPreparedResponse because in the extended protocol
 // the client expects to receive ParseComplete and BindComplete messages.
-func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *BackendConnection, logger *Logger) (byte, error) {
+func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *BackendConnection, sentParseHashes []string, logger *Logger) (byte, error) {
+	// sentParseHashes lists, in order, the hashes of Parse messages that were
+	// actually forwarded to the backend this pipeline. ParseComplete responses
+	// arrive in that same order; we mark each hash deployed as we see them.
+	parseIdx := 0
+
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
@@ -265,16 +381,29 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 			return 0, sendErrorResponse(client, "ERROR", "08006", "connection failure")
 		}
 
-		if err := client.WriteMessage(msgType, body); err != nil {
-			if isClientGone(err) {
-				return 0, err
+		// Each ParseComplete corresponds to a forwarded Parse in pipeline order.
+		if msgType == '1' && parseIdx < len(sentParseHashes) {
+			backend.MarkStmt(sentParseHashes[parseIdx])
+			parseIdx++
+		}
+
+		writeErr := client.WriteMessage(msgType, body)
+		// Extract status before returning body to pool.
+		var status byte
+		if msgType == 'Z' && len(body) > 0 {
+			status = body[0]
+		}
+		PutMsgBody(body)
+		if writeErr != nil {
+			if isClientGone(writeErr) {
+				return 0, writeErr
 			}
-			return 0, err
+			return 0, writeErr
 		}
 
 		if msgType == 'Z' { // ReadyForQuery
-			if len(body) > 0 {
-				return body[0], nil
+			if status != 0 {
+				return status, nil
 			}
 			return 'I', nil
 		}
@@ -501,28 +630,35 @@ func (p *Server) forwardPreparedResponse(
 				entry.RecordDeploy()
 				logger.Debug("Prepared statement deployed on backend", "hash", hash)
 			}
-			// Do not forward to client — simple query protocol has no ParseComplete.
+			PutMsgBody(body) // not forwarded to client
 
 		case '2': // BindComplete
-			// Do not forward to client — simple query protocol has no BindComplete.
+			PutMsgBody(body) // not forwarded to client
 
 		case 'Z': // ReadyForQuery
-			if err := client.WriteMessage(msgType, body); err != nil {
-				return 0, err
-			}
+			var status byte
 			if len(body) > 0 {
-				return body[0], nil
+				status = body[0]
+			}
+			writeErr := client.WriteMessage(msgType, body)
+			PutMsgBody(body)
+			if writeErr != nil {
+				return 0, writeErr
+			}
+			if status != 0 {
+				return status, nil
 			}
 			return 'I', nil
 
 		default:
 			// DataRow, RowDescription, CommandComplete, ErrorResponse, NoticeResponse, etc.
-			// Forward everything else as-is.
-			if err := client.WriteMessage(msgType, body); err != nil {
-				if isClientGone(err) {
-					return 0, err
+			writeErr := client.WriteMessage(msgType, body)
+			PutMsgBody(body)
+			if writeErr != nil {
+				if isClientGone(writeErr) {
+					return 0, writeErr
 				}
-				return 0, err
+				return 0, writeErr
 			}
 		}
 	}
@@ -567,9 +703,9 @@ func (p *Server) reconcileConn(
 			client.SetBackendConnection(nil)
 			backend.SetClient(nil)
 			client.SetInTransaction(false)
-			backend.pool.target.returnCh <- backend
+			returnConn(backend)
 		} else {
-			backend.pool.target.returnCh <- backend
+			returnConn(backend)
 		}
 
 	default:
@@ -580,15 +716,19 @@ func (p *Server) reconcileConn(
 			backend.SetClient(nil)
 			client.SetInTransaction(false)
 		}
-		backend.pool.target.returnCh <- backend
+		returnConn(backend)
 	}
 }
 
 // drainFlushResponse reads backend responses after a Flush message.
 // PostgreSQL does NOT send ReadyForQuery after Flush — only after Sync.
 // The response to Parse+Describe+Flush ends with RowDescription('T') or NoData('n').
-func (p *Server) drainFlushResponse(client *ClientConnection, backend *BackendConnection) error {
+func (p *Server) drainFlushResponse(client *ClientConnection, backend *BackendConnection, sentParseHashes []string) error {
 	logger := client.Logger()
+	// ParseComplete responses arrive in the same order as the Parse messages
+	// that were sent. Mark each hash as deployed so phase 3.5 does not
+	// re-inject a Parse on the same backend for the subsequent Bind pipeline.
+	parseIdx := 0
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
@@ -596,15 +736,21 @@ func (p *Server) drainFlushResponse(client *ClientConnection, backend *BackendCo
 			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
 		}
 
-		if err := client.WriteMessage(msgType, body); err != nil {
-			return err
+		if msgType == '1' && parseIdx < len(sentParseHashes) {
+			backend.MarkStmt(sentParseHashes[parseIdx])
+			parseIdx++
 		}
 
+		writeErr := client.WriteMessage(msgType, body)
+		done := msgType == 'T' || msgType == 'n' || msgType == 'E'
+		PutMsgBody(body)
+		if writeErr != nil {
+			return writeErr
+		}
 		// RowDescription or NoData ends the Describe response.
 		// ErrorResponse ends a failed stage.
 		// Connection stays pinned — client will send Bind+Execute+Sync next.
-		switch msgType {
-		case 'T', 'n', 'E':
+		if done {
 			return nil
 		}
 	}
@@ -631,16 +777,22 @@ func (p *Server) forwardCompleteBackendResponse(client *ClientConnection, backen
 			return 0, err
 		}
 
-		if err := client.WriteMessage(msgType, body); err != nil {
-			if isClientGone(err) {
-				return 0, err
+		var status byte
+		if msgType == 'Z' && len(body) > 0 {
+			status = body[0]
+		}
+		writeErr := client.WriteMessage(msgType, body)
+		PutMsgBody(body)
+		if writeErr != nil {
+			if isClientGone(writeErr) {
+				return 0, writeErr
 			}
-			return 0, err
+			return 0, writeErr
 		}
 
 		if msgType == 'Z' {
-			if len(body) > 0 {
-				return body[0], nil
+			if status != 0 {
+				return status, nil
 			}
 			return 'I', nil
 		}
@@ -652,5 +804,6 @@ func (p *Server) forwardCompleteBackendResponse(client *ClientConnection, backen
 // Kept as a thin wrapper over forwardExtendedResponse for callers in
 // listen_notify.go and similar that don't need the extended name-remapping path.
 func (p *Server) forwardUntilReady(client *ClientConnection, backend *BackendConnection) (byte, error) {
-	return p.forwardExtendedResponse(client, backend, client.Logger())
+	// No remapped Parse messages — pass nil so no MarkStmt calls are made.
+	return p.forwardExtendedResponse(client, backend, nil, client.Logger())
 }

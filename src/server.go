@@ -208,7 +208,7 @@ func (p *Server) handleClient(conn net.Conn) {
 			backend.Release()
 		} else {
 			clientLogger.Debug("Releasing backend on disconnect")
-			backend.pool.target.returnCh <- backend
+			returnConn(backend)
 		}
 	}()
 

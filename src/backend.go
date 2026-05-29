@@ -189,6 +189,11 @@ func (b *BackendConnection) WriteMessage(msgType byte, body []byte) error {
 
 // ReadMessage reads a message from the backend.
 // Must only be called by the goroutine that currently owns this connection.
+//
+// The returned body slice is borrowed from msgBodyPool. Callers MUST call
+// PutMsgBody(body) when they are done reading all fields from it. If the body
+// needs to outlive the immediate dispatch, call cloneMsgBody first and put
+// the original back immediately.
 func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 	msgType, err := b.reader.ReadByte()
 	if err != nil {
@@ -208,13 +213,34 @@ func (b *BackendConnection) ReadMessage() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("message length %d exceeds max_message_size %d for type %c", length, b.maxMessageSize, msgType)
 	}
 	bodyLength := int(length - 4)
-	body := make([]byte, bodyLength)
+
+	var body []byte
 	if bodyLength > 0 {
+		if bodyLength > msgBodyPoolMax {
+			// Oversized — allocate directly; no pool churn.
+			body = make([]byte, bodyLength)
+		} else {
+			bp := getMsgBody(bodyLength)
+			*bp = (*bp)[:bodyLength]
+			body = *bp
+		}
 		if _, err := io.ReadFull(b.reader, body); err != nil {
+			PutMsgBody(body)
 			return 0, nil, fmt.Errorf("failed to read message body (%d bytes) for type %c: %w", bodyLength, msgType, err)
 		}
 	}
 	return msgType, body, nil
+}
+
+// PutMsgBody returns a backend ReadMessage body to the pool.
+// Call this exactly once per body returned by BackendConnection.ReadMessage,
+// after all fields have been read from it.
+func PutMsgBody(body []byte) {
+	if cap(body) == 0 || cap(body) > msgBodyPoolMax {
+		return
+	}
+	bp := &body
+	putMsgBody(bp)
 }
 
 // IsAlive checks if the connection is still alive via a non-blocking TCP peek.

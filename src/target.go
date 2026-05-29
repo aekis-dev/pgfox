@@ -76,10 +76,15 @@ type Target struct {
 	// target.conn is never accessed concurrently from client goroutines.
 	scramCh chan scramRequest
 
-	// returnCh and closeCh are target-level. conn.pool identifies which pool
-	// the connection belongs to. The target goroutine is the sole reader.
-	returnCh chan *BackendConnection
-	closeCh  chan *BackendConnection
+	// closeCh receives connections that need to be cleaned up (dead or
+	// backendPool-full). The target goroutine is the sole reader.
+	closeCh chan *BackendConnection
+
+	// demand is a capacity-1 signal channel. borrowConn sends a non-blocking
+	// token when it enters the slow path (pool empty), triggering an immediate
+	// growthCycle instead of waiting up to 50ms for the ticker. Subsequent
+	// waiters within the same tick find the channel full and skip silently.
+	demand chan struct{}
 
 	// poolRegistered receives newly created Pool pointers from getPool so the
 	// target goroutine can append them to cachedPools without a lock.
@@ -298,13 +303,19 @@ func (t *Target) deployPrivilegedStmts(logger *Logger) error {
 			deployed++
 			t.conn.MarkStmt(stmts[deployed-1].hash)
 			logger.Debug("Privileged stmt deployed", "stmt", stmts[deployed-1].hash)
+			PutMsgBody(body)
 		case 'Z': // ReadyForQuery
+			PutMsgBody(body)
 			if deployed != len(stmts) {
 				return fmt.Errorf("expected %d ParseComplete, got %d", len(stmts), deployed)
 			}
 			return nil
 		case 'E':
-			return fmt.Errorf("Parse error for privileged stmt: %s", parseErrorMessage(body))
+			errStr := parseErrorMessage(body)
+			PutMsgBody(body)
+			return fmt.Errorf("Parse error for privileged stmt: %s", errStr)
+		default:
+			PutMsgBody(body)
 		}
 	}
 }
@@ -371,7 +382,9 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 		switch msgType {
 		case '1': // ParseComplete (only present on first call after redeploy)
 			t.conn.MarkStmt(scramStmtHash)
+			PutMsgBody(body)
 		case '2': // BindComplete
+			PutMsgBody(body)
 		case 'D': // DataRow — binary format
 			// Binary DataRow layout:
 			//   Int16  num_columns
@@ -400,14 +413,21 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 				// Binary text/varchar is raw UTF-8 — identical to text mode.
 				rolpassword = string(body[pos : pos+colLen])
 			}
+			PutMsgBody(body)
 		case 'C': // CommandComplete
+			PutMsgBody(body)
 		case 'Z': // ReadyForQuery
+			PutMsgBody(body)
 			if rolpassword == "" {
 				return nil, fmt.Errorf("user %q not found in pg_authid", username)
 			}
 			return parseSCRAMVerifier(rolpassword)
 		case 'E':
-			return nil, fmt.Errorf("pg_authid query error: %s", parseErrorMessage(body))
+			errStr := parseErrorMessage(body)
+			PutMsgBody(body)
+			return nil, fmt.Errorf("pg_authid query error: %s", errStr)
+		default:
+			PutMsgBody(body)
 		}
 	}
 }
@@ -439,20 +459,17 @@ func (t *Target) run(p *Server) {
 			t.drain(p, logger)
 			return
 
-		case pool := <-t.poolRegistered:
-			// A new pool was created by getPool — append to cachedPools so
-			// growthCycle and healthCheck see it on the next tick.
-			t.cachedPools = append(t.cachedPools, pool)
-
 		case req := <-t.scramCh:
 			verifier, err := t.fetchSCRAMVerifier(req.username)
 			req.reply <- scramReply{verifier: verifier, err: err}
 
-		case conn := <-t.returnCh:
-			t.handleReturn(p, conn, logger)
-
 		case conn := <-t.closeCh:
 			t.handleClose(p, conn, logger)
+
+		case <-t.demand:
+			// A borrowConn caller hit an empty pool. Grow immediately rather
+			// than waiting for the next growthTicker tick.
+			t.growthCycle(p, logger)
 
 		case <-growthTicker.C:
 			t.growthCycle(p, logger)
@@ -507,39 +524,6 @@ func (t *Target) openPrivilegedConn(p *Server, logger *Logger) error {
 		close(t.ready)
 		logger.Info("Privileged connection ready", "role", p.config.Server.PgFoxRole)
 		return nil
-	}
-}
-
-// handleReturn validates a returned connection and puts it back in its pool's
-// backendPool, or closes it if dead.
-func (t *Target) handleReturn(p *Server, conn *BackendConnection, logger *Logger) {
-	pool := conn.pool
-
-	if !conn.IsAlive() {
-		logger.Warn("Returned connection is dead, closing")
-		t.backendIndex.Delete(conn.GetProcessID())
-		conn.conn.Close()
-		t.totalOpen--
-		pool.removeFromAllConns(conn)
-		t.signalConnReady()
-		return
-	}
-
-	conn.SetInUse(false)
-	conn.SetClient(nil)
-
-	select {
-	case pool.backendPool <- conn:
-		// Index idle connection for O(1) cancel lookup.
-		t.backendIndex.Store(conn.GetProcessID(), conn)
-		t.signalConnReady()
-	default:
-		// backendPool full — shouldn't happen, close defensively.
-		logger.Warn("backendPool full on return, closing extra connection")
-		t.backendIndex.Delete(conn.GetProcessID())
-		conn.conn.Close()
-		t.totalOpen--
-		pool.removeFromAllConns(conn)
 	}
 }
 
@@ -794,7 +778,9 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 		switch msgType {
 		case '1': // ParseComplete (only on redeploy)
 			t.conn.MarkStmt(statsStmtHash)
+			PutMsgBody(body)
 		case '2': // BindComplete
+			PutMsgBody(body)
 		case 'D': // DataRow — binary format
 			// Two int4 columns in binary:
 			//   Int16  num_columns  (= 2)
@@ -840,8 +826,11 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 					int64(body[pos+4])<<24 | int64(body[pos+5])<<16 |
 					int64(body[pos+6])<<8 | int64(body[pos+7]))
 			}
+			PutMsgBody(body)
 		case 'C': // CommandComplete
+			PutMsgBody(body)
 		case 'Z': // ReadyForQuery
+			PutMsgBody(body)
 			if maxConns > 0 {
 				t.serverMaxConns = maxConns
 				t.serverOpenConns = openConns
@@ -852,8 +841,12 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 			}
 			return
 		case 'E':
-			logger.Warn("Stats query error", "error", parseErrorMessage(body))
+			errStr := parseErrorMessage(body)
+			PutMsgBody(body)
+			logger.Warn("Stats query error", "error", errStr)
 			return
+		default:
+			PutMsgBody(body)
 		}
 	}
 }
@@ -863,9 +856,6 @@ func (t *Target) drain(p *Server, logger *Logger) {
 	// Drain in-flight returns and closes first.
 	for {
 		select {
-		case conn := <-t.returnCh:
-			conn.conn.Close()
-			t.totalOpen--
 		case conn := <-t.closeCh:
 			conn.conn.Close()
 			t.totalOpen--
@@ -960,8 +950,19 @@ func (t *Target) signalConnReady() {
 	}
 }
 
-// allPools returns the target goroutine's cached pool slice.
-// Must only be called from the target goroutine — no lock needed.
+// allPools flushes any pending pool registrations into cachedPools and returns
+// the slice. Must only be called from the target goroutine — no lock needed.
 func (t *Target) allPools() []*Pool {
-	return t.cachedPools
+	// Drain all pending registrations before returning the slice so callers
+	// always see a fully up-to-date view. This prevents the race where getPool
+	// registers a pool and immediately triggers demand, causing growthCycle to
+	// run before the poolRegistered case fires in the select.
+	for {
+		select {
+		case pool := <-t.poolRegistered:
+			t.cachedPools = append(t.cachedPools, pool)
+		default:
+			return t.cachedPools
+		}
+	}
 }

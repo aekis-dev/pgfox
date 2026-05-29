@@ -112,6 +112,7 @@ func (l *Listen) run(p *Server) {
 		switch msgType {
 		case 'A': // NotificationResponse
 			notification := parseNotificationResponse(body)
+			PutMsgBody(body)
 			if notification == nil {
 				logger.Warn("Received unparseable notification")
 				continue
@@ -120,10 +121,14 @@ func (l *Listen) run(p *Server) {
 			l.fanOut(p, *notification)
 
 		case 'Z', 'S', 'N': // ReadyForQuery, ParameterStatus, NoticeResponse
+			PutMsgBody(body)
 			continue
 		case 'E':
-			logger.Warn("Error from listen backend", "error", parseErrorMessage(body))
+			errStr := parseErrorMessage(body)
+			PutMsgBody(body)
+			logger.Warn("Error from listen backend", "error", errStr)
 		default:
+			PutMsgBody(body)
 			logger.Warn("Unexpected message in listen monitor", "type", string([]byte{msgType}))
 		}
 	}
@@ -349,9 +354,14 @@ func (p *Server) drainUntilReady(backend *BackendConnection) error {
 		}
 		switch msgType {
 		case 'Z':
+			PutMsgBody(body)
 			return nil
 		case 'E':
-			return fmt.Errorf("backend error: %s", parseErrorMessage(body))
+			errStr := parseErrorMessage(body)
+			PutMsgBody(body)
+			return fmt.Errorf("backend error: %s", errStr)
+		default:
+			PutMsgBody(body)
 		}
 	}
 }
@@ -495,7 +505,7 @@ func (p *Server) handleNotify(client *ClientConnection, query string) error {
 
 	// NOTIFY is always outside a transaction from the pool's perspective —
 	// we borrowed for one query and return immediately regardless of status.
-	backend.pool.target.returnCh <- backend
+	returnConn(backend)
 
 	logger.Debug("NOTIFY executed successfully")
 	return nil
