@@ -112,7 +112,6 @@ func (l *Listen) run(p *Server) {
 		switch msgType {
 		case 'A': // NotificationResponse
 			notification := parseNotificationResponse(body)
-			PutMsgBody(body)
 			if notification == nil {
 				logger.Warn("Received unparseable notification")
 				continue
@@ -121,14 +120,10 @@ func (l *Listen) run(p *Server) {
 			l.fanOut(p, *notification)
 
 		case 'Z', 'S', 'N': // ReadyForQuery, ParameterStatus, NoticeResponse
-			PutMsgBody(body)
 			continue
 		case 'E':
-			errStr := parseErrorMessage(body)
-			PutMsgBody(body)
-			logger.Warn("Error from listen backend", "error", errStr)
+			logger.Warn("Error from listen backend", "error", parseErrorMessage(body))
 		default:
-			PutMsgBody(body)
 			logger.Warn("Unexpected message in listen monitor", "type", string([]byte{msgType}))
 		}
 	}
@@ -180,8 +175,11 @@ func (p *Server) getOrCreateListen(ch Channel, client *ClientConnection) (*Liste
 	}
 
 	// Budget check — include both pool and listen connections.
+	// Use the atomic listen counter; totalOpen is read via the atomic snapshot
+	// taken by Stats() to avoid a data race with the target goroutine.
 	listenOpen := int(atomic.LoadInt32(&pool.target.listenOpen))
-	if pool.target.totalOpen+listenOpen >= pool.target.MaxConnections {
+	totalOpen := int(pool.target.atomicTotalOpen.Load())
+	if totalOpen+listenOpen >= pool.target.MaxConnections {
 		return nil, false, fmt.Errorf("target %s at connection limit", pool.target.Name)
 	}
 
@@ -354,14 +352,9 @@ func (p *Server) drainUntilReady(backend *BackendConnection) error {
 		}
 		switch msgType {
 		case 'Z':
-			PutMsgBody(body)
 			return nil
 		case 'E':
-			errStr := parseErrorMessage(body)
-			PutMsgBody(body)
-			return fmt.Errorf("backend error: %s", errStr)
-		default:
-			PutMsgBody(body)
+			return fmt.Errorf("backend error: %s", parseErrorMessage(body))
 		}
 	}
 }
@@ -415,7 +408,9 @@ func (p *Server) handleListen(client *ClientConnection, query string) error {
 	if len(parts) < 2 {
 		return sendErrorResponse(client, "ERROR", "42601", "syntax error in LISTEN command")
 	}
-	channelName := strings.Trim(parts[1], "\"';")
+	// Handle both quoted ("my_channel") and unquoted (my_channel) names.
+	// Also strip trailing semicolons sent by some clients.
+	channelName := strings.TrimRight(strings.Trim(parts[1], `"`), ";")
 
 	ch := Channel{
 		Database: client.GetDatabase(),
@@ -457,7 +452,7 @@ func (p *Server) handleUnlisten(client *ClientConnection, query string) error {
 		client.ClearListenChannels()
 		logger.Info("UNLISTEN * — left all channels", "count", len(channels))
 	} else if len(parts) >= 2 {
-		channelName := strings.Trim(parts[1], "\"';")
+		channelName := strings.TrimRight(strings.Trim(parts[1], `"`), ";")
 		ch := Channel{
 			Database: client.GetDatabase(),
 			Name:     channelName,

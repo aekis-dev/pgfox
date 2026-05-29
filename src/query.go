@@ -107,6 +107,12 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 	// we synthesize Parse messages for any hash the backend hasn't deployed yet.
 	bindRequiredHashes := make(map[string]bool, 4)
 
+	// specialCmd and specialSQL are set when a Parse message contains a
+	// LISTEN/UNLISTEN/NOTIFY statement. The pipeline is drained without
+	// forwarding to any backend and then routed to the appropriate handler.
+	var specialCmd SimpleQueryCommand
+	var specialSQL string
+
 	// Borrow a second pooled slice for the rewritten pipeline, then return both
 	// when this function exits regardless of error path.
 	rp := getPipeline()
@@ -123,6 +129,15 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 		case 'P': // Parse
 			clientName := ParseBodyStatementName(m.body)
 			querySQL := ParseBodyQuery(m.body)
+
+			// Classify the SQL regardless of statement name so we can intercept
+			// LISTEN/UNLISTEN/NOTIFY even when sent via the extended protocol
+			// (e.g. asyncpg.execute("LISTEN chan") uses unnamed prepared stmts).
+			if cmd, _ := ClassifyAndParameterize(querySQL); cmd != SimpleQueryOther {
+				specialCmd = cmd
+				specialSQL = querySQL
+				break // drain the rest of the pipeline, then dispatch below
+			}
 
 			// The unnamed statement ("") is per-connection and implicitly replaced
 			// on every Parse. It cannot be shared across backends via the cache —
@@ -213,6 +228,64 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 			} else if closeType == 'S' && closeName == "" {
 				// Closing the unnamed statement — no mapping needed.
 			}
+		}
+	}
+
+	// --- Phase 1.5: intercept LISTEN/UNLISTEN/NOTIFY from extended protocol ---
+	// If the Parse contained one of these special commands, drain the rest of
+	// the buffered pipeline (no backend involvement) and dispatch to the handler.
+	// We send CommandComplete + ReadyForQuery for the Sync case; for Flush we
+	// send nothing extra (client will send Bind+Execute+Sync next, which we also
+	// intercept via the same specialCmd path if it re-parses, or just discard).
+	if specialCmd != SimpleQueryOther {
+		// LISTEN/UNLISTEN/NOTIFY arrived via extended protocol (e.g. asyncpg
+		// execute()). The pipeline may have ended with Flush (H), meaning
+		// the client will immediately send a follow-up Bind+Execute+Sync pipeline
+		// expecting to execute the prepared statement. Since we intercepted the
+		// Parse and never sent it to any backend, we must consume and discard
+		// that follow-up pipeline and respond synthetically, otherwise the client
+		// will send B referencing a non-existent unnamed prepared statement.
+		if pipeline[len(pipeline)-1].msgType == 'H' {
+			// Pipeline ended with Flush (H): asyncpg sends P+D+H then B+E+S as
+			// two separate pipelines. We must respond to both synthetically.
+			//
+			// Response to P (Parse): ParseComplete
+			if err := client.WriteMessage('1', nil); err != nil {
+				return err
+			}
+			// Response to D(S) (Describe statement): ParameterDescription (0 params) + NoData
+			paramDesc := []byte{0, 0} // int16 = 0 parameters
+			if err := client.WriteMessage('t', paramDesc); err != nil {
+				return err
+			}
+			if err := client.WriteMessage('n', nil); err != nil { // NoData
+				return err
+			}
+			// No ReadyForQuery after Flush — client continues with B+E+S.
+			// Drain the follow-up Bind+Execute+Sync pipeline from the wire.
+			for {
+				mt, _, err := client.ReadMessage()
+				if err != nil {
+					return err
+				}
+				if mt == 'S' || mt == 'H' {
+					break
+				}
+			}
+			// Response to B+E+S: BindComplete + CommandComplete + ReadyForQuery.
+			if err := client.WriteMessage('2', nil); err != nil { // BindComplete
+				return err
+			}
+		}
+		// For Sync-terminated pipelines (or after handling the Flush follow-up),
+		// dispatch to the handler which sends CommandComplete + ReadyForQuery.
+		switch specialCmd {
+		case SimpleQueryListen:
+			return p.handleListen(client, specialSQL)
+		case SimpleQueryUnlisten:
+			return p.handleUnlisten(client, specialSQL)
+		case SimpleQueryNotify:
+			return p.handleNotify(client, specialSQL)
 		}
 	}
 

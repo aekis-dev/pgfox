@@ -48,8 +48,9 @@ type Target struct {
 	// --- Runtime: connection budget ---
 	// totalOpen is the count of all open backend connections on this target
 	// across all pools plus the privileged conn. Only the target goroutine
-	// writes this — no atomic needed.
-	totalOpen int
+	// writes this. atomicTotalOpen mirrors it for safe cross-goroutine reads.
+	totalOpen       int
+	atomicTotalOpen atomic.Int32
 
 	// serverMaxConns and serverOpenConns are updated by the stats ticker
 	// from pg_stat_activity. They reflect the real PostgreSQL server state
@@ -509,6 +510,7 @@ func (t *Target) openPrivilegedConn(p *Server, logger *Logger) error {
 
 		t.conn = conn
 		t.totalOpen++
+		t.atomicTotalOpen.Store(int32(t.totalOpen))
 
 		for k, v := range conn.parameters {
 			t.params[k] = v
@@ -663,6 +665,7 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 		logger.Warn("Privileged connection dead, replacing")
 		t.conn.conn.Close()
 		t.totalOpen--
+		t.atomicTotalOpen.Store(int32(t.totalOpen))
 		t.conn = nil
 
 		pgfoxCert, err := p.loadOrGenerateUserCert(p.config.Server.PgFoxRole)
@@ -670,6 +673,7 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 			if conn, err := p.createCertBackendConnection(t, "postgres", p.config.Server.PgFoxRole, pgfoxCert); err == nil {
 				t.conn = conn
 				t.totalOpen++
+				t.atomicTotalOpen.Store(int32(t.totalOpen))
 				if err := t.deployPrivilegedStmts(logger); err != nil {
 					logger.WithError(err).Warn("Failed to deploy privileged stmts after reconnect")
 				}
@@ -704,6 +708,7 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 						"user", pool.username)
 					conn.conn.Close()
 					t.totalOpen--
+					t.atomicTotalOpen.Store(int32(t.totalOpen))
 					pool.removeFromAllConns(conn)
 					atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
 				} else {
@@ -712,6 +717,7 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 					default:
 						conn.conn.Close()
 						t.totalOpen--
+						t.atomicTotalOpen.Store(int32(t.totalOpen))
 						pool.removeFromAllConns(conn)
 					}
 				}
@@ -859,6 +865,7 @@ func (t *Target) drain(p *Server, logger *Logger) {
 		case conn := <-t.closeCh:
 			conn.conn.Close()
 			t.totalOpen--
+			t.atomicTotalOpen.Store(int32(t.totalOpen))
 		default:
 			goto drainPools
 		}
@@ -873,6 +880,7 @@ drainPools:
 			case conn := <-pool.backendPool:
 				conn.conn.Close()
 				t.totalOpen--
+				t.atomicTotalOpen.Store(int32(t.totalOpen))
 			default:
 				goto nextPool
 			}
@@ -883,6 +891,7 @@ drainPools:
 	if t.conn != nil {
 		t.conn.conn.Close()
 		t.totalOpen--
+		t.atomicTotalOpen.Store(int32(t.totalOpen))
 		t.conn = nil
 	}
 
@@ -918,6 +927,7 @@ func (t *Target) openOne(p *Server, pool *Pool, logger *Logger, reason string) {
 		// backendPool full — shouldn't happen but guard.
 		conn.conn.Close()
 		t.totalOpen--
+		t.atomicTotalOpen.Store(int32(t.totalOpen))
 		pool.allConns = pool.allConns[:len(pool.allConns)-1]
 	}
 }
@@ -929,6 +939,7 @@ func (t *Target) closeOneIdle(p *Server, pool *Pool, logger *Logger) bool {
 	case conn := <-pool.backendPool:
 		conn.conn.Close()
 		t.totalOpen--
+		t.atomicTotalOpen.Store(int32(t.totalOpen))
 		pool.removeFromAllConns(conn)
 		atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
 		logger.Debug("Shrunk pool",
