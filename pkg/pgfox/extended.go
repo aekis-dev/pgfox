@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"encoding/binary"

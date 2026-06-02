@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"fmt"
@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/aekis-dev/pgfox/pkg/logger"
 )
 
 // pipelineMsg holds a single buffered extended query protocol message.
@@ -22,7 +24,7 @@ type pipelineMsg struct {
 // (Parse, Bind, Execute, Sync) without waiting for individual responses.
 // We buffer the full pipeline up to Sync or Flush before forwarding to
 // the backend — PostgreSQL won't respond until it receives Sync or Flush.
-func (p *Server) handleClientMessage(client *ClientConnection) error {
+func (p *Server) HandleClientMessage(client *Client) error {
 	msgType, body, err := client.ReadMessage()
 	if err != nil {
 		if err == io.EOF {
@@ -50,7 +52,7 @@ func (p *Server) handleClientMessage(client *ClientConnection) error {
 
 	default:
 		// Extended query protocol — buffer full pipeline until Sync or Flush.
-		// Borrow a pooled slice; executeExtendedPipeline returns it to the pool.
+		// Borrow a pooled slice; executeExtendedPipeline returns it to the Pool.
 		pp := getPipeline()
 		*pp = append(*pp, pipelineMsg{msgType, body})
 		complete := msgType == Sync || msgType == 'H'
@@ -88,8 +90,8 @@ func (p *Server) handleClientMessage(client *ClientConnection) error {
 // Connection pinning rules (unchanged from before):
 //   - Named statements from the client that we can't remap → pin
 //   - Open transactions (ReadyForQuery reports 'T' or 'E') → pin
-//   - All other cases → return to pool after Sync
-func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelineMsg) error {
+//   - All other cases → return to Pool after Sync
+func (p *Server) executeExtendedPipeline(client *Client, pp *[]pipelineMsg) error {
 	pipeline := *pp
 	logger := client.Logger()
 
@@ -153,7 +155,7 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 				// Named statement that we can manage in the shared cache.
 				pool := p.getPool(client.GetDatabase(), client.GetUser())
 				if pool != nil {
-					entry, isNew := pool.target.stmtCache.GetOrRegister(
+					entry, isNew := pool.Target.StmtCache.GetOrRegister(
 						result.Hash, result.CanonicalSQL, querySQL, len(result.Values))
 					if isNew {
 						logger.Debug("Registered prepared statement via extended protocol",
@@ -290,31 +292,31 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 	}
 
 	// --- Phase 2: acquire backend ---
-	backend := client.GetBackendConnection()
+	backend := client.GetBackend()
 	wasPinned := backend != nil
 
 	if backend == nil {
 		pool := p.getPool(client.GetDatabase(), client.GetUser())
 		if pool == nil {
-			return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+			return client.SendErrorResponse("FATAL", "53300", "no Pool available")
 		}
 		var err error
-		backend, err = pool.borrowConn(p.ctx)
+		backend, err = pool.borrowConn(p.Context)
 		if err != nil {
 			logger.WithError(err).Error("Failed to borrow backend for extended query")
-			return sendErrorResponse(client, "FATAL", "53300", "too many connections")
+			return client.SendErrorResponse("FATAL", "53300", "too many connections")
 		}
 		if requiresPin {
 			// Non-remappable named statement: pin immediately.
-			client.SetBackendConnection(backend)
+			client.SetBackend(backend)
 			backend.SetClient(client)
 			client.SetInTransaction(true)
 		}
 	}
 
-	if p.config.Server.QueryTimeout > 0 {
-		if conn, ok := backend.conn.(net.Conn); ok {
-			conn.SetReadDeadline(time.Now().Add(p.config.Server.QueryTimeout))
+	if p.Config.Server.QueryTimeout > 0 {
+		if conn, ok := backend.Conn.(net.Conn); ok {
+			conn.SetReadDeadline(time.Now().Add(p.Config.Server.QueryTimeout))
 			defer conn.SetReadDeadline(time.Time{})
 		}
 	}
@@ -344,29 +346,29 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 		pool := p.getPool(client.GetDatabase(), client.GetUser())
 		if pool == nil {
 			backend.Release()
-			return sendErrorResponse(client, "ERROR", "26000", "prepared statement not found")
+			return client.SendErrorResponse("ERROR", "26000", "prepared statement not found")
 		}
-		entry := pool.target.stmtCache.Get(hash)
+		entry := pool.Target.StmtCache.Get(hash)
 		if entry == nil {
 			backend.Release()
-			return sendErrorResponse(client, "ERROR", "26000", "prepared statement not found")
+			return client.SendErrorResponse("ERROR", "26000", "prepared statement not found")
 		}
 		// Send Parse + Sync to deploy the statement.
 		parseBody := BuildParseBody(StmtName(hash), entry.CanonicalSQL, nil)
 		if err := backend.WriteMessage('P', parseBody); err != nil {
 			backend.Release()
-			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 		if err := backend.WriteMessage('S', []byte{}); err != nil {
 			backend.Release()
-			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 		// Read until ReadyForQuery, expecting ParseComplete then ReadyForQuery.
 		for {
 			mt, body, err := backend.ReadMessage()
 			if err != nil {
 				backend.Release()
-				return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+				return client.SendErrorResponse("ERROR", "08006", "connection failure")
 			}
 			PutMsgBody(body)
 			if mt == '1' { // ParseComplete
@@ -374,7 +376,7 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 				logger.Debug("Synthesized Parse deployed", "hash", hash)
 			} else if mt == 'E' { // ErrorResponse
 				backend.Release()
-				return sendErrorResponse(client, "ERROR", "26000", "failed to deploy prepared statement")
+				return client.SendErrorResponse("ERROR", "26000", "failed to deploy prepared statement")
 			} else if mt == 'Z' { // ReadyForQuery
 				break
 			}
@@ -388,7 +390,12 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 		if m.msgType == 'P' {
 			if hash, ok := remappedParses[i]; ok {
 				if backend.HasStmt(hash) {
-					// Already deployed — skip Parse, backend won't send ParseComplete.
+					// Already deployed — skip Parse to backend, but synthesize
+					// ParseComplete to the client (it sent Parse and expects a response).
+					if err := client.WriteMessage('1', nil); err != nil {
+						backend.Release()
+						return err
+					}
 					continue
 				}
 				// Will be sent — record hash so we can mark it on ParseComplete.
@@ -399,7 +406,7 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 			logger.WithError(err).Error("Failed to forward extended query message",
 				"msg_type", string(m.msgType))
 			backend.Release()
-			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 	}
 
@@ -414,7 +421,7 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 		}
 		// wasPinned tracks state before this pipeline. If we pinned during this
 		// pipeline (requiresPin=true), reconcileConn must also treat it as pinned
-		// so it correctly unsets SetBackendConnection on a clean 'I' status.
+		// so it correctly unsets SetBackend on a clean 'I' status.
 		p.reconcileConn(client, backend, txStatus, wasPinned || requiresPin, logger)
 	} else { // Flush ('H')
 		if err := p.drainFlushResponse(client, backend, sentParseHashes); err != nil {
@@ -425,7 +432,7 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 		// If we acquired it for this pipeline without pinning, keep it associated
 		// temporarily — the next Sync will trigger reconcileConn.
 		if !wasPinned && !requiresPin {
-			client.SetBackendConnection(backend)
+			client.SetBackend(backend)
 			backend.SetClient(client)
 		}
 	}
@@ -439,7 +446,7 @@ func (p *Server) executeExtendedPipeline(client *ClientConnection, pp *[]pipelin
 //
 // This is separate from forwardPreparedResponse because in the extended protocol
 // the client expects to receive ParseComplete and BindComplete messages.
-func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *BackendConnection, sentParseHashes []string, logger *Logger) (byte, error) {
+func (p *Server) forwardExtendedResponse(client *Client, backend *Backend, sentParseHashes []string, logger *logger.Logger) (byte, error) {
 	// sentParseHashes lists, in order, the hashes of Parse messages that were
 	// actually forwarded to the backend this pipeline. ParseComplete responses
 	// arrive in that same order; we mark each hash deployed as we see them.
@@ -449,9 +456,9 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
 			if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
-				return 0, sendErrorResponse(client, "ERROR", "57014", "query timeout")
+				return 0, client.SendErrorResponse("ERROR", "57014", "query timeout")
 			}
-			return 0, sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return 0, client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 
 		// Each ParseComplete corresponds to a forwarded Parse in pipeline order.
@@ -461,7 +468,7 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 		}
 
 		writeErr := client.WriteMessage(msgType, body)
-		// Extract status before returning body to pool.
+		// Extract status before returning body to Pool.
 		var status byte
 		if msgType == 'Z' && len(body) > 0 {
 			status = body[0]
@@ -485,7 +492,7 @@ func (p *Server) forwardExtendedResponse(client *ClientConnection, backend *Back
 
 // executeQuery handles a simple query ('Q') from the client.
 // Transaction state is driven by the ReadyForQuery status byte.
-func (p *Server) executeQuery(client *ClientConnection, query string) error {
+func (p *Server) executeQuery(client *Client, query string) error {
 	logger := client.Logger()
 
 	// Single parse pass: classify special commands AND attempt parameterization
@@ -510,40 +517,40 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 	}
 
 	// --- Fallback: simple query protocol (original path) ---
-	var backend *BackendConnection
+	var backend *Backend
 
 	if pinned {
-		backend = client.GetBackendConnection()
+		backend = client.GetBackend()
 		if backend == nil {
-			logger.Warn("In transaction but no pinned backend, borrowing from pool")
+			logger.Warn("In transaction but no pinned backend, borrowing from Pool")
 			pool := p.getPool(client.GetDatabase(), client.GetUser())
 			if pool == nil {
-				return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+				return client.SendErrorResponse("FATAL", "53300", "no Pool available")
 			}
 			var err error
-			backend, err = pool.borrowConn(p.ctx)
+			backend, err = pool.borrowConn(p.Context)
 			if err != nil {
-				return sendErrorResponse(client, "FATAL", "53300", "too many connections")
+				return client.SendErrorResponse("FATAL", "53300", "too many connections")
 			}
-			client.SetBackendConnection(backend)
+			client.SetBackend(backend)
 			backend.SetClient(client)
 		}
 	} else {
 		pool := p.getPool(client.GetDatabase(), client.GetUser())
 		if pool == nil {
-			return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+			return client.SendErrorResponse("FATAL", "53300", "no Pool available")
 		}
 		var err error
-		backend, err = pool.borrowConn(p.ctx)
+		backend, err = pool.borrowConn(p.Context)
 		if err != nil {
 			logger.WithError(err).Error("Failed to borrow backend connection")
-			return sendErrorResponse(client, "FATAL", "53300", "too many connections")
+			return client.SendErrorResponse("FATAL", "53300", "too many connections")
 		}
 	}
 
-	if p.config.Server.QueryTimeout > 0 {
-		if conn, ok := backend.conn.(net.Conn); ok {
-			conn.SetReadDeadline(time.Now().Add(p.config.Server.QueryTimeout))
+	if p.Config.Server.QueryTimeout > 0 {
+		if conn, ok := backend.Conn.(net.Conn); ok {
+			conn.SetReadDeadline(time.Now().Add(p.Config.Server.QueryTimeout))
 			defer conn.SetReadDeadline(time.Time{})
 		}
 	}
@@ -551,7 +558,7 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 	if err := p.forwardQueryToBackend(backend, query); err != nil {
 		logger.WithError(err).Error("Failed to forward query to backend")
 		backend.Release()
-		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		return client.SendErrorResponse("ERROR", "08006", "connection failure")
 	}
 
 	txStatus, err := p.forwardCompleteBackendResponse(client, backend)
@@ -564,7 +571,7 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 	if pool := p.getPool(client.GetDatabase(), client.GetUser()); pool != nil {
 		atomic.AddInt64(&pool.stats.QueriesExecuted, 1)
 	}
-	atomic.AddInt64(&p.stats.TotalQueries, 1)
+	atomic.AddInt64(&p.GlobalStats.TotalQueries, 1)
 
 	p.reconcileConn(client, backend, txStatus, pinned, logger)
 
@@ -574,20 +581,20 @@ func (p *Server) executeQuery(client *ClientConnection, query string) error {
 // executeAsPrepared serves a simple query through the extended protocol using
 // the target-level prepared statement cache. It:
 //  1. Registers the canonical statement in the target cache (or finds existing).
-//  2. Borrows a backend connection from the pool.
+//  2. Borrows a backend connection from the Pool.
 //  3. Sends Parse to the backend only if this backend hasn't seen this statement.
 //  4. Sends Bind (text params, binary results) + Execute + Sync.
 //  5. Forwards all responses to the client, translating to what the client
 //     expects from a simple query (CommandComplete + ReadyForQuery).
-//  6. Returns the backend to the pool (no pinning — no transaction opened).
-func (p *Server) executeAsPrepared(client *ClientConnection, originalSQL string, result *ParameterizeResult, logger *Logger) error {
+//  6. Returns the backend to the Pool (no pinning — no transaction opened).
+func (p *Server) executeAsPrepared(client *Client, originalSQL string, result *ParameterizeResult, logger *logger.Logger) error {
 	pool := p.getPool(client.GetDatabase(), client.GetUser())
 	if pool == nil {
-		return sendErrorResponse(client, "FATAL", "53300", "no pool available")
+		return client.SendErrorResponse("FATAL", "53300", "no Pool available")
 	}
 
 	// Register in the target cache.
-	entry, isNew := pool.target.stmtCache.GetOrRegister(
+	entry, isNew := pool.Target.StmtCache.GetOrRegister(
 		result.Hash, result.CanonicalSQL, originalSQL, len(result.Values))
 	if isNew {
 		logger.Debug("Registered new prepared statement",
@@ -596,15 +603,15 @@ func (p *Server) executeAsPrepared(client *ClientConnection, originalSQL string,
 			"sql", result.CanonicalSQL)
 	}
 
-	backend, err := pool.borrowConn(p.ctx)
+	backend, err := pool.borrowConn(p.Context)
 	if err != nil {
 		logger.WithError(err).Error("Failed to borrow backend for prepared query")
-		return sendErrorResponse(client, "FATAL", "53300", "too many connections")
+		return client.SendErrorResponse("FATAL", "53300", "too many connections")
 	}
 
-	if p.config.Server.QueryTimeout > 0 {
-		if conn, ok := backend.conn.(net.Conn); ok {
-			conn.SetReadDeadline(time.Now().Add(p.config.Server.QueryTimeout))
+	if p.Config.Server.QueryTimeout > 0 {
+		if conn, ok := backend.Conn.(net.Conn); ok {
+			conn.SetReadDeadline(time.Now().Add(p.Config.Server.QueryTimeout))
 			defer conn.SetReadDeadline(time.Time{})
 		}
 	}
@@ -616,7 +623,7 @@ func (p *Server) executeAsPrepared(client *ClientConnection, originalSQL string,
 		parseBody := BuildParseBody(stmtName, result.CanonicalSQL, nil)
 		if err := backend.WriteMessage('P', parseBody); err != nil {
 			backend.Release()
-			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 	}
 
@@ -630,20 +637,20 @@ func (p *Server) executeAsPrepared(client *ClientConnection, originalSQL string,
 	)
 	if err := backend.WriteMessage('B', bindBody); err != nil {
 		backend.Release()
-		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		return client.SendErrorResponse("ERROR", "08006", "connection failure")
 	}
 
 	// Execute the unnamed portal.
 	execBody := BuildExecuteBody("", 0)
 	if err := backend.WriteMessage('E', execBody); err != nil {
 		backend.Release()
-		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		return client.SendErrorResponse("ERROR", "08006", "connection failure")
 	}
 
 	// Sync — backend will now respond and send ReadyForQuery.
 	if err := backend.WriteMessage('S', SyncBody); err != nil {
 		backend.Release()
-		return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+		return client.SendErrorResponse("ERROR", "08006", "connection failure")
 	}
 
 	// Read responses. If we just sent Parse for the first time, the first
@@ -658,10 +665,10 @@ func (p *Server) executeAsPrepared(client *ClientConnection, originalSQL string,
 	}
 
 	atomic.AddInt64(&pool.stats.QueriesExecuted, 1)
-	atomic.AddInt64(&p.stats.TotalQueries, 1)
+	atomic.AddInt64(&p.GlobalStats.TotalQueries, 1)
 	entry.RecordExecution()
 
-	// Prepared statement execution is always stateless from the pool's perspective
+	// Prepared statement execution is always stateless from the Pool's perspective
 	// (ReadyForQuery will report 'I' since we didn't open a transaction).
 	p.reconcileConn(client, backend, txStatus, false, logger)
 
@@ -681,19 +688,19 @@ func (p *Server) executeAsPrepared(client *ClientConnection, originalSQL string,
 //   - ErrorResponse ('E')   → forwarded as-is
 //   - ReadyForQuery ('Z')   → forwarded as-is, loop exits
 func (p *Server) forwardPreparedResponse(
-	client *ClientConnection,
-	backend *BackendConnection,
+	client *Client,
+	backend *Backend,
 	hash string,
 	entry *CachedStmt,
-	logger *Logger,
+	logger *logger.Logger,
 ) (byte, error) {
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
 			if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
-				return 0, sendErrorResponse(client, "ERROR", "57014", "query timeout")
+				return 0, client.SendErrorResponse("ERROR", "57014", "query timeout")
 			}
-			return 0, sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return 0, client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 
 		switch msgType {
@@ -744,11 +751,11 @@ func (p *Server) forwardPreparedResponse(
 //   - PostgreSQL reports 'T' or 'E' (inside a transaction), OR
 //   - Named prepared statements exist on this backend (must go to same backend)
 func (p *Server) reconcileConn(
-	client *ClientConnection,
-	backend *BackendConnection,
+	client *Client,
+	backend *Backend,
 	txStatus byte,
 	wasPinned bool,
-	logger *Logger,
+	logger *logger.Logger,
 ) {
 	hasNamedStmts := client.HasNamedStatements()
 
@@ -756,7 +763,7 @@ func (p *Server) reconcileConn(
 	case 'T', 'E':
 		if !wasPinned {
 			logger.Debug("Transaction opened — pinning connection", "tx_status", string(txStatus))
-			client.SetBackendConnection(backend)
+			client.SetBackend(backend)
 			backend.SetClient(client)
 			client.SetInTransaction(true)
 		}
@@ -765,38 +772,38 @@ func (p *Server) reconcileConn(
 		if hasNamedStmts {
 			// Keep pinned — named statements live on this specific backend.
 			if !wasPinned {
-				client.SetBackendConnection(backend)
+				client.SetBackend(backend)
 				backend.SetClient(client)
 				client.SetInTransaction(true)
 			}
 			logger.Debug("Keeping connection pinned for named statements",
 				"count", client.namedStmts)
 		} else if wasPinned {
-			logger.Debug("Transaction closed — returning connection to pool")
-			client.SetBackendConnection(nil)
+			logger.Debug("Transaction closed — returning connection to Pool")
+			client.SetBackend(nil)
 			backend.SetClient(nil)
 			client.SetInTransaction(false)
-			returnConn(backend)
+			backend.Return()
 		} else {
-			returnConn(backend)
+			backend.Return()
 		}
 
 	default:
 		logger.Warn("Unknown ReadyForQuery status, returning connection",
 			"status", string(txStatus))
 		if wasPinned && !hasNamedStmts {
-			client.SetBackendConnection(nil)
+			client.SetBackend(nil)
 			backend.SetClient(nil)
 			client.SetInTransaction(false)
 		}
-		returnConn(backend)
+		backend.Return()
 	}
 }
 
 // drainFlushResponse reads backend responses after a Flush message.
 // PostgreSQL does NOT send ReadyForQuery after Flush — only after Sync.
 // The response to Parse+Describe+Flush ends with RowDescription('T') or NoData('n').
-func (p *Server) drainFlushResponse(client *ClientConnection, backend *BackendConnection, sentParseHashes []string) error {
+func (p *Server) drainFlushResponse(client *Client, backend *Backend, sentParseHashes []string) error {
 	logger := client.Logger()
 	// ParseComplete responses arrive in the same order as the Parse messages
 	// that were sent. Mark each hash as deployed so phase 3.5 does not
@@ -806,7 +813,7 @@ func (p *Server) drainFlushResponse(client *ClientConnection, backend *BackendCo
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
 			logger.WithError(err).Error("Failed to read response after flush")
-			return sendErrorResponse(client, "ERROR", "08006", "connection failure")
+			return client.SendErrorResponse("ERROR", "08006", "connection failure")
 		}
 
 		if msgType == '1' && parseIdx < len(sentParseHashes) {
@@ -830,7 +837,7 @@ func (p *Server) drainFlushResponse(client *ClientConnection, backend *BackendCo
 }
 
 // forwardQueryToBackend sends a simple query to the backend.
-func (p *Server) forwardQueryToBackend(backend *BackendConnection, query string) error {
+func (p *Server) forwardQueryToBackend(backend *Backend, query string) error {
 	return backend.WriteMessage('Q', []byte(query+"\x00"))
 }
 
@@ -840,7 +847,7 @@ func (p *Server) forwardQueryToBackend(backend *BackendConnection, query string)
 //	'I' — idle (not in a transaction)
 //	'T' — in a transaction block
 //	'E' — in a failed transaction block
-func (p *Server) forwardCompleteBackendResponse(client *ClientConnection, backend *BackendConnection) (byte, error) {
+func (p *Server) forwardCompleteBackendResponse(client *Client, backend *Backend) (byte, error) {
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
@@ -876,7 +883,7 @@ func (p *Server) forwardCompleteBackendResponse(client *ClientConnection, backen
 // transaction status byte. Used after Sync in executeExtendedPipeline.
 // Kept as a thin wrapper over forwardExtendedResponse for callers in
 // listen_notify.go and similar that don't need the extended name-remapping path.
-func (p *Server) forwardUntilReady(client *ClientConnection, backend *BackendConnection) (byte, error) {
+func (p *Server) forwardUntilReady(client *Client, backend *Backend) (byte, error) {
 	// No remapped Parse messages — pass nil so no MarkStmt calls are made.
 	return p.forwardExtendedResponse(client, backend, nil, client.Logger())
 }

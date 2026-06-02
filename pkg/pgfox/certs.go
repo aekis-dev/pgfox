@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"crypto/rand"
@@ -72,7 +72,7 @@ func (p *Server) loadCACertPool() (*x509.CertPool, error) {
 
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("failed to parse CA cert into pool")
+		return nil, fmt.Errorf("failed to parse CA cert into Pool")
 	}
 
 	return pool, nil
@@ -91,11 +91,11 @@ func (p *Server) loadOrGenerateUserCert(username string) (tls.Certificate, error
 	if p.isCertValidForCA(certPath, false) {
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err == nil {
-			p.logger.Debug("Using cached user certificate", "user", username, "cert", certPath)
+			p.Logger.Debug("Using cached user certificate", "user", username, "cert", certPath)
 			return cert, nil
 		}
 		// Key or cert unreadable — regenerate
-		p.logger.Debug("Cached cert unreadable, regenerating", "user", username, "err", err)
+		p.Logger.Debug("Cached cert unreadable, regenerating", "user", username, "err", err)
 	}
 
 	return p.generateAndCacheUserCert(username)
@@ -160,7 +160,7 @@ func (p *Server) isCertValidForCA(certPath string, requireSAN bool) bool {
 // username, signs it with the CA, caches it to disk, and returns it.
 // The certificate CN is set to the username for PostgreSQL cert auth.
 func (p *Server) generateAndCacheUserCert(username string) (tls.Certificate, error) {
-	p.logger.Info("Generating user certificate", "user", username)
+	p.Logger.Info("Generating user certificate", "user", username)
 
 	caCert, caKey, err := p.loadCA()
 	if err != nil {
@@ -179,7 +179,7 @@ func (p *Server) generateAndCacheUserCert(username string) (tls.Certificate, err
 		return tls.Certificate{}, fmt.Errorf("failed to generate serial number: %w", err)
 	}
 
-	cfg := p.config.Server.Certs
+	cfg := p.Config.Server.Certs
 	now := time.Now()
 
 	template := &x509.Certificate{
@@ -240,7 +240,7 @@ func (p *Server) generateAndCacheUserCert(username string) (tls.Certificate, err
 	}
 	keyFile.Close()
 
-	p.logger.Info("User certificate generated and cached",
+	p.Logger.Info("User certificate generated and cached",
 		"user", username,
 		"cert", certPath,
 		"expires", template.NotAfter.Format(time.RFC3339))
@@ -255,7 +255,7 @@ func (p *Server) generateAndCacheUserCert(username string) (tls.Certificate, err
 func (p *Server) backendTLSConfig(host string, clientCert tls.Certificate) (*tls.Config, error) {
 	caPool, err := p.loadCACertPool()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load CA pool for backend TLS: %w", err)
+		return nil, fmt.Errorf("failed to load CA Pool for backend TLS: %w", err)
 	}
 
 	return &tls.Config{
@@ -271,43 +271,43 @@ func (p *Server) backendTLSConfig(host string, clientCert tls.Certificate) (*tls
 // Path helper methods — all paths derived from pgfox_dir
 
 func (p *Server) caCertPath() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "ca.crt")
+	return filepath.Join(p.Config.Server.PgFoxDir, "ca.crt")
 }
 
 func (p *Server) caKeyPath() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "ca.key")
+	return filepath.Join(p.Config.Server.PgFoxDir, "ca.key")
 }
 
 // serverCertPath returns the path for the PostgreSQL server certificate.
 // Operators copy this to $PGDATA and set ssl_cert_file in postgresql.conf.
 func (p *Server) serverCertPath() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "server.crt")
+	return filepath.Join(p.Config.Server.PgFoxDir, "server.crt")
 }
 
 func (p *Server) serverKeyPath() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "server.key")
+	return filepath.Join(p.Config.Server.PgFoxDir, "server.key")
 }
 
 // pgfoxTLSCertPath returns the path for the PgFox client-facing TLS cert.
 // CN=Hostname — must match what clients use to connect to PgFox.
 func (p *Server) pgfoxTLSCertPath() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "pgfox.crt")
+	return filepath.Join(p.Config.Server.PgFoxDir, "pgfox.crt")
 }
 
 func (p *Server) pgfoxTLSKeyPath() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "pgfox.key")
+	return filepath.Join(p.Config.Server.PgFoxDir, "pgfox.key")
 }
 
 func (p *Server) certsDir() string {
-	return filepath.Join(p.config.Server.PgFoxDir, "certs")
+	return filepath.Join(p.Config.Server.PgFoxDir, "certs")
 }
 
 func (p *Server) pgfoxCertPath() string {
-	return filepath.Join(p.certsDir(), p.config.Server.PgFoxRole+".crt")
+	return filepath.Join(p.certsDir(), p.Config.Server.PgFoxRole+".crt")
 }
 
 func (p *Server) pgfoxKeyPath() string {
-	return filepath.Join(p.certsDir(), p.config.Server.PgFoxRole+".key")
+	return filepath.Join(p.certsDir(), p.Config.Server.PgFoxRole+".key")
 }
 
 func (p *Server) userCertPath(username string) string {
@@ -334,8 +334,8 @@ func (p *Server) userKeyPath(username string) string {
 // Both server.crt and pgfox.crt include proper SANs required by Go 1.15+.
 // Operators copy server.crt/key to $PGDATA and configure postgresql.conf.
 func (p *Server) ensureBootstrapCerts() error {
-	if err := os.MkdirAll(p.config.Server.PgFoxDir, 0700); err != nil {
-		return fmt.Errorf("failed to create pgfox_dir %s: %w", p.config.Server.PgFoxDir, err)
+	if err := os.MkdirAll(p.Config.Server.PgFoxDir, 0700); err != nil {
+		return fmt.Errorf("failed to create pgfox_dir %s: %w", p.Config.Server.PgFoxDir, err)
 	}
 
 	if err := p.ensureCA(); err != nil {
@@ -349,8 +349,8 @@ func (p *Server) ensureBootstrapCerts() error {
 
 	// PostgreSQL server cert — CN+SAN = first target host
 	serverHost := "localhost"
-	if len(p.config.Targets) > 0 {
-		serverHost = p.config.Targets[0].Host
+	if len(p.Config.Targets) > 0 {
+		serverHost = p.Config.Targets[0].Host
 	}
 	if err := p.ensureSignedCert(
 		p.serverCertPath(), p.serverKeyPath(),
@@ -362,17 +362,17 @@ func (p *Server) ensureBootstrapCerts() error {
 	// PgFox client-facing TLS cert — CN+SAN = Hostname
 	if err := p.ensureSignedCert(
 		p.pgfoxTLSCertPath(), p.pgfoxTLSKeyPath(),
-		p.config.Server.Hostname, "PgFox Server", caCert, caKey,
+		p.Config.Server.Hostname, "PgFox Server", caCert, caKey,
 	); err != nil {
 		return fmt.Errorf("pgfox TLS cert setup failed: %w", err)
 	}
 
-	p.logger.Info("Bootstrap certificates ready",
+	p.Logger.Info("Bootstrap certificates ready",
 		"ca", p.caCertPath(),
 		"server_cert", p.serverCertPath(),
 		"pgfox_cert", p.pgfoxTLSCertPath())
 
-	p.logger.Info("PostgreSQL server setup — copy these files to $PGDATA:",
+	p.Logger.Info("PostgreSQL server setup — copy these files to $PGDATA:",
 		"ssl_cert_file", p.serverCertPath(),
 		"ssl_key_file", p.serverKeyPath(),
 		"ssl_ca_file", p.caCertPath())
@@ -386,15 +386,15 @@ func (p *Server) ensureCA() error {
 	caKeyExists := fileExists(p.caKeyPath())
 
 	if caCertExists && caKeyExists {
-		p.logger.Debug("CA already exists", "path", p.caCertPath())
+		p.Logger.Debug("CA already exists", "path", p.caCertPath())
 		return nil
 	}
 	if caCertExists != caKeyExists {
-		p.logger.Warn("CA cert and key inconsistent — regenerating both",
+		p.Logger.Warn("CA cert and key inconsistent — regenerating both",
 			"cert_exists", caCertExists, "key_exists", caKeyExists)
 	}
 
-	p.logger.Info("Generating CA certificate", "path", p.caCertPath())
+	p.Logger.Info("Generating CA certificate", "path", p.caCertPath())
 
 	caKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
@@ -406,7 +406,7 @@ func (p *Server) ensureCA() error {
 		return fmt.Errorf("failed to generate CA serial: %w", err)
 	}
 
-	cfg := p.config.Server.Certs
+	cfg := p.Config.Server.Certs
 	now := time.Now()
 
 	template := &x509.Certificate{
@@ -437,7 +437,7 @@ func (p *Server) ensureCA() error {
 		return fmt.Errorf("failed to write CA key: %w", err)
 	}
 
-	p.logger.Info("CA certificate generated",
+	p.Logger.Info("CA certificate generated",
 		"cert", p.caCertPath(),
 		"expires", template.NotAfter.Format(time.RFC3339))
 
@@ -451,11 +451,11 @@ func (p *Server) ensureSignedCert(certPath, keyPath, cn, ou string,
 	caCert *x509.Certificate, caKey *rsa.PrivateKey) error {
 
 	if p.isCertValidForCA(certPath, true) {
-		p.logger.Debug("Certificate already valid", "path", certPath, "cn", cn)
+		p.Logger.Debug("Certificate already valid", "path", certPath, "cn", cn)
 		return nil
 	}
 
-	p.logger.Info("Generating certificate", "path", certPath, "cn", cn)
+	p.Logger.Info("Generating certificate", "path", certPath, "cn", cn)
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -467,7 +467,7 @@ func (p *Server) ensureSignedCert(certPath, keyPath, cn, ou string,
 		return fmt.Errorf("failed to generate serial for %s: %w", cn, err)
 	}
 
-	cfg := p.config.Server.Certs
+	cfg := p.Config.Server.Certs
 	now := time.Now()
 
 	// Go 1.15+ requires SANs for server certificate hostname verification.
@@ -510,7 +510,7 @@ func (p *Server) ensureSignedCert(certPath, keyPath, cn, ou string,
 		return fmt.Errorf("failed to write key %s: %w", keyPath, err)
 	}
 
-	p.logger.Info("Certificate generated",
+	p.Logger.Info("Certificate generated",
 		"path", certPath,
 		"cn", cn,
 		"expires", template.NotAfter.Format(time.RFC3339))

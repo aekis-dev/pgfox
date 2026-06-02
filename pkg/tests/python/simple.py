@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PgFox simple threaded test suite.
-Tests concurrent queries, transactions, and connection pool behavior.
+Tests concurrent queries, transactions, and connection Pool behavior.
 
 Requirements:
     pip install psycopg2-binary requests

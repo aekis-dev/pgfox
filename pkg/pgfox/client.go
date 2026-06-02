@@ -1,16 +1,19 @@
-package main
+package pgfox
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aekis-dev/pgfox/pkg/logger"
 )
 
-// ClientConnection represents a client connection.
+// Client represents a client connection.
 //
 // Lock discipline — two separate locks instead of one coarse mutex:
 //
@@ -19,16 +22,16 @@ import (
 //     concurrent writer; every other write is from the owning client goroutine.
 //
 //   - sharedMu: protects the small set of fields that genuinely cross goroutine
-//     boundaries: backendConn, lastActivity, listenChannels/isListening.
+//     boundaries: backend, lastActivity, listenChannels/isListening.
 //
 // All other fields (authenticated, database, user, password, inTransaction,
 // namedStmts, connectedAt, stmtNameMap/stmtRevMap) are owned exclusively by
 // the single goroutine handling this client and need no locking.
-type ClientConnection struct {
+type Client struct {
 	conn           net.Conn
 	reader         *bufio.Reader
 	writer         *bufio.Writer
-	backendConn    *BackendConnection
+	backend        *Backend
 	authenticated  bool
 	database       string
 	user           string
@@ -37,7 +40,7 @@ type ClientConnection struct {
 	namedStmts     int // count of named prepared statements active on pinned backend
 	isListening    bool
 	listenChannels map[Channel]bool
-	logger         *Logger
+	logger         *logger.Logger
 	writeMu        sync.Mutex
 	sharedMu       sync.Mutex
 	connectedAt    time.Time
@@ -56,10 +59,10 @@ type ClientConnection struct {
 	msgsSent int64
 }
 
-// NewClientConnection creates a new client connection
-func NewClientConnection(conn net.Conn, logger *Logger, maxMessageSize int) *ClientConnection {
+// NewClient creates a new client connection
+func NewClient(conn net.Conn, logger *logger.Logger, maxMessageSize int) *Client {
 	now := time.Now()
-	return &ClientConnection{
+	return &Client{
 		conn:           conn,
 		reader:         bufio.NewReader(conn),
 		writer:         bufio.NewWriter(conn),
@@ -74,15 +77,15 @@ func NewClientConnection(conn net.Conn, logger *Logger, maxMessageSize int) *Cli
 }
 
 // RemoteAddr returns the client's remote address
-func (c *ClientConnection) RemoteAddr() net.Addr {
+func (c *Client) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
 
 // Close closes the client connection
-func (c *ClientConnection) Close() error {
+func (c *Client) Close() error {
 	c.sharedMu.Lock()
-	bc := c.backendConn
-	c.backendConn = nil
+	bc := c.backend
+	c.backend = nil
 	c.sharedMu.Unlock()
 
 	if bc != nil {
@@ -91,26 +94,26 @@ func (c *ClientConnection) Close() error {
 	return c.conn.Close()
 }
 
-func (c *ClientConnection) IsAuthenticated() bool   { return c.authenticated }
-func (c *ClientConnection) SetAuthenticated(v bool) { c.authenticated = v }
+func (c *Client) IsAuthenticated() bool   { return c.authenticated }
+func (c *Client) SetAuthenticated(v bool) { c.authenticated = v }
 
-func (c *ClientConnection) GetDatabase() string   { return c.database }
-func (c *ClientConnection) SetDatabase(v string)  { c.database = v }
-func (c *ClientConnection) GetUser() string       { return c.user }
-func (c *ClientConnection) SetUser(v string)      { c.user = v }
-func (c *ClientConnection) SetPassword(v string)  { c.password = v }
-func (c *ClientConnection) GetPassword() string   { return c.password }
-func (c *ClientConnection) IsInTransaction() bool { return c.inTransaction }
+func (c *Client) GetDatabase() string   { return c.database }
+func (c *Client) SetDatabase(v string)  { c.database = v }
+func (c *Client) GetUser() string       { return c.user }
+func (c *Client) SetUser(v string)      { c.user = v }
+func (c *Client) SetPassword(v string)  { c.password = v }
+func (c *Client) GetPassword() string   { return c.password }
+func (c *Client) IsInTransaction() bool { return c.inTransaction }
 
-func (c *ClientConnection) AddNamedStatement() { c.namedStmts++ }
-func (c *ClientConnection) RemoveNamedStatement() {
+func (c *Client) AddNamedStatement() { c.namedStmts++ }
+func (c *Client) RemoveNamedStatement() {
 	if c.namedStmts > 0 {
 		c.namedStmts--
 	}
 }
-func (c *ClientConnection) HasNamedStatements() bool { return c.namedStmts > 0 }
+func (c *Client) HasNamedStatements() bool { return c.namedStmts > 0 }
 
-func (c *ClientConnection) SetInTransaction(inTx bool) {
+func (c *Client) SetInTransaction(inTx bool) {
 	c.inTransaction = inTx
 	if inTx {
 		c.logger.Debug("Client entered transaction")
@@ -119,64 +122,64 @@ func (c *ClientConnection) SetInTransaction(inTx bool) {
 	}
 }
 
-func (c *ClientConnection) GetConnectedAt() time.Time { return c.connectedAt }
+func (c *Client) GetConnectedAt() time.Time { return c.connectedAt }
 
 // --- sharedMu-protected accessors ---
 
-func (c *ClientConnection) GetLastActivity() time.Time {
+func (c *Client) GetLastActivity() time.Time {
 	c.sharedMu.Lock()
 	t := c.lastActivity
 	c.sharedMu.Unlock()
 	return t
 }
 
-func (c *ClientConnection) GetBackendConnection() *BackendConnection {
+func (c *Client) GetBackend() *Backend {
 	c.sharedMu.Lock()
-	bc := c.backendConn
+	bc := c.backend
 	c.sharedMu.Unlock()
 	return bc
 }
 
-func (c *ClientConnection) SetBackendConnection(conn *BackendConnection) {
+func (c *Client) SetBackend(conn *Backend) {
 	c.sharedMu.Lock()
-	if c.backendConn != nil && c.backendConn != conn {
+	if c.backend != nil && c.backend != conn {
 		if conn != nil {
 			c.logger.Debug("Replacing existing backend connection")
 		} else {
 			c.logger.Debug("Clearing backend connection reference")
 		}
 	}
-	c.backendConn = conn
+	c.backend = conn
 	c.lastActivity = time.Now()
 	c.sharedMu.Unlock()
 
 	if conn != nil {
-		c.logger.Debug("Backend connection assigned",
+		c.logger.Debug("Queue connection assigned",
 			"backend_addr", conn.RemoteAddr(),
 			"backend_db", conn.GetDatabase())
 	}
 }
 
-func (c *ClientConnection) ShouldKeepBackendConnection() bool {
+func (c *Client) ShouldKeepBackend() bool {
 	return c.inTransaction // single-goroutine field, no lock needed
 }
 
 // --- Listen channel accessors (sharedMu) ---
 
-func (c *ClientConnection) IsListening() bool {
+func (c *Client) IsListening() bool {
 	c.sharedMu.Lock()
 	v := c.isListening
 	c.sharedMu.Unlock()
 	return v
 }
 
-func (c *ClientConnection) SetListening(v bool) {
+func (c *Client) SetListening(v bool) {
 	c.sharedMu.Lock()
 	c.isListening = v
 	c.sharedMu.Unlock()
 }
 
-func (c *ClientConnection) AddListenChannel(ch Channel) {
+func (c *Client) AddListenChannel(ch Channel) {
 	c.sharedMu.Lock()
 	c.listenChannels[ch] = true
 	c.isListening = true
@@ -184,7 +187,7 @@ func (c *ClientConnection) AddListenChannel(ch Channel) {
 	c.sharedMu.Unlock()
 }
 
-func (c *ClientConnection) RemoveListenChannel(ch Channel) {
+func (c *Client) RemoveListenChannel(ch Channel) {
 	c.sharedMu.Lock()
 	delete(c.listenChannels, ch)
 	if len(c.listenChannels) == 0 {
@@ -193,7 +196,7 @@ func (c *ClientConnection) RemoveListenChannel(ch Channel) {
 	c.sharedMu.Unlock()
 }
 
-func (c *ClientConnection) GetListenChannels() map[Channel]bool {
+func (c *Client) GetListenChannels() map[Channel]bool {
 	c.sharedMu.Lock()
 	out := make(map[Channel]bool, len(c.listenChannels))
 	for ch, active := range c.listenChannels {
@@ -203,7 +206,7 @@ func (c *ClientConnection) GetListenChannels() map[Channel]bool {
 	return out
 }
 
-func (c *ClientConnection) ClearListenChannels() {
+func (c *Client) ClearListenChannels() {
 	c.sharedMu.Lock()
 	c.listenChannels = make(map[Channel]bool)
 	c.isListening = false
@@ -214,7 +217,7 @@ func (c *ClientConnection) ClearListenChannels() {
 
 // WriteMessage writes a PostgreSQL protocol message to the client.
 // writeMu serialises concurrent callers (owning goroutine + listen fan-out).
-func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
+func (c *Client) WriteMessage(msgType byte, body []byte) error {
 	if len(body) > c.maxMessageSize {
 		return fmt.Errorf("message body too large: %d bytes", len(body))
 	}
@@ -249,7 +252,7 @@ func (c *ClientConnection) WriteMessage(msgType byte, body []byte) error {
 
 // ReadMessage reads a PostgreSQL protocol message from the client.
 // Only the owning goroutine calls this — no locking needed.
-func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
+func (c *Client) ReadMessage() (byte, []byte, error) {
 	msgType, err := c.reader.ReadByte()
 	if err != nil {
 		if err == io.EOF {
@@ -285,17 +288,17 @@ func (c *ClientConnection) ReadMessage() (byte, []byte, error) {
 }
 
 // Logger returns the client's logger.
-func (c *ClientConnection) Logger() *Logger { return c.logger }
+func (c *Client) Logger() *logger.Logger { return c.logger }
 
 // --- Prepared statement name mapping (single-goroutine, no lock) ---
 
 // --- Prepared statement name mapping ---
-// These methods are NOT guarded by c.mu because they are only ever called
+// These methods are NOT guarded by c.Mu because they are only ever called
 // from the single goroutine that owns this client connection.
 
 // MapStmtName registers a mapping from a client-visible name to an internal
 // pgfox hash, and the reverse. Replaces any previous mapping for clientName.
-func (c *ClientConnection) MapStmtName(clientName, hash string) {
+func (c *Client) MapStmtName(clientName, hash string) {
 	// Remove any previous reverse entry for this clientName.
 	if old, ok := c.stmtNameMap[clientName]; ok {
 		delete(c.stmtRevMap, old)
@@ -306,22 +309,99 @@ func (c *ClientConnection) MapStmtName(clientName, hash string) {
 
 // LookupInternalName returns the internal hash for a client-visible statement
 // name, or ("", false) if not found.
-func (c *ClientConnection) LookupInternalName(clientName string) (string, bool) {
+func (c *Client) LookupInternalName(clientName string) (string, bool) {
 	hash, ok := c.stmtNameMap[clientName]
 	return hash, ok
 }
 
 // LookupClientName returns the client-visible name for an internal hash,
 // or ("", false) if not found.
-func (c *ClientConnection) LookupClientName(hash string) (string, bool) {
+func (c *Client) LookupClientName(hash string) (string, bool) {
 	name, ok := c.stmtRevMap[hash]
 	return name, ok
 }
 
 // UnmapStmtName removes the mapping for clientName and its reverse entry.
-func (c *ClientConnection) UnmapStmtName(clientName string) {
+func (c *Client) UnmapStmtName(clientName string) {
 	if hash, ok := c.stmtNameMap[clientName]; ok {
 		delete(c.stmtRevMap, hash)
 	}
 	delete(c.stmtNameMap, clientName)
+}
+
+// SendAuthenticationOK sends authentication OK message
+func (c *Client) SendAuthenticationOK() error {
+	body := make([]byte, 4)
+	binary.BigEndian.PutUint32(body, AuthenticationOK)
+	return c.WriteMessage('R', body)
+}
+
+// SendAuthenticationMD5 sends an MD5 password challenge to the client.
+// The 4-byte salt is randomly generated by the caller.
+func (c *Client) SendAuthenticationMD5(salt [4]byte) error {
+	body := make([]byte, 8)
+	binary.BigEndian.PutUint32(body[0:4], AuthenticationMD5)
+	copy(body[4:8], salt[:])
+	return c.WriteMessage('R', body)
+}
+
+// SendAuthenticationCleartext sends a cleartext password challenge to the client.
+func (c *Client) SendAuthenticationCleartext() error {
+	body := make([]byte, 4)
+	binary.BigEndian.PutUint32(body, AuthenticationCleartextPassword)
+	return c.WriteMessage('R', body)
+}
+
+// sendBackendKeyData sends backend key data message
+func (c *Client) SendBackendKeyData(processID, secretKey int32) error {
+	body := make([]byte, 8)
+	binary.BigEndian.PutUint32(body[0:4], uint32(processID))
+	binary.BigEndian.PutUint32(body[4:8], uint32(secretKey))
+	return c.WriteMessage('K', body)
+}
+
+// SendParameterStatus sends parameter status message
+func (c *Client) SendParameterStatus(name, value string) error {
+	body := name + "\x00" + value + "\x00"
+	return c.WriteMessage('S', []byte(body))
+}
+
+// SendReadyForQuery sends ready for query message
+func (c *Client) SendReadyForQuery(status byte) error {
+	body := []byte{status}
+	return c.WriteMessage('Z', body)
+}
+
+// SendErrorResponse sends error response message
+func (c *Client) SendErrorResponse(severity, code, message string) error {
+	body := fmt.Sprintf("S%s\x00C%s\x00M%s\x00\x00", severity, code, message)
+	return c.WriteMessage('E', []byte(body))
+}
+
+// SendCommandComplete sends command complete message
+func (c *Client) SendCommandComplete(command string) error {
+	body := command + "\x00"
+	return c.WriteMessage('C', []byte(body))
+}
+
+// SendNotificationToClient sends a notification message to a client
+func (c *Client) SendNotificationToClient(notification NotificationMessage) error {
+	channelBytes := []byte(notification.Channel)
+	payloadBytes := []byte(notification.Payload)
+	bodyLen := 4 + len(channelBytes) + 1 + len(payloadBytes) + 1
+
+	body := make([]byte, bodyLen)
+	binary.BigEndian.PutUint32(body[0:4], uint32(notification.ProcessID))
+
+	pos := 4
+	copy(body[pos:], channelBytes)
+	pos += len(channelBytes)
+	body[pos] = 0 // null terminator
+	pos++
+
+	copy(body[pos:], payloadBytes)
+	pos += len(payloadBytes)
+	body[pos] = 0 // null terminator
+
+	return c.WriteMessage('A', body)
 }

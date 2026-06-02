@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"crypto/hmac"
@@ -13,16 +13,18 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aekis-dev/pgfox/pkg/auth"
 )
 
 // handleStartupMessage handles the PostgreSQL startup protocol.
-func (p *Server) handleStartupMessage(client *ClientConnection) error {
+func (p *Server) handleStartupMessage(client *Client) error {
 	length, err := readUint32(client.reader)
 	if err != nil {
 		return fmt.Errorf("failed to read message length: %w", err)
 	}
 
-	p.logger.Debug("First message length", "length", length)
+	p.Logger.Debug("First message length", "length", length)
 
 	if length == 8 {
 		requestCode, err := readUint32(client.reader)
@@ -30,11 +32,11 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 			return fmt.Errorf("failed to read request code: %w", err)
 		}
 
-		p.logger.Debug("Request code received", "code", requestCode)
+		p.Logger.Debug("Request code received", "code", requestCode)
 
 		if requestCode == SSLRequestCode {
 			if p.isSSLSupported() {
-				p.logger.Debug("SSL request received, accepting")
+				p.Logger.Debug("SSL request received, accepting")
 				if err := client.writer.WriteByte('S'); err != nil {
 					return fmt.Errorf("failed to send SSL acceptance: %w", err)
 				}
@@ -47,7 +49,7 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 				return p.handleStartupMessage(client)
 			}
 
-			p.logger.Debug("SSL not configured, rejecting")
+			p.Logger.Debug("SSL not configured, rejecting")
 			if err := client.writer.WriteByte('N'); err != nil {
 				return fmt.Errorf("failed to send SSL rejection: %w", err)
 			}
@@ -86,7 +88,7 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 
 	params := parseStartupParams(paramBytes)
 
-	p.logger.Debug("Parsed startup parameters", "params", params)
+	p.Logger.Debug("Parsed startup parameters", "params", params)
 
 	startupMsg := StartupMessage{
 		ProtocolVersion: protocolVersion,
@@ -115,54 +117,54 @@ func (p *Server) handleStartupMessage(client *ClientConnection) error {
 }
 
 // authenticateClientWithBackend authenticates a client using SCRAM-SHA-256,
-// then ensures the backend pool for this (database, user) exists.
+// then ensures the backend Pool for this (database, user) exists.
 // No backend connection is opened here — the target goroutine owns all
 // connection creation. Parameters come from target.params captured at startup.
-func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, database string) error {
+func (p *Server) authenticateClientWithBackend(client *Client, user, database string) error {
 	logger := client.Logger()
 
-	// Get or create the pool — target selection is handled inside getPool.
+	// Get or create the Pool — target selection is handled inside getPool.
 	pool := p.getPool(database, user)
 	if pool == nil {
 		logger.Warn("No target serves database", "database", database)
-		return sendErrorResponse(client, "FATAL", "3D000", "database not found")
+		return client.SendErrorResponse("FATAL", "3D000", "database not found")
 	}
 
-	target := pool.target
+	target := pool.Target
 
 	// Check access control rules before doing any crypto work.
 	if err := target.checkAccess(client.RemoteAddr(), user, database); err != nil {
 		logger.Warn("Access denied", "user", user, "database", database, "client", client.RemoteAddr(), "target", target.Name)
-		return sendErrorResponse(client, "FATAL", "28000", "access denied")
+		return client.SendErrorResponse("FATAL", "28000", "access denied")
 	}
 
 	// Fetch live SCRAM verifier from pg_shadow via target.conn.
 	verifier, err := p.getSCRAMVerifier(target, user)
 	if err != nil {
 		logger.WithError(err).Error("Failed to fetch SCRAM verifier")
-		return sendErrorResponse(client, "FATAL", "28P01", "authentication failed")
+		return client.SendErrorResponse("FATAL", "28P01", "authentication failed")
 	}
 
 	// Run SCRAM-SHA-256 server exchange with the client.
 	if err := p.handleClientSCRAM(client, user, verifier); err != nil {
 		logger.WithError(err).Warn("Client SCRAM authentication failed")
-		return sendErrorResponse(client, "FATAL", "28P01", "password authentication failed")
+		return client.SendErrorResponse("FATAL", "28P01", "password authentication failed")
 	}
 	logger.Debug("Client SCRAM authentication successful")
 
 	// Send authentication success to the client. The client will block
 	// naturally on borrowConn when it sends its first query if no connection
 	// is available yet — no need to wait here.
-	if err := sendAuthenticationOK(client); err != nil {
+	if err := client.SendAuthenticationOK(); err != nil {
 		return fmt.Errorf("failed to send AuthenticationOK: %w", err)
 	}
-	if err := sendBackendKeyData(client, 0, 0); err != nil {
+	if err := client.SendBackendKeyData(0, 0); err != nil {
 		return fmt.Errorf("failed to send BackendKeyData: %w", err)
 	}
 	if err := p.sendTargetParameterStatuses(client, user, target); err != nil {
 		return err
 	}
-	if err := sendReadyForQuery(client, 'I'); err != nil {
+	if err := client.SendReadyForQuery('I'); err != nil {
 		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
 	}
 
@@ -170,8 +172,8 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 	logger.Debug("Client authenticated",
 		"target", target.Name,
 		"database", database,
-		"total_pool", pool.totalConnections(),
-		"active_clients", atomic.LoadInt64(&p.stats.ActiveClients))
+		"total_pool", pool.TotalConnections(),
+		"active_clients", atomic.LoadInt64(&p.GlobalStats.ActiveClients))
 
 	return nil
 }
@@ -179,20 +181,20 @@ func (p *Server) authenticateClientWithBackend(client *ClientConnection, user, d
 // sendTargetParameterStatuses sends ParameterStatus messages to the client
 // using the values captured from the target's privileged connection at startup.
 // session_authorization is overridden to reflect the authenticated client user.
-func (p *Server) sendTargetParameterStatuses(client *ClientConnection, user string, target *Target) error {
+func (p *Server) sendTargetParameterStatuses(client *Client, user string, target *Target) error {
 	overrides := map[string]string{"session_authorization": user}
 
-	for name, value := range target.params {
+	for name, value := range target.Params {
 		if ov, ok := overrides[name]; ok {
 			value = ov
 		}
-		if err := sendParameterStatus(client, name, value); err != nil {
+		if err := client.SendParameterStatus(name, value); err != nil {
 			return fmt.Errorf("failed to send parameter status %s: %w", name, err)
 		}
 	}
 	for name, value := range overrides {
-		if _, sent := target.params[name]; !sent {
-			if err := sendParameterStatus(client, name, value); err != nil {
+		if _, sent := target.Params[name]; !sent {
+			if err := client.SendParameterStatus(name, value); err != nil {
 				return fmt.Errorf("failed to send parameter status %s: %w", name, err)
 			}
 		}
@@ -203,25 +205,25 @@ func (p *Server) sendTargetParameterStatuses(client *ClientConnection, user stri
 // getSCRAMVerifier fetches the SCRAM-SHA-256 verifier for a user from pg_authid.
 // Routes the query through the target goroutine via scramCh so that target.conn
 // is never accessed concurrently from multiple client goroutines.
-func (p *Server) getSCRAMVerifier(target *Target, username string) (*SCRAMVerifier, error) {
-	reply := make(chan scramReply, 1)
+func (p *Server) getSCRAMVerifier(target *Target, username string) (*auth.SCRAMVerifier, error) {
+	reply := make(chan ScramReply, 1)
 	select {
-	case target.scramCh <- scramRequest{username: username, reply: reply}:
-	case <-p.ctx.Done():
+	case target.ScramCh <- ScramRequest{username: username, reply: reply}:
+	case <-p.Context.Done():
 		return nil, fmt.Errorf("server shutting down")
 	}
 	select {
 	case r := <-reply:
 		return r.verifier, r.err
-	case <-p.ctx.Done():
+	case <-p.Context.Done():
 		return nil, fmt.Errorf("server shutting down")
 	}
 }
 
-// createCertBackendConnection opens a new backend connection using TLS client
+// createCertBackend opens a new backend connection using TLS client
 // certificate auth (verify-full). Used by auth for the seed connection and by
-// the pool manager goroutine for all subsequent connections.
-func (p *Server) createCertBackendConnection(target *Target, database, user string, cert tls.Certificate) (*BackendConnection, error) {
+// the Pool manager goroutine for all subsequent connections.
+func (p *Server) createCertBackend(target *Target, database, user string, cert tls.Certificate) (*Backend, error) {
 	addr := fmt.Sprintf("%s:%d", target.Host, target.Port)
 
 	conn, err := net.DialTimeout("tcp", addr, target.ConnectTimeout)
@@ -246,7 +248,7 @@ func (p *Server) createCertBackendConnection(target *Target, database, user stri
 		return nil, fmt.Errorf("TLS upgrade failed: %w", err)
 	}
 
-	backend := NewBackendConnection(tlsConn, database, target.Name, user, p.config.Server.MaxMessageSize)
+	backend := NewBackend(tlsConn, database, target.Name, user, p.Config.Server.MaxMessageSize)
 
 	startupMsg := buildStartupMessage(user, database)
 	if _, err := tlsConn.Write(startupMsg); err != nil {
@@ -292,7 +294,7 @@ func (p *Server) upgradeToCertTLS(conn net.Conn, tlsCfg *tls.Config) (net.Conn, 
 // drainBackendStartup reads ParameterStatus, BackendKeyData, ReadyForQuery
 // after the startup message. Cert-auth connections receive AuthenticationOK
 // without a challenge.
-func (p *Server) drainBackendStartup(backend *BackendConnection) error {
+func (p *Server) drainBackendStartup(backend *Backend) error {
 	authComplete := false
 	for {
 		msgType, body, err := backend.ReadMessage()
@@ -334,7 +336,7 @@ func (p *Server) drainBackendStartup(backend *BackendConnection) error {
 			}
 			return nil
 		case 'E':
-			errStr := parseErrorMessage(body)
+			errStr := ParseErrorMessage(body)
 			PutMsgBody(body)
 			return fmt.Errorf("backend error during startup: %s", errStr)
 		case 'N':
@@ -347,7 +349,7 @@ func (p *Server) drainBackendStartup(backend *BackendConnection) error {
 }
 
 // handleClientSCRAM runs the full SCRAM-SHA-256 server exchange with a client.
-func (p *Server) handleClientSCRAM(client *ClientConnection, user string, verifier *SCRAMVerifier) error {
+func (p *Server) handleClientSCRAM(client *Client, user string, verifier *auth.SCRAMVerifier) error {
 	logger := client.Logger()
 
 	// Step 1: Advertise SCRAM-SHA-256.
@@ -445,7 +447,7 @@ func (p *Server) handleClientSCRAM(client *ClientConnection, user string, verifi
 }
 
 // handleCancelRequest processes a PostgreSQL cancel request.
-func (p *Server) handleCancelRequest(client *ClientConnection) error {
+func (p *Server) handleCancelRequest(client *Client) error {
 	buf := make([]byte, 8)
 	if _, err := io.ReadFull(client.reader, buf); err != nil {
 		return fmt.Errorf("failed to read cancel data: %w", err)
@@ -454,18 +456,18 @@ func (p *Server) handleCancelRequest(client *ClientConnection) error {
 	processID := int32(buf[0])<<24 | int32(buf[1])<<16 | int32(buf[2])<<8 | int32(buf[3])
 	secretKey := int32(buf[4])<<24 | int32(buf[5])<<16 | int32(buf[6])<<8 | int32(buf[7])
 
-	p.logger.Debug("Cancel request received", "process_id", processID)
+	p.Logger.Debug("Cancel request received", "process_id", processID)
 
 	cancelTarget, backend := p.findBackendByKey(processID, secretKey)
 	if backend == nil {
-		p.logger.Debug("Cancel: no matching backend", "process_id", processID)
+		p.Logger.Debug("Cancel: no matching backend", "process_id", processID)
 		return nil
 	}
 
 	addr := fmt.Sprintf("%s:%d", cancelTarget.Host, cancelTarget.Port)
-	cancelConn, err := net.DialTimeout("tcp", addr, p.config.Server.ConnectTimeout)
+	cancelConn, err := net.DialTimeout("tcp", addr, p.Config.Server.ConnectTimeout)
 	if err != nil {
-		p.logger.WithError(err).Warn("Cancel: failed to reach backend")
+		p.Logger.WithError(err).Warn("Cancel: failed to reach backend")
 		return nil
 	}
 	defer cancelConn.Close()
@@ -477,11 +479,11 @@ func (p *Server) handleCancelRequest(client *ClientConnection) error {
 	binary.BigEndian.PutUint32(msg[12:16], uint32(secretKey))
 
 	if _, err := cancelConn.Write(msg); err != nil {
-		p.logger.WithError(err).Warn("Cancel: failed to send")
+		p.Logger.WithError(err).Warn("Cancel: failed to send")
 		return nil
 	}
 
-	p.logger.Debug("Cancel forwarded", "process_id", processID, "backend", addr)
+	p.Logger.Debug("Cancel forwarded", "process_id", processID, "backend", addr)
 	return nil
 }
 
@@ -584,14 +586,9 @@ func splitNullTerminated(b []byte) []string {
 	return parts
 }
 
-// escapeSingleQuote escapes single quotes in a string for use in SQL literals.
-func escapeSingleQuote(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
-
 // authenticateBackendWithPassword authenticates with backend using credentials.
 // Kept for any future path that needs password-based backend auth.
-func (p *Server) authenticateBackendWithPassword(backend *BackendConnection, user, password string) error {
+func (p *Server) authenticateBackendWithPassword(backend *Backend, user, password string) error {
 	authComplete := false
 
 	for {
@@ -631,7 +628,7 @@ func (p *Server) authenticateBackendWithPassword(backend *BackendConnection, use
 				if len(body) < 4 {
 					return fmt.Errorf("invalid SASL auth response")
 				}
-				return handleSCRAMAuth(backend, user, password, body[4:])
+				return backend.HandleSCRAMAuth(user, password, body[4:])
 			default:
 				return fmt.Errorf("unsupported authentication type: %d", authType)
 			}
@@ -658,7 +655,7 @@ func (p *Server) authenticateBackendWithPassword(backend *BackendConnection, use
 			return nil
 
 		case 'E':
-			return fmt.Errorf("authentication failed: %s", parseErrorMessage(body))
+			return fmt.Errorf("authentication failed: %s", ParseErrorMessage(body))
 
 		case 'N':
 			continue

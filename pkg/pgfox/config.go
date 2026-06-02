@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"fmt"
@@ -7,15 +7,16 @@ import (
 	"sort"
 	"time"
 
+	"github.com/aekis-dev/pgfox/pkg/logger"
 	"gopkg.in/yaml.v3"
 )
 
 // Config represents the main configuration structure
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Targets []*Target     `yaml:"targets"`
-	Logging LoggingConfig `yaml:"logging"`
-	Metrics MetricsConfig `yaml:"metrics"`
+	Server  ServerConfig         `yaml:"server"`
+	Targets []*Target            `yaml:"targets"`
+	Logging logger.LoggingConfig `yaml:"logging"`
+	Metrics MetricsConfig        `yaml:"metrics"`
 }
 
 // ServerConfig contains server-level configuration
@@ -105,14 +106,7 @@ type Rule struct {
 	Databases []string   `yaml:"databases"`
 
 	// nets holds the parsed CIDR networks, populated by LoadConfig.
-	nets []*net.IPNet
-}
-
-// LoggingConfig contains logging configuration
-type LoggingConfig struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
-	File   string `yaml:"file"`
+	Nets []*net.IPNet
 }
 
 // MetricsConfig contains metrics configuration
@@ -146,7 +140,7 @@ func LoadConfig(configPath string) (*Config, error) {
 				Country:            "US",
 			},
 		},
-		Logging: LoggingConfig{
+		Logging: logger.LoggingConfig{
 			Level:  "info",
 			Format: "text",
 		},
@@ -194,18 +188,18 @@ func LoadConfig(configPath string) (*Config, error) {
 					return nil, fmt.Errorf("target %s rule %d: invalid cidr %q: %w",
 						t.Name, i, cidr, err)
 				}
-				r.nets = append(r.nets, network)
+				r.Nets = append(r.Nets, network)
 			}
 		}
 		// Initialize runtime fields.
-		t.ready = make(chan struct{})
-		t.params = make(map[string]string)
-		t.closeCh = make(chan *BackendConnection, t.MaxConnections)
-		t.demand = make(chan struct{}, 1)
-		t.poolRegistered = make(chan *Pool, 64)
-		t.connReady = make(chan struct{}, t.MaxConnections)
-		t.scramCh = make(chan scramRequest)
-		t.stmtCache = NewStmtCache()
+		t.Ready = make(chan struct{})
+		t.Params = make(map[string]string)
+		t.CloseCh = make(chan *Backend, t.MaxConnections)
+		t.Demand = make(chan struct{}, 1)
+		t.PoolRegistered = make(chan *Pool, 64)
+		t.ConnReady = make(chan struct{}, t.MaxConnections)
+		t.ScramCh = make(chan ScramRequest)
+		t.StmtCache = NewStmtCache()
 	}
 
 	// Sort targets by priority (lower value = higher priority, ties by name).
@@ -246,4 +240,43 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// MatchesIP returns true if the rule's CIDR list contains ip, or the list is empty.
+func (r *Rule) MatchesIP(ip net.IP) bool {
+	if len(r.Nets) == 0 {
+		return true
+	}
+	for _, network := range r.Nets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchesUser returns true if the rule's Users list contains user, or is empty.
+func (r *Rule) MatchesUser(user string) bool {
+	if len(r.Users) == 0 {
+		return true
+	}
+	for _, u := range r.Users {
+		if u == user {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchesDatabase returns true if the rule's Databases list contains database, or is empty.
+func (r *Rule) MatchesDatabase(database string) bool {
+	if len(r.Databases) == 0 {
+		return true
+	}
+	for _, d := range r.Databases {
+		if d == database {
+			return true
+		}
+	}
+	return false
 }

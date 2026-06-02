@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"strings"
@@ -8,7 +8,7 @@ import (
 // ---------------------------------------------------------------------------
 // msgBodyPool — reusable byte slices for PostgreSQL protocol message bodies.
 //
-// Lifetime contract: a slice borrowed from this pool is valid only for the
+// Lifetime contract: a slice borrowed from this Pool is valid only for the
 // synchronous duration of the ReadMessage call that fills it. Callers that
 // need the body to outlive a single message dispatch MUST copy the relevant
 // bytes out (or call cloneMsgBody) before returning the slice.
@@ -19,14 +19,14 @@ import (
 //   large  — cap 64 KiB : typical data rows, bind parameters, COPY payloads
 //
 // Messages larger than 64 KiB are allocated directly from the heap and never
-// pooled, because they are rare and holding a giant buffer in the pool would
+// pooled, because they are rare and holding a giant buffer in the Pool would
 // waste memory across the idle lifetime of that goroutine's P.
 // ---------------------------------------------------------------------------
 
 const (
 	msgBodySmallCap = 4 * 1024
 	msgBodyLargeCap = 64 * 1024
-	msgBodyPoolMax  = msgBodyLargeCap // bodies above this skip the pool
+	msgBodyPoolMax  = msgBodyLargeCap // bodies above this skip the Pool
 )
 
 var msgBodySmallPool = sync.Pool{
@@ -43,7 +43,7 @@ var msgBodyLargePool = sync.Pool{
 	},
 }
 
-// getMsgBody returns a *[]byte from the appropriate pool, reset to length 0.
+// getMsgBody returns a *[]byte from the appropriate Pool, reset to length 0.
 // The caller must call putMsgBody when done.
 func getMsgBody(need int) *[]byte {
 	if need <= msgBodySmallCap {
@@ -68,21 +68,10 @@ func putMsgBody(p *[]byte) {
 	}
 }
 
-// cloneMsgBody copies src into a fresh heap slice. Use this when a body
-// read via a pooled ReadMessage needs to outlive the immediate dispatch.
-func cloneMsgBody(src []byte) []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make([]byte, len(src))
-	copy(dst, src)
-	return dst
-}
-
 // ---------------------------------------------------------------------------
 // pipelinePool — reusable []pipelineMsg slices for the extended query path.
 //
-// A typical pipeline is 4 messages (Parse + Bind + Execute + Sync). The pool
+// A typical pipeline is 4 messages (Parse + Bind + Execute + Sync). The Pool
 // keeps a backing slice of capacity 16 to handle deeper pipelines without
 // reallocation. executeExtendedPipeline borrows one slice for `pipeline` and
 // one for `rewritten`, returns both before returning to the caller.

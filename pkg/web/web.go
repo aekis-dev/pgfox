@@ -1,9 +1,12 @@
-package main
+package web
 
 import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/aekis-dev/pgfox/pkg/logger"
+	"github.com/aekis-dev/pgfox/pkg/pgfox"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,7 +15,7 @@ import (
 
 // MetricsCollector implements prometheus.Collector
 type MetricsCollector struct {
-	pooler *Server
+	pooler *pgfox.Server
 
 	// Global metrics
 	clientsTotal          *prometheus.Desc
@@ -31,7 +34,7 @@ type MetricsCollector struct {
 }
 
 // NewMetricsCollector creates a new Prometheus collector.
-func NewMetricsCollector(pooler *Server) *MetricsCollector {
+func NewMetricsCollector(pooler *pgfox.Server) *MetricsCollector {
 	labels := []string{"target", "database", "user"}
 
 	return &MetricsCollector{
@@ -113,7 +116,7 @@ func (mc *MetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect collects the current metrics.
 func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
-	stats := mc.pooler.Stats()
+	stats := mc.pooler.GlobalStats
 
 	ch <- prometheus.MustNewConstMetric(mc.clientsTotal, prometheus.CounterValue, float64(stats.TotalClients))
 	ch <- prometheus.MustNewConstMetric(mc.clientsActive, prometheus.GaugeValue, float64(stats.ActiveClients))
@@ -122,22 +125,22 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(mc.notificationsSent, prometheus.CounterValue, float64(stats.NotificationsSent))
 	ch <- prometheus.MustNewConstMetric(mc.idleConnectionsClosed, prometheus.CounterValue, float64(stats.IdleConnectionsClosed))
 
-	for _, target := range mc.pooler.targets {
+	for _, target := range mc.pooler.Targets {
 		// pools is now a sync.Map; Range is the safe iteration API.
-		target.pools.Range(func(_, v any) bool {
-			pool := v.(*Pool)
-			labels := []string{target.Name, pool.dbName, pool.username}
+		target.Pools.Range(func(_, v any) bool {
+			pool := v.(*pgfox.Pool)
+			labels := []string{target.Name, pool.DbName, pool.Username}
 
 			ch <- prometheus.MustNewConstMetric(mc.poolConnectionsTotal, prometheus.GaugeValue,
-				float64(pool.totalConnections()), labels...)
+				float64(pool.TotalConnections()), labels...)
 			ch <- prometheus.MustNewConstMetric(mc.poolConnectionsActive, prometheus.GaugeValue,
-				float64(pool.activeConnections()), labels...)
+				float64(pool.ActiveConnections()), labels...)
 			ch <- prometheus.MustNewConstMetric(mc.poolConnectionsIdle, prometheus.GaugeValue,
-				float64(pool.idleConnections()), labels...)
+				float64(pool.IdleConnections()), labels...)
 			ch <- prometheus.MustNewConstMetric(mc.poolQueriesTotal, prometheus.CounterValue,
-				float64(pool.queriesExecuted()), labels...)
+				float64(pool.QueriesExecuted()), labels...)
 			ch <- prometheus.MustNewConstMetric(mc.poolErrorsTotal, prometheus.CounterValue,
-				float64(pool.errorCount()), labels...)
+				float64(pool.ErrorCount()), labels...)
 			return true
 		})
 	}
@@ -145,15 +148,15 @@ func (mc *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 
 // WebServer provides HTTP endpoints.
 type WebServer struct {
-	pooler   *Server
+	pooler   *pgfox.Server
 	server   *http.Server
 	router   *gin.Engine
-	logger   *Logger
+	logger   *logger.Logger
 	registry *prometheus.Registry
 }
 
 // NewWebServer creates a new web server.
-func NewWebServer(pooler *Server, addr string, logger *Logger) *WebServer {
+func NewWebServer(pooler *pgfox.Server, addr string, log *logger.Logger) *WebServer {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
@@ -164,7 +167,7 @@ func NewWebServer(pooler *Server, addr string, logger *Logger) *WebServer {
 	ws := &WebServer{
 		pooler:   pooler,
 		router:   router,
-		logger:   logger.WithField("component", "webserver"),
+		logger:   log.WithField("component", "webserver"),
 		registry: registry,
 		server: &http.Server{
 			Addr:    addr,
@@ -220,7 +223,6 @@ func (ws *WebServer) handleIndex(c *gin.Context) {
 <body>
     <h1>🦊 PgFox</h1>
     <div class="info">
-        <p><strong>Version:</strong> ` + Version + `</p>
         <p><strong>Description:</strong> PostgreSQL Connection Pooler with Wildcard Database Support</p>
     </div>
     <h2>Available Endpoints</h2>

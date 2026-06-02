@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"crypto/sha256"
@@ -20,7 +20,7 @@ type ParameterizeResult struct {
 	Values []string
 
 	// Hash is the 16-character hex prefix of SHA-256(CanonicalSQL).
-	// Used as the statement name key in StmtCache and on BackendConnection.
+	// Used as the statement name key in StmtCache and on Backend.
 	Hash string
 }
 
@@ -102,9 +102,9 @@ func ClassifyAndParameterize(sql string) (SimpleQueryCommand, *ParameterizeResul
 		}
 	}
 
-	// Borrow scratch space from the pool to avoid per-query allocations for
+	// Borrow scratch space from the Pool to avoid per-query allocations for
 	// the literal slice, strings.Builder, and values slice. All three are reset
-	// and returned to the pool before this function returns; the ParameterizeResult
+	// and returned to the Pool before this function returns; the ParameterizeResult
 	// that escapes to the heap contains only heap-allocated strings.
 	ws := getParamWorkspace()
 	defer putParamWorkspace(ws)
@@ -126,7 +126,7 @@ func ClassifyAndParameterize(sql string) (SimpleQueryCommand, *ParameterizeResul
 	}
 
 	// values slice elements are Go string literals (immutable, heap-safe) so we
-	// copy them into a fresh slice before returning the workspace to the pool.
+	// copy them into a fresh slice before returning the workspace to the Pool.
 	heapValues := make([]string, len(values))
 	copy(heapValues, values)
 
@@ -513,7 +513,7 @@ func collectInList(list *nodes.List, out *[]literalValue, inLimit bool) {
 // order matches left-to-right source order for all DML statement types.
 // rewriteLiteralsWS is the pooled version of rewriteLiterals; it writes into
 // a caller-supplied workspace so the Builder and values slice are not allocated
-// per call. The caller must copy ws.values out before returning ws to the pool.
+// per call. The caller must copy ws.values out before returning ws to the Pool.
 func rewriteLiteralsWS(sql string, litValues []literalValue, ws *paramWorkspace) (string, []string, error) {
 	if len(litValues) == 0 {
 		return sql, nil, nil
@@ -564,9 +564,9 @@ func rewriteLiterals(sql string, litValues []literalValue) (string, []string, er
 	return result, heap, nil
 }
 
-// findNextLiteral scans src starting at startPos for the next occurrence of
+// findNextLiteral scans pkg starting at startPos for the next occurrence of
 // the literal token described by lit. It returns the start and end byte
-// offsets of the token in src.
+// offsets of the token in pkg.
 //
 // The scan skips over SQL comments, double-quoted identifiers, and other
 // string literals to avoid false matches inside them.

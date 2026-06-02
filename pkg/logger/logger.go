@@ -1,4 +1,4 @@
-package main
+package logger
 
 import (
 	"fmt"
@@ -10,6 +10,13 @@ import (
 // Logger provides structured logging interface
 type Logger struct {
 	*slog.Logger
+}
+
+// LoggingConfig contains logging configuration
+type LoggingConfig struct {
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
+	File   string `yaml:"file"`
 }
 
 // NewLogger creates a new structured logger

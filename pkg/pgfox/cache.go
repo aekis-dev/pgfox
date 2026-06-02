@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"sync"
@@ -74,7 +74,7 @@ func (s *CachedStmt) LastUsed() time.Time {
 // canonical SQL, so the same logical query from any (database, user) pair
 // shares a single entry and a single set of stats. Deployment state (whether
 // a specific backend connection has had Parse sent) is tracked separately on
-// BackendConnection.deployedStmts.
+// Backend.deployedStmts.
 type StmtCache struct {
 	mu      sync.RWMutex
 	entries map[string]*CachedStmt // hash → entry

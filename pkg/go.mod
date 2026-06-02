@@ -1,4 +1,4 @@
-module pgfox
+module github.com/aekis-dev/pgfox/pkg
 
 go 1.26.0
 

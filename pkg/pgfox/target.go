@@ -1,4 +1,4 @@
-package main
+package pgfox
 
 import (
 	"context"
@@ -7,6 +7,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aekis-dev/pgfox/pkg/auth"
+	"github.com/aekis-dev/pgfox/pkg/logger"
 )
 
 // Target represents a PostgreSQL server. It holds both config (from yaml) and
@@ -28,137 +31,137 @@ type Target struct {
 	Rules []Rule `yaml:"rules"`
 
 	// --- Runtime: privileged connection ---
-	// conn is the pgfox_role backend connection used exclusively for
+	// backend is the pgfox_role backend connection used exclusively for
 	// pg_shadow queries during client authentication.
-	conn   *BackendConnection
-	ready  chan struct{}     // closed when conn is ready for the first time
-	params map[string]string // ParameterStatus values from conn startup
+	Backend *Backend
+	Ready   chan struct{}     // closed when conn is ready for the first time
+	Params  map[string]string // ParameterStatus values from conn startup
 
 	// --- Runtime: pools ---
-	// pools maps "database\x00user" → *Pool. sync.Map is used because the
+	// Pools maps "database\x00user" → *Pool. sync.Map is used because the
 	// map is read on every query but written only once per (database, user)
 	// pair — exactly the load profile sync.Map is optimised for.
-	pools sync.Map // key: dbUser string → *Pool
+	Pools sync.Map // key: dbUser string → *Pool
 
-	// cachedPools is a flat snapshot maintained exclusively by the target
+	// CachedPools is a flat snapshot maintained exclusively by the target
 	// goroutine (growthCycle, healthCheck, drain). It avoids Range() overhead
 	// and the allocation of a new slice on every 50ms tick.
-	cachedPools []*Pool
+	CachedPools []*Pool
 
 	// --- Runtime: connection budget ---
-	// totalOpen is the count of all open backend connections on this target
+	// TotalOpen is the count of all open backend connections on this target
 	// across all pools plus the privileged conn. Only the target goroutine
 	// writes this. atomicTotalOpen mirrors it for safe cross-goroutine reads.
-	totalOpen       int
-	atomicTotalOpen atomic.Int32
+	TotalOpen       int
+	AtomicTotalOpen atomic.Int32
 
-	// serverMaxConns and serverOpenConns are updated by the stats ticker
+	// ServerMaxConns and serverOpenConns are updated by the stats ticker
 	// from pg_stat_activity. They reflect the real PostgreSQL server state
 	// regardless of other clients not using pgfox.
-	serverMaxConns  int // pg max_connections setting
-	serverOpenConns int // total connections currently open on the server
+	ServerMaxConns  int // pg max_connections setting
+	ServerOpenConns int // total connections currently open on the server
 
-	// listenOpen is the count of active dedicated listen connections on this
+	// ListenOpen is the count of active dedicated listen connections on this
 	// target. Written atomically from client goroutines.
-	listenOpen int32
+	ListenOpen int32
 
-	// draining is set to true when the target is being removed during a config
+	// Draining is set to true when the target is being removed during a config
 	// reload. New pools and new borrows are refused; existing transactions are
 	// allowed to complete until query_timeout, then force-closed.
-	draining atomic.Bool
+	Draining atomic.Bool
 
-	// stmtCache is the target-level prepared statement registry. It maps a
+	// StmtCache is the target-level prepared statement registry. It maps a
 	// canonical query hash to the parsed/parameterized form and usage stats.
 	// All pools on this target share one cache — the same logical query sent
 	// against any (database, user) combination maps to a single entry.
-	stmtCache *StmtCache
+	StmtCache *StmtCache
 
-	// scramCh serialises pg_shadow queries through the target goroutine so that
+	// ScramCh serialises pg_shadow queries through the target goroutine so that
 	// target.conn is never accessed concurrently from client goroutines.
-	scramCh chan scramRequest
+	ScramCh chan ScramRequest
 
-	// closeCh receives connections that need to be cleaned up (dead or
+	// CloseCh receives connections that need to be cleaned up (dead or
 	// backendPool-full). The target goroutine is the sole reader.
-	closeCh chan *BackendConnection
+	CloseCh chan *Backend
 
-	// demand is a capacity-1 signal channel. borrowConn sends a non-blocking
-	// token when it enters the slow path (pool empty), triggering an immediate
+	// Demand is a capacity-1 signal channel. borrowConn sends a non-blocking
+	// token when it enters the slow path (Pool empty), triggering an immediate
 	// growthCycle instead of waiting up to 50ms for the ticker. Subsequent
 	// waiters within the same tick find the channel full and skip silently.
-	demand chan struct{}
+	Demand chan struct{}
 
-	// poolRegistered receives newly created Pool pointers from getPool so the
+	// PoolRegistered receives newly created Pool pointers from getPool so the
 	// target goroutine can append them to cachedPools without a lock.
-	poolRegistered chan *Pool
+	PoolRegistered chan *Pool
 
-	// backendIndex maps processID (int32) → *BackendConnection for idle
+	// BackendIndex maps processID (int32) → *Backend for idle
 	// connections. Updated atomically when connections enter/leave backendPool.
 	// Allows O(1) cancel-request lookup without draining the channel.
-	backendIndex sync.Map // int32 → *BackendConnection
+	BackendIndex sync.Map // int32 → *Backend
 
 	// connReady is signaled (non-blocking send) whenever a connection is
-	// returned to any pool, waking borrowConn waiters.
-	connReady chan struct{}
+	// returned to any Pool, waking borrowConn waiters.
+	ConnReady chan struct{}
 
 	// --- Runtime: lifecycle ---
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	Context context.Context
+	Cancel  context.CancelFunc
+	Wg      sync.WaitGroup
 }
 
-// scramRequest is sent by a client goroutine to the target goroutine to fetch
+// ScramRequest is sent by a client goroutine to the target goroutine to fetch
 // a SCRAM verifier from pg_shadow via the privileged connection.
-type scramRequest struct {
+type ScramRequest struct {
 	username string
-	reply    chan scramReply
+	reply    chan ScramReply
 }
 
-type scramReply struct {
-	verifier *SCRAMVerifier
+type ScramReply struct {
+	verifier *auth.SCRAMVerifier
 	err      error
 }
 
-// activeConnections returns the total number of connections currently checked
+// ActiveConnections returns the total number of connections currently checked
 // out across all pools on this target. Safe to call from any goroutine.
-func (t *Target) activeConnections() int {
+func (t *Target) ActiveConnections() int {
 	total := 0
-	t.pools.Range(func(_, v any) bool {
-		total += v.(*Pool).activeConnections()
+	t.Pools.Range(func(_, v any) bool {
+		total += v.(*Pool).ActiveConnections()
 		return true
 	})
 	return total
 }
 
-// poolKey builds the sync.Map key for a (dbName, user) pair.
-func poolKey(dbName, user string) string { return dbName + "\x00" + user }
+// PoolKey builds the sync.Map key for a (dbName, user) pair.
+func PoolKey(dbName, user string) string { return dbName + "\x00" + user }
 
-// lookupPool returns the Pool for (dbName, user), or nil if absent.
-func (t *Target) lookupPool(dbName, user string) *Pool {
-	v, ok := t.pools.Load(poolKey(dbName, user))
+// LookupPool returns the Pool for (dbName, user), or nil if absent.
+func (t *Target) LookupPool(dbName, user string) *Pool {
+	v, ok := t.Pools.Load(PoolKey(dbName, user))
 	if !ok {
 		return nil
 	}
 	return v.(*Pool)
 }
 
-// storePool registers a new pool in the sync.Map and appends it to cachedPools.
+// StorePool registers a new Pool in the sync.Map and appends it to cachedPools.
 // cachedPools is used by the target goroutine for lock-free iteration; it must
-// only be written from that goroutine (or during pool creation while the
-// caller holds no pool lock, which is always the case in getPool).
-func (t *Target) storePool(pool *Pool) {
-	t.pools.Store(poolKey(pool.dbName, pool.username), pool)
-	t.cachedPools = append(t.cachedPools, pool)
+// only be written from that goroutine (or during Pool creation while the
+// caller holds no Pool lock, which is always the case in getPool).
+func (t *Target) StorePool(pool *Pool) {
+	t.Pools.Store(PoolKey(pool.DbName, pool.Username), pool)
+	t.CachedPools = append(t.CachedPools, pool)
 }
 
 // waitDrained blocks until all active connections on this target complete or
 // the timeout expires, then returns. Used during config reload removal.
-func (t *Target) waitDrained(timeout time.Duration, logger *Logger) {
+func (t *Target) waitDrained(timeout time.Duration, logger *logger.Logger) {
 	if timeout <= 0 {
 		return
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if t.activeConnections() == 0 {
+		if t.ActiveConnections() == 0 {
 			logger.Info("Target drained of active connections", "target", t.Name)
 			return
 		}
@@ -166,7 +169,7 @@ func (t *Target) waitDrained(timeout time.Duration, logger *Logger) {
 	}
 	logger.Warn("Target drain timed out, force-closing remaining connections",
 		"target", t.Name,
-		"active", t.activeConnections())
+		"active", t.ActiveConnections())
 }
 
 // checkAccess evaluates the target's ordered rule list against the client
@@ -177,13 +180,13 @@ func (t *Target) checkAccess(clientAddr net.Addr, user, database string) error {
 	ip := extractIP(clientAddr)
 
 	for _, r := range t.Rules {
-		if !r.matchesIP(ip) {
+		if !r.MatchesIP(ip) {
 			continue
 		}
-		if !r.matchesUser(user) {
+		if !r.MatchesUser(user) {
 			continue
 		}
-		if !r.matchesDatabase(database) {
+		if !r.MatchesDatabase(database) {
 			continue
 		}
 		// Rule matched.
@@ -195,45 +198,6 @@ func (t *Target) checkAccess(clientAddr net.Addr, user, database string) error {
 
 	// No rule matched — default permit.
 	return nil
-}
-
-// matchesIP returns true if the rule's CIDR list contains ip, or the list is empty.
-func (r *Rule) matchesIP(ip net.IP) bool {
-	if len(r.nets) == 0 {
-		return true
-	}
-	for _, network := range r.nets {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchesUser returns true if the rule's Users list contains user, or is empty.
-func (r *Rule) matchesUser(user string) bool {
-	if len(r.Users) == 0 {
-		return true
-	}
-	for _, u := range r.Users {
-		if u == user {
-			return true
-		}
-	}
-	return false
-}
-
-// matchesDatabase returns true if the rule's Databases list contains database, or is empty.
-func (r *Rule) matchesDatabase(database string) bool {
-	if len(r.Databases) == 0 {
-		return true
-	}
-	for _, d := range r.Databases {
-		if d == database {
-			return true
-		}
-	}
-	return false
 }
 
 // extractIP extracts the IP address from a net.Addr, stripping the port.
@@ -267,7 +231,7 @@ const (
 // statements and reads their ParseComplete responses. Called after every
 // successful (re)connection of t.conn so the statements are always ready.
 // Must only be called from the target goroutine.
-func (t *Target) deployPrivilegedStmts(logger *Logger) error {
+func (t *Target) deployPrivilegedStmts(logger *logger.Logger) error {
 	stmts := []struct {
 		hash string
 		sql  string
@@ -276,33 +240,33 @@ func (t *Target) deployPrivilegedStmts(logger *Logger) error {
 		{statsStmtHash, statsStmtSQL},
 	}
 
-	if err := t.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := t.Backend.Conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return fmt.Errorf("failed to set deadline: %w", err)
 	}
-	defer t.conn.conn.SetReadDeadline(time.Time{})
+	defer t.Backend.Conn.SetReadDeadline(time.Time{})
 
 	// Send all Parse messages then a single Sync — pipeline them in one shot.
 	for _, s := range stmts {
 		parseBody := BuildParseBody(s.hash, s.sql, nil)
-		if err := t.conn.WriteMessage('P', parseBody); err != nil {
+		if err := t.Backend.WriteMessage('P', parseBody); err != nil {
 			return fmt.Errorf("failed to send Parse for %s: %w", s.hash, err)
 		}
 	}
-	if err := t.conn.WriteMessage('S', SyncBody); err != nil {
+	if err := t.Backend.WriteMessage('S', SyncBody); err != nil {
 		return fmt.Errorf("failed to send Sync: %w", err)
 	}
 
 	// Read responses: ParseComplete × 2, then ReadyForQuery.
 	deployed := 0
 	for {
-		msgType, body, err := t.conn.ReadMessage()
+		msgType, body, err := t.Backend.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("failed to read Parse response: %w", err)
 		}
 		switch msgType {
 		case '1': // ParseComplete
 			deployed++
-			t.conn.MarkStmt(stmts[deployed-1].hash)
+			t.Backend.MarkStmt(stmts[deployed-1].hash)
 			logger.Debug("Privileged stmt deployed", "stmt", stmts[deployed-1].hash)
 			PutMsgBody(body)
 		case 'Z': // ReadyForQuery
@@ -312,7 +276,7 @@ func (t *Target) deployPrivilegedStmts(logger *Logger) error {
 			}
 			return nil
 		case 'E':
-			errStr := parseErrorMessage(body)
+			errStr := ParseErrorMessage(body)
 			PutMsgBody(body)
 			return fmt.Errorf("Parse error for privileged stmt: %s", errStr)
 		default:
@@ -323,30 +287,30 @@ func (t *Target) deployPrivilegedStmts(logger *Logger) error {
 
 // run is the target manager goroutine. It:
 //  1. Opens and maintains the privileged connection (conn).
-//  2. Manages all pool connections: growth, shrink, recycling, health checks.
+//  2. Manages all Pool connections: growth, shrink, recycling, health checks.
 //  3. Periodically queries pg_stat_activity to track real server capacity.
 //
 // fetchSCRAMVerifier queries pg_authid for the SCRAM verifier of username
 // using the extended protocol with binary result format.
 // Must only be called from the target goroutine — target.conn is not
 // safe to access from other goroutines concurrently.
-func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
-	if t.conn == nil {
+func (t *Target) fetchSCRAMVerifier(username string) (*auth.SCRAMVerifier, error) {
+	if t.Backend == nil {
 		return nil, fmt.Errorf("privileged connection not ready for target %s", t.Name)
 	}
 
-	if err := t.conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := t.Backend.Conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline: %w", err)
 	}
-	defer t.conn.conn.SetReadDeadline(time.Time{})
+	defer t.Backend.Conn.SetReadDeadline(time.Time{})
 
 	// Re-deploy if the statement was lost (e.g. after a reconnect that
 	// called deployPrivilegedStmts, this should never trigger, but guard
 	// defensively in case t.conn was replaced without going through
 	// openPrivilegedConn).
-	if !t.conn.HasStmt(scramStmtHash) {
+	if !t.Backend.HasStmt(scramStmtHash) {
 		parseBody := BuildParseBody(scramStmtHash, scramStmtSQL, nil)
-		if err := t.conn.WriteMessage('P', parseBody); err != nil {
+		if err := t.Backend.WriteMessage('P', parseBody); err != nil {
 			return nil, fmt.Errorf("failed to send Parse for scram stmt: %w", err)
 		}
 	}
@@ -359,30 +323,30 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 		[]string{username},
 		[]int16{1}, // binary result
 	)
-	if err := t.conn.WriteMessage('B', bindBody); err != nil {
+	if err := t.Backend.WriteMessage('B', bindBody); err != nil {
 		return nil, fmt.Errorf("failed to send Bind for scram stmt: %w", err)
 	}
 
 	execBody := BuildExecuteBody("", 0)
-	if err := t.conn.WriteMessage('E', execBody); err != nil {
+	if err := t.Backend.WriteMessage('E', execBody); err != nil {
 		return nil, fmt.Errorf("failed to send Execute for scram stmt: %w", err)
 	}
 
-	if err := t.conn.WriteMessage('S', SyncBody); err != nil {
+	if err := t.Backend.WriteMessage('S', SyncBody); err != nil {
 		return nil, fmt.Errorf("failed to send Sync: %w", err)
 	}
 
 	var rolpassword string
 
 	for {
-		msgType, body, err := t.conn.ReadMessage()
+		msgType, body, err := t.Backend.ReadMessage()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read pg_authid response: %w", err)
 		}
 
 		switch msgType {
 		case '1': // ParseComplete (only present on first call after redeploy)
-			t.conn.MarkStmt(scramStmtHash)
+			t.Backend.MarkStmt(scramStmtHash)
 			PutMsgBody(body)
 		case '2': // BindComplete
 			PutMsgBody(body)
@@ -422,9 +386,9 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 			if rolpassword == "" {
 				return nil, fmt.Errorf("user %q not found in pg_authid", username)
 			}
-			return parseSCRAMVerifier(rolpassword)
+			return auth.ParseSCRAMVerifier(rolpassword)
 		case 'E':
-			errStr := parseErrorMessage(body)
+			errStr := ParseErrorMessage(body)
 			PutMsgBody(body)
 			return nil, fmt.Errorf("pg_authid query error: %s", errStr)
 		default:
@@ -434,7 +398,7 @@ func (t *Target) fetchSCRAMVerifier(username string) (*SCRAMVerifier, error) {
 }
 
 func (t *Target) run(p *Server) {
-	logger := p.logger.
+	logger := p.Logger.
 		WithField("component", "target").
 		WithField("target", t.Name)
 
@@ -450,25 +414,25 @@ func (t *Target) run(p *Server) {
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer healthTicker.Stop()
 
-	statsTicker := time.NewTicker(p.config.Server.StatsInterval)
+	statsTicker := time.NewTicker(p.Config.Server.StatsInterval)
 	defer statsTicker.Stop()
 
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-t.Context.Done():
 			logger.Info("Target manager stopping")
 			t.drain(p, logger)
 			return
 
-		case req := <-t.scramCh:
+		case req := <-t.ScramCh:
 			verifier, err := t.fetchSCRAMVerifier(req.username)
-			req.reply <- scramReply{verifier: verifier, err: err}
+			req.reply <- ScramReply{verifier: verifier, err: err}
 
-		case conn := <-t.closeCh:
+		case conn := <-t.CloseCh:
 			t.handleClose(p, conn, logger)
 
-		case <-t.demand:
-			// A borrowConn caller hit an empty pool. Grow immediately rather
+		case <-t.Demand:
+			// A borrowConn caller hit an empty Pool. Grow immediately rather
 			// than waiting for the next growthTicker tick.
 			t.growthCycle(p, logger)
 
@@ -485,35 +449,35 @@ func (t *Target) run(p *Server) {
 }
 
 // openPrivilegedConn opens t.conn and populates t.params, then closes t.ready.
-// Retries until successful or ctx is cancelled.
-func (t *Target) openPrivilegedConn(p *Server, logger *Logger) error {
-	pgfoxCert, err := p.loadOrGenerateUserCert(p.config.Server.PgFoxRole)
+// Retries until successful or Context is cancelled.
+func (t *Target) openPrivilegedConn(p *Server, logger *logger.Logger) error {
+	pgfoxCert, err := p.loadOrGenerateUserCert(p.Config.Server.PgFoxRole)
 	if err != nil {
 		return fmt.Errorf("failed to load pgfox cert: %w", err)
 	}
 
 	for {
-		if t.ctx.Err() != nil {
+		if t.Context.Err() != nil {
 			return fmt.Errorf("context cancelled")
 		}
 
-		conn, err := p.createCertBackendConnection(t, "postgres", p.config.Server.PgFoxRole, pgfoxCert)
+		conn, err := p.createCertBackend(t, "postgres", p.Config.Server.PgFoxRole, pgfoxCert)
 		if err != nil {
 			logger.WithError(err).Warn("Privileged connection failed, retrying in 5s")
 			select {
-			case <-t.ctx.Done():
+			case <-t.Context.Done():
 				return fmt.Errorf("context cancelled")
 			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
 
-		t.conn = conn
-		t.totalOpen++
-		t.atomicTotalOpen.Store(int32(t.totalOpen))
+		t.Backend = conn
+		t.TotalOpen++
+		t.AtomicTotalOpen.Store(int32(t.TotalOpen))
 
 		for k, v := range conn.parameters {
-			t.params[k] = v
+			t.Params[k] = v
 		}
 
 		// Deploy both privileged prepared statements immediately so
@@ -523,42 +487,42 @@ func (t *Target) openPrivilegedConn(p *Server, logger *Logger) error {
 			logger.WithError(err).Warn("Failed to deploy privileged stmts, will retry on next use")
 		}
 
-		close(t.ready)
-		logger.Info("Privileged connection ready", "role", p.config.Server.PgFoxRole)
+		close(t.Ready)
+		logger.Info("Privileged connection ready", "role", p.Config.Server.PgFoxRole)
 		return nil
 	}
 }
 
-// handleClose closes a dead connection, removes it from its pool, and signals
+// handleClose closes a dead connection, removes it from its Pool, and signals
 // connReady so waiting borrowers can react (e.g. trigger growth).
-func (t *Target) handleClose(p *Server, conn *BackendConnection, logger *Logger) {
-	pool := conn.pool
-	t.backendIndex.Delete(conn.GetProcessID())
-	conn.conn.Close()
-	t.totalOpen--
-	pool.removeFromAllConns(conn)
+func (t *Target) handleClose(p *Server, backend *Backend, logger *logger.Logger) {
+	pool := backend.Pool
+	t.BackendIndex.Delete(backend.GetProcessID())
+	backend.Conn.Close()
+	t.TotalOpen--
+	pool.removeFromAll(backend)
 	logger.Debug("Closed failed connection",
-		"database", pool.dbName,
-		"user", pool.username,
-		"target_total", t.totalOpen)
+		"database", pool.DbName,
+		"user", pool.Username,
+		"target_total", t.TotalOpen)
 	t.signalConnReady()
 }
 
 // growthCycle runs on every growthTicker. Opens one connection per contended
-// pool per tick, recycling slots from idle pools before using fresh server slots.
+// Pool per tick, recycling slots from idle pools before using fresh server slots.
 // Shrinks only when nothing is contended.
-func (t *Target) growthCycle(p *Server, logger *Logger) {
+func (t *Target) growthCycle(p *Server, logger *logger.Logger) {
 	now := time.Now()
-	peakWindow := p.config.Server.PeakWindow
+	peakWindow := p.Config.Server.PeakWindow
 
 	// cachedPools is maintained exclusively by the target goroutine — no lock.
 	pools := t.allPools()
 
 	serverAvailable := 0
-	if t.serverMaxConns > 0 {
-		serverAvailable = t.serverMaxConns - t.serverOpenConns
+	if t.ServerMaxConns > 0 {
+		serverAvailable = t.ServerMaxConns - t.ServerOpenConns
 	} else {
-		serverAvailable = t.MaxConnections - t.totalOpen
+		serverAvailable = t.MaxConnections - t.TotalOpen
 	}
 
 	type poolState struct {
@@ -574,7 +538,7 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 	states := make([]poolState, 0, len(pools))
 
 	for _, pool := range pools {
-		active := pool.activeConnections()
+		active := pool.ActiveConnections()
 		pool.peakSamples = append(pool.peakSamples, peakSample{active: active, at: now})
 
 		cutoff := now.Add(-peakWindow)
@@ -591,8 +555,8 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 			}
 		}
 
-		idle := pool.idleConnections()
-		total := len(pool.allConns)
+		idle := pool.IdleConnections()
+		total := len(pool.All)
 		contended := total == 0 || active == total
 		excess := idle - (hwm + 1)
 		if excess < 0 {
@@ -613,10 +577,10 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 		}
 	}
 
-	// Open one connection per contended pool — recycling idle slots first.
+	// Open one connection per contended Pool — recycling idle slots first.
 	idleIdx := 0
 	for _, cs := range contendedPools {
-		if t.totalOpen >= t.MaxConnections || serverAvailable <= 1 {
+		if t.TotalOpen >= t.MaxConnections || serverAvailable <= 1 {
 			break
 		}
 
@@ -629,8 +593,8 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 			}
 			if t.closeOneIdle(p, is.pool, logger) {
 				logger.Debug("Recycling slot",
-					"from", is.pool.dbName+"/"+is.pool.username,
-					"to", cs.pool.dbName+"/"+cs.pool.username)
+					"from", is.pool.DbName+"/"+is.pool.Username,
+					"to", cs.pool.DbName+"/"+cs.pool.Username)
 				idlePools[idleIdx].excess--
 				if idlePools[idleIdx].excess == 0 {
 					idleIdx++
@@ -640,7 +604,7 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 			break
 		}
 
-		if recycled || (t.totalOpen < t.MaxConnections && serverAvailable > 1) {
+		if recycled || (t.TotalOpen < t.MaxConnections && serverAvailable > 1) {
 			reason := "growth"
 			if recycled {
 				reason = "recycled"
@@ -659,21 +623,21 @@ func (t *Target) growthCycle(p *Server, logger *Logger) {
 
 // healthCheck runs on the healthTicker. Validates idle connections and replaces
 // dead ones. Also checks and replaces the privileged connection if needed.
-func (t *Target) healthCheck(p *Server, logger *Logger) {
+func (t *Target) healthCheck(p *Server, logger *logger.Logger) {
 	// Check privileged connection.
-	if t.conn != nil && !t.conn.IsAlive() {
+	if t.Backend != nil && !t.Backend.IsAlive() {
 		logger.Warn("Privileged connection dead, replacing")
-		t.conn.conn.Close()
-		t.totalOpen--
-		t.atomicTotalOpen.Store(int32(t.totalOpen))
-		t.conn = nil
+		t.Backend.Conn.Close()
+		t.TotalOpen--
+		t.AtomicTotalOpen.Store(int32(t.TotalOpen))
+		t.Backend = nil
 
-		pgfoxCert, err := p.loadOrGenerateUserCert(p.config.Server.PgFoxRole)
+		pgfoxCert, err := p.loadOrGenerateUserCert(p.Config.Server.PgFoxRole)
 		if err == nil {
-			if conn, err := p.createCertBackendConnection(t, "postgres", p.config.Server.PgFoxRole, pgfoxCert); err == nil {
-				t.conn = conn
-				t.totalOpen++
-				t.atomicTotalOpen.Store(int32(t.totalOpen))
+			if conn, err := p.createCertBackend(t, "postgres", p.Config.Server.PgFoxRole, pgfoxCert); err == nil {
+				t.Backend = conn
+				t.TotalOpen++
+				t.AtomicTotalOpen.Store(int32(t.TotalOpen))
 				if err := t.deployPrivilegedStmts(logger); err != nil {
 					logger.WithError(err).Warn("Failed to deploy privileged stmts after reconnect")
 				}
@@ -684,18 +648,18 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 		}
 	}
 
-	idleTimeout := p.config.Server.IdleTimeout
+	idleTimeout := p.Config.Server.IdleTimeout
 	cutoff := time.Now().Add(-idleTimeout)
 
 	pools := t.allPools()
 
 	for _, pool := range pools {
-		poolLen := len(pool.backendPool)
+		poolLen := len(pool.Queue)
 		for i := 0; i < poolLen; i++ {
 			select {
-			case conn := <-pool.backendPool:
-				dead := !conn.IsAlive()
-				tooOld := idleTimeout > 0 && conn.LastUsedAt().Before(cutoff)
+			case backend := <-pool.Queue:
+				dead := !backend.IsAlive()
+				tooOld := idleTimeout > 0 && backend.LastUsedAt().Before(cutoff)
 
 				if dead || tooOld {
 					reason := "dead"
@@ -704,21 +668,21 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 					}
 					logger.Debug("Health check closing connection",
 						"reason", reason,
-						"database", pool.dbName,
-						"user", pool.username)
-					conn.conn.Close()
-					t.totalOpen--
-					t.atomicTotalOpen.Store(int32(t.totalOpen))
-					pool.removeFromAllConns(conn)
-					atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
+						"database", pool.DbName,
+						"user", pool.Username)
+					backend.Conn.Close()
+					t.TotalOpen--
+					t.AtomicTotalOpen.Store(int32(t.TotalOpen))
+					pool.removeFromAll(backend)
+					atomic.AddInt64(&p.GlobalStats.IdleConnectionsClosed, 1)
 				} else {
 					select {
-					case pool.backendPool <- conn:
+					case pool.Queue <- backend:
 					default:
-						conn.conn.Close()
-						t.totalOpen--
-						t.atomicTotalOpen.Store(int32(t.totalOpen))
-						pool.removeFromAllConns(conn)
+						backend.Conn.Close()
+						t.TotalOpen--
+						t.AtomicTotalOpen.Store(int32(t.TotalOpen))
+						pool.removeFromAll(backend)
 					}
 				}
 			default:
@@ -730,20 +694,20 @@ func (t *Target) healthCheck(p *Server, logger *Logger) {
 // updateServerStats queries pg_stat_activity on the privileged connection using
 // the extended protocol with binary result format to get real PostgreSQL server
 // capacity regardless of non-pgfox clients.
-func (t *Target) updateServerStats(p *Server, logger *Logger) {
-	if t.conn == nil {
+func (t *Target) updateServerStats(p *Server, logger *logger.Logger) {
+	if t.Backend == nil {
 		return
 	}
 
-	if err := t.conn.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := t.Backend.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return
 	}
-	defer t.conn.conn.SetReadDeadline(time.Time{})
+	defer t.Backend.Conn.SetReadDeadline(time.Time{})
 
 	// Re-deploy statement if needed (defensive guard, same as fetchSCRAMVerifier).
-	if !t.conn.HasStmt(statsStmtHash) {
+	if !t.Backend.HasStmt(statsStmtHash) {
 		parseBody := BuildParseBody(statsStmtHash, statsStmtSQL, nil)
-		if err := t.conn.WriteMessage('P', parseBody); err != nil {
+		if err := t.Backend.WriteMessage('P', parseBody); err != nil {
 			logger.WithError(err).Warn("Failed to send Parse for stats stmt")
 			return
 		}
@@ -757,18 +721,18 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 		nil,        // no param values
 		[]int16{1}, // binary result for all columns
 	)
-	if err := t.conn.WriteMessage('B', bindBody); err != nil {
+	if err := t.Backend.WriteMessage('B', bindBody); err != nil {
 		logger.WithError(err).Warn("Failed to send Bind for stats stmt")
 		return
 	}
 
 	execBody := BuildExecuteBody("", 0)
-	if err := t.conn.WriteMessage('E', execBody); err != nil {
+	if err := t.Backend.WriteMessage('E', execBody); err != nil {
 		logger.WithError(err).Warn("Failed to send Execute for stats stmt")
 		return
 	}
 
-	if err := t.conn.WriteMessage('S', SyncBody); err != nil {
+	if err := t.Backend.WriteMessage('S', SyncBody); err != nil {
 		logger.WithError(err).Warn("Failed to send Sync for stats stmt")
 		return
 	}
@@ -776,14 +740,14 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 	var maxConns, openConns int
 
 	for {
-		msgType, body, err := t.conn.ReadMessage()
+		msgType, body, err := t.Backend.ReadMessage()
 		if err != nil {
 			logger.WithError(err).Warn("Failed to read stats response")
 			return
 		}
 		switch msgType {
 		case '1': // ParseComplete (only on redeploy)
-			t.conn.MarkStmt(statsStmtHash)
+			t.Backend.MarkStmt(statsStmtHash)
 			PutMsgBody(body)
 		case '2': // BindComplete
 			PutMsgBody(body)
@@ -838,8 +802,8 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 		case 'Z': // ReadyForQuery
 			PutMsgBody(body)
 			if maxConns > 0 {
-				t.serverMaxConns = maxConns
-				t.serverOpenConns = openConns
+				t.ServerMaxConns = maxConns
+				t.ServerOpenConns = openConns
 				logger.Debug("Server stats updated",
 					"max_connections", maxConns,
 					"open_connections", openConns,
@@ -847,7 +811,7 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 			}
 			return
 		case 'E':
-			errStr := parseErrorMessage(body)
+			errStr := ParseErrorMessage(body)
 			PutMsgBody(body)
 			logger.Warn("Stats query error", "error", errStr)
 			return
@@ -858,14 +822,14 @@ func (t *Target) updateServerStats(p *Server, logger *Logger) {
 }
 
 // drain closes all connections on shutdown.
-func (t *Target) drain(p *Server, logger *Logger) {
+func (t *Target) drain(p *Server, logger *logger.Logger) {
 	// Drain in-flight returns and closes first.
 	for {
 		select {
-		case conn := <-t.closeCh:
-			conn.conn.Close()
-			t.totalOpen--
-			t.atomicTotalOpen.Store(int32(t.totalOpen))
+		case backend := <-t.CloseCh:
+			backend.Conn.Close()
+			t.TotalOpen--
+			t.AtomicTotalOpen.Store(int32(t.TotalOpen))
 		default:
 			goto drainPools
 		}
@@ -877,10 +841,10 @@ drainPools:
 	for _, pool := range pools {
 		for {
 			select {
-			case conn := <-pool.backendPool:
-				conn.conn.Close()
-				t.totalOpen--
-				t.atomicTotalOpen.Store(int32(t.totalOpen))
+			case backend := <-pool.Queue:
+				backend.Conn.Close()
+				t.TotalOpen--
+				t.AtomicTotalOpen.Store(int32(t.TotalOpen))
 			default:
 				goto nextPool
 			}
@@ -888,65 +852,65 @@ drainPools:
 	nextPool:
 	}
 
-	if t.conn != nil {
-		t.conn.conn.Close()
-		t.totalOpen--
-		t.atomicTotalOpen.Store(int32(t.totalOpen))
-		t.conn = nil
+	if t.Backend != nil {
+		t.Backend.Conn.Close()
+		t.TotalOpen--
+		t.AtomicTotalOpen.Store(int32(t.TotalOpen))
+		t.Backend = nil
 	}
 
-	logger.Info("Target drained", "remaining_open", t.totalOpen)
+	logger.Info("Target drained", "remaining_open", t.TotalOpen)
 }
 
-// openOne opens a single new backend connection for pool and adds it to the
-// pool. Must only be called from the target goroutine.
-func (t *Target) openOne(p *Server, pool *Pool, logger *Logger, reason string) {
-	conn, err := pool.newConn(p)
+// openOne opens a single new backend connection for Pool and adds it to the
+// Pool. Must only be called from the target goroutine.
+func (t *Target) openOne(p *Server, pool *Pool, logger *logger.Logger, reason string) {
+	backend, err := pool.newConn(p)
 	if err != nil {
 		logger.WithError(err).Warn("Failed to open backend connection",
 			"reason", reason,
-			"database", pool.dbName,
-			"user", pool.username)
+			"database", pool.DbName,
+			"user", pool.Username)
 		return
 	}
 
-	conn.pool = pool
-	pool.allConns = append(pool.allConns, conn)
-	t.totalOpen++
+	backend.Pool = pool
+	pool.All = append(pool.All, backend)
+	t.TotalOpen++
 
 	select {
-	case pool.backendPool <- conn:
+	case pool.Queue <- backend:
 		t.signalConnReady()
 		logger.Debug("Opened connection",
 			"reason", reason,
-			"database", pool.dbName,
-			"user", pool.username,
-			"pool_total", len(pool.allConns),
-			"target_total", t.totalOpen)
+			"database", pool.DbName,
+			"user", pool.Username,
+			"pool_total", len(pool.All),
+			"target_total", t.TotalOpen)
 	default:
 		// backendPool full — shouldn't happen but guard.
-		conn.conn.Close()
-		t.totalOpen--
-		t.atomicTotalOpen.Store(int32(t.totalOpen))
-		pool.allConns = pool.allConns[:len(pool.allConns)-1]
+		backend.Conn.Close()
+		t.TotalOpen--
+		t.AtomicTotalOpen.Store(int32(t.TotalOpen))
+		pool.All = pool.All[:len(pool.All)-1]
 	}
 }
 
-// closeOneIdle closes one idle connection from pool and removes it.
+// closeOneIdle closes one idle connection from Pool and removes it.
 // Returns true if a connection was closed.
-func (t *Target) closeOneIdle(p *Server, pool *Pool, logger *Logger) bool {
+func (t *Target) closeOneIdle(p *Server, pool *Pool, logger *logger.Logger) bool {
 	select {
-	case conn := <-pool.backendPool:
-		conn.conn.Close()
-		t.totalOpen--
-		t.atomicTotalOpen.Store(int32(t.totalOpen))
-		pool.removeFromAllConns(conn)
-		atomic.AddInt64(&p.stats.IdleConnectionsClosed, 1)
-		logger.Debug("Shrunk pool",
-			"database", pool.dbName,
-			"user", pool.username,
-			"pool_total", len(pool.allConns),
-			"target_total", t.totalOpen)
+	case backend := <-pool.Queue:
+		backend.Conn.Close()
+		t.TotalOpen--
+		t.AtomicTotalOpen.Store(int32(t.TotalOpen))
+		pool.removeFromAll(backend)
+		atomic.AddInt64(&p.GlobalStats.IdleConnectionsClosed, 1)
+		logger.Debug("Shrunk Pool",
+			"database", pool.DbName,
+			"user", pool.Username,
+			"pool_total", len(pool.All),
+			"target_total", t.TotalOpen)
 		return true
 	default:
 		return false
@@ -956,24 +920,24 @@ func (t *Target) closeOneIdle(p *Server, pool *Pool, logger *Logger) bool {
 // signalConnReady does a non-blocking send on connReady to wake borrowConn waiters.
 func (t *Target) signalConnReady() {
 	select {
-	case t.connReady <- struct{}{}:
+	case t.ConnReady <- struct{}{}:
 	default:
 	}
 }
 
-// allPools flushes any pending pool registrations into cachedPools and returns
+// allPools flushes any pending Pool registrations into cachedPools and returns
 // the slice. Must only be called from the target goroutine — no lock needed.
 func (t *Target) allPools() []*Pool {
 	// Drain all pending registrations before returning the slice so callers
 	// always see a fully up-to-date view. This prevents the race where getPool
-	// registers a pool and immediately triggers demand, causing growthCycle to
+	// registers a Pool and immediately triggers demand, causing growthCycle to
 	// run before the poolRegistered case fires in the select.
 	for {
 		select {
-		case pool := <-t.poolRegistered:
-			t.cachedPools = append(t.cachedPools, pool)
+		case pool := <-t.PoolRegistered:
+			t.CachedPools = append(t.CachedPools, pool)
 		default:
-			return t.cachedPools
+			return t.CachedPools
 		}
 	}
 }

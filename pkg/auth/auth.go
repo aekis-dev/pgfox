@@ -1,4 +1,4 @@
-package main
+package auth
 
 import (
 	"crypto/hmac"
@@ -152,8 +152,8 @@ func (s *SCRAMAuth) VerifyServerFinal(serverFinal []byte) error {
 	return nil
 }
 
-// parseSASLMechanisms parses the list of supported SASL mechanisms from AuthenticationSASL message
-func parseSASLMechanisms(data []byte) []string {
+// ParseSASLMechanisms parses the list of supported SASL mechanisms from AuthenticationSASL message
+func ParseSASLMechanisms(data []byte) []string {
 	var mechanisms []string
 
 	i := 0
@@ -209,179 +209,6 @@ func (s *SCRAMAuth) xor(a, b []byte) []byte {
 	return result
 }
 
-// handleSCRAMAuth handles SCRAM-SHA-256 authentication
-func handleSCRAMAuth(backend *BackendConnection, username, password string, saslData []byte) error {
-	// Parse supported SASL mechanisms
-	mechanisms := parseSASLMechanisms(saslData)
-
-	// Check if SCRAM-SHA-256 is supported
-	scramSupported := false
-	for _, mech := range mechanisms {
-		if mech == "SCRAM-SHA-256" {
-			scramSupported = true
-			break
-		}
-	}
-
-	if !scramSupported {
-		return fmt.Errorf("server does not support SCRAM-SHA-256, supported mechanisms: %v", mechanisms)
-	}
-
-	scram := NewSCRAMAuth(username, password)
-
-	// Send initial response
-	initialResponse := scram.BuildInitialResponse()
-
-	// Build SASL initial response message
-	mechanism := "SCRAM-SHA-256"
-	msgLen := len(mechanism) + 1 + 4 + len(initialResponse)
-	msg := make([]byte, msgLen)
-
-	pos := 0
-	copy(msg[pos:], mechanism)
-	pos += len(mechanism)
-	msg[pos] = 0
-	pos++
-
-	msg[pos] = byte(len(initialResponse) >> 24)
-	msg[pos+1] = byte(len(initialResponse) >> 16)
-	msg[pos+2] = byte(len(initialResponse) >> 8)
-	msg[pos+3] = byte(len(initialResponse))
-	pos += 4
-
-	copy(msg[pos:], initialResponse)
-
-	if err := backend.WriteMessage('p', msg); err != nil {
-		return fmt.Errorf("failed to send SASL initial response: %w", err)
-	}
-
-	// Read server first response
-	msgType, body, err := backend.ReadMessage()
-	if err != nil {
-		return fmt.Errorf("failed to read SASL continue: %w", err)
-	}
-
-	if msgType == 'E' {
-		errorMsg := parseErrorMessage(body)
-		return fmt.Errorf("SCRAM authentication failed: %s", errorMsg)
-	}
-
-	if msgType != 'R' {
-		return fmt.Errorf("expected authentication response, got %c", msgType)
-	}
-
-	if len(body) < 4 {
-		return fmt.Errorf("invalid SASL continue response")
-	}
-
-	authType := uint32(body[0])<<24 | uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
-	if authType != AuthenticationSASLContinue {
-		return fmt.Errorf("expected SASL continue, got auth type %d", authType)
-	}
-
-	serverFirst := body[4:]
-	clientFinal, err := scram.ProcessServerFirst(serverFirst)
-	if err != nil {
-		return fmt.Errorf("failed to process server first: %w", err)
-	}
-
-	// Send client final response
-	if err := backend.WriteMessage('p', clientFinal); err != nil {
-		return fmt.Errorf("failed to send client final: %w", err)
-	}
-
-	// Read server final response
-	msgType, body, err = backend.ReadMessage()
-	if err != nil {
-		return fmt.Errorf("failed to read server final: %w", err)
-	}
-
-	if msgType == 'E' {
-		errorMsg := parseErrorMessage(body)
-		return fmt.Errorf("SCRAM final authentication failed: %s", errorMsg)
-	}
-
-	if msgType != 'R' {
-		return fmt.Errorf("expected authentication response, got %c", msgType)
-	}
-
-	if len(body) < 4 {
-		return fmt.Errorf("invalid server final response")
-	}
-
-	authType = uint32(body[0])<<24 | uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
-	if authType != AuthenticationSASLFinal {
-		return fmt.Errorf("expected SASL final, got auth type %d", authType)
-	}
-
-	serverFinal := body[4:]
-	if err := scram.VerifyServerFinal(serverFinal); err != nil {
-		return fmt.Errorf("server verification failed: %w", err)
-	}
-
-	// CRITICAL: SCRAM auth is complete, but we MUST continue reading
-	// until we get ReadyForQuery. The server will send:
-	// - AuthenticationOK (R with type=0)
-	// - ParameterStatus (S) messages
-	// - BackendKeyData (K)
-	// - ReadyForQuery (Z)
-
-	authComplete := false
-
-	for {
-		msgType, body, err := backend.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("failed to read post-SCRAM message: %w", err)
-		}
-
-		switch msgType {
-		case 'R': // Should be AuthenticationOK
-			if len(body) >= 4 {
-				authType := uint32(body[0])<<24 | uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
-				if authType == AuthenticationOK {
-					authComplete = true
-					continue
-				}
-			}
-			return fmt.Errorf("unexpected auth message after SCRAM")
-
-		case 'K': // Backend key data
-			if !authComplete {
-				return fmt.Errorf("received BackendKeyData before AuthenticationOK")
-			}
-			if len(body) >= 8 {
-				processID := int32(body[0])<<24 | int32(body[1])<<16 | int32(body[2])<<8 | int32(body[3])
-				secretKey := int32(body[4])<<24 | int32(body[5])<<16 | int32(body[6])<<8 | int32(body[7])
-				backend.SetProcessID(processID)
-				backend.SetSecretKey(secretKey)
-			}
-			continue
-
-		case 'S': // Parameter status
-			if !authComplete {
-				return fmt.Errorf("received ParameterStatus before AuthenticationOK")
-			}
-			continue
-
-		case 'Z': // Ready for query - DONE!
-			if !authComplete {
-				return fmt.Errorf("received ReadyForQuery before AuthenticationOK")
-			}
-			return nil
-
-		case 'E':
-			errorMsg := parseErrorMessage(body)
-			return fmt.Errorf("error after SCRAM: %s", errorMsg)
-
-		case 'N':
-			continue
-
-		default:
-			return fmt.Errorf("unexpected message type after SCRAM: %c", msgType)
-		}
-	}
-}
-
 // SCRAMVerifier holds the server-side SCRAM-SHA-256 verification data
 // retrieved from pg_authid.rolpassword. PgFox uses this to act as a
 // proper SCRAM server when authenticating clients without needing plaintext.
@@ -392,11 +219,11 @@ type SCRAMVerifier struct {
 	ServerKey  []byte // HMAC-SHA-256(SaltedPassword, "Server Key")
 }
 
-// parseSCRAMVerifier parses a PostgreSQL SCRAM-SHA-256 verifier string from
+// ParseSCRAMVerifier parses a PostgreSQL SCRAM-SHA-256 verifier string from
 // pg_authid.rolpassword. The format is:
 //
 //	SCRAM-SHA-256$<iterations>:<salt-base64>$<StoredKey-base64>:<ServerKey-base64>
-func parseSCRAMVerifier(rolpassword string) (*SCRAMVerifier, error) {
+func ParseSCRAMVerifier(rolpassword string) (*SCRAMVerifier, error) {
 	const prefix = "SCRAM-SHA-256$"
 	if !strings.HasPrefix(rolpassword, prefix) {
 		return nil, fmt.Errorf("not a SCRAM-SHA-256 verifier: unexpected prefix")

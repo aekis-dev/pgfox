@@ -239,13 +239,13 @@ async def test_listen_notify():
     print("\n── Test 5: LISTEN/NOTIFY with concurrent queries (text result format forced) ──")
 
     received: list = []
-    listener = await connect()
+    Listener = await connect()
 
     def on_notification(conn, pid, channel, payload):
         received.append(payload)
 
-    await listener.add_listener("pgfox_test_channel", on_notification)
-    await listener.execute("LISTEN pgfox_test_channel")
+    await Listener.add_listener("pgfox_test_channel", on_notification)
+    await Listener.execute("LISTEN pgfox_test_channel")
 
     async def send_notifications():
         await asyncio.sleep(0.3)
@@ -273,9 +273,9 @@ async def test_listen_notify():
     query_results = await queries
     await asyncio.sleep(0.5)
 
-    await listener.remove_listener("pgfox_test_channel", on_notification)
-    await listener.execute("UNLISTEN pgfox_test_channel")
-    await listener.close()
+    await Listener.remove_listener("pgfox_test_channel", on_notification)
+    await Listener.execute("UNLISTEN pgfox_test_channel")
+    await Listener.close()
 
     print(f"  notifications received: {received}")
     print(f"  concurrent queries ok:  {len(query_results)}/10")

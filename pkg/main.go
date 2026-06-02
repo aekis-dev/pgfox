@@ -8,6 +8,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	logger2 "github.com/aekis-dev/pgfox/pkg/logger"
+	"github.com/aekis-dev/pgfox/pkg/pgfox"
+	"github.com/aekis-dev/pgfox/pkg/web"
 )
 
 const Version = "1.0.0"
@@ -27,7 +31,7 @@ func main() {
 	}
 
 	// Load configuration
-	config, err := LoadConfig(*configPath)
+	config, err := pgfox.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -38,11 +42,11 @@ func main() {
 	}
 
 	// Initialize logger
-	logger := NewLogger(config.Logging)
+	logger := logger2.NewLogger(config.Logging)
 	logger.Info("Starting PgFox", "version", Version, "config", *configPath)
 
 	// Create server
-	server, err := NewServer(*config, logger)
+	server, err := pgfox.NewServer(*config, logger)
 	if err != nil {
 		logger.Fatal("Failed to create server", "error", err)
 	}
@@ -68,17 +72,30 @@ func main() {
 	go func() {
 		for range reloadChan {
 			logger.Info("Received SIGHUP, reloading config")
-			newConfig, err := LoadConfig(*configPath)
+			newConfig, err := pgfox.LoadConfig(*configPath)
 			if err != nil {
 				logger.WithError(err).Error("Config reload failed, keeping current config")
 				continue
 			}
-			server.reload(*newConfig)
+			server.Reload(*newConfig)
 		}
 	}()
 
 	if err := server.Start(ctx); err != nil {
 		logger.Fatal("Server failed to start", "error", err)
+	}
+
+	if server.Config.Metrics.Enabled {
+		server.Wg.Add(1)
+		go func() {
+			defer server.Wg.Done()
+			addr := fmt.Sprintf(":%d", server.Config.Metrics.Port)
+			webserver := web.NewWebServer(server, addr, server.Logger)
+			server.Logger.Info("Starting web server", "addr", addr)
+			if err := webserver.Start(ctx); err != nil {
+				server.Logger.WithError(err).Error("Web server failed")
+			}
+		}()
 	}
 
 	logger.Info("PgFox shutdown complete")
