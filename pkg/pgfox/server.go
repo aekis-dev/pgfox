@@ -42,6 +42,11 @@ type Server struct {
 	Listeners   map[Channel]*Listen
 	ListenersMu sync.RWMutex
 
+	// certGenMu serialises user-certificate generation per username so that
+	// concurrent callers (target growth, listen setup, reconnect) never
+	// interleave writes to the same {user}.crt/{user}.key pair on disk.
+	certGenMu sync.Map // username → *sync.Mutex
+
 	GlobalStats GlobalStats
 	Context     context.Context
 	Cancel      context.CancelFunc

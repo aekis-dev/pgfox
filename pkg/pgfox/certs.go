@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -82,7 +83,24 @@ func (p *Server) loadCACertPool() (*x509.CertPool, error) {
 // It checks the cert cache at {pgfox_dir}/certs/{username}.crt:
 //   - If the cert exists, is signed by the current CA, and is not expired → use it
 //   - Otherwise → generate a new cert signed by the CA, cache it, and use it
+//
+// certLock returns the per-username mutex used to serialise certificate
+// generation, creating it on first use.
+func (p *Server) certLock(username string) *sync.Mutex {
+	m, _ := p.certGenMu.LoadOrStore(username, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 func (p *Server) loadOrGenerateUserCert(username string) (tls.Certificate, error) {
+	// Serialise per username: concurrent callers for the same user would
+	// otherwise interleave the .crt/.key writes and a later LoadX509KeyPair
+	// could read a mismatched pair. Different usernames still proceed in
+	// parallel. The second caller for a username finds the now-valid cache and
+	// loads a consistent pair instead of regenerating.
+	mu := p.certLock(username)
+	mu.Lock()
+	defer mu.Unlock()
+
 	certPath := p.userCertPath(username)
 	keyPath := p.userKeyPath(username)
 
