@@ -36,6 +36,11 @@ type Pool struct {
 	// Peak tracking for smart shrink decisions.
 	peakSamples []peakSample
 
+	// connCount mirrors len(All) for safe cross-goroutine reads (e.g. the
+	// metrics endpoint). All is single-writer on the target goroutine; the
+	// target goroutine Stores this after every All mutation.
+	connCount atomic.Int32
+
 	stats Stats
 }
 
@@ -57,6 +62,7 @@ func (pool *Pool) removeFromAll(conn *Backend) {
 		if c == conn {
 			pool.All[i] = pool.All[len(pool.All)-1]
 			pool.All = pool.All[:len(pool.All)-1]
+			pool.connCount.Store(int32(len(pool.All)))
 			return
 		}
 	}
@@ -139,7 +145,7 @@ func (pool *Pool) IdleConnections() int {
 
 // ActiveConnections returns connections currently checked out.
 func (pool *Pool) ActiveConnections() int {
-	total := len(pool.All)
+	total := int(pool.connCount.Load())
 	idle := len(pool.Queue)
 	if idle > total {
 		return 0
@@ -149,7 +155,7 @@ func (pool *Pool) ActiveConnections() int {
 
 // TotalConnections returns all connections owned by this Pool.
 func (pool *Pool) TotalConnections() int {
-	return len(pool.All)
+	return int(pool.connCount.Load())
 }
 
 func (pool *Pool) QueriesExecuted() int64 {

@@ -58,8 +58,8 @@ type Target struct {
 	// ServerMaxConns and serverOpenConns are updated by the stats ticker
 	// from pg_stat_activity. They reflect the real PostgreSQL server state
 	// regardless of other clients not using pgfox.
-	ServerMaxConns  int // pg max_connections setting
-	ServerOpenConns int // total connections currently open on the server
+	ServerMaxConns  atomic.Int32 // pg max_connections setting
+	ServerOpenConns atomic.Int32 // total connections currently open on the server
 
 	// ListenOpen is the count of active dedicated listen connections on this
 	// target. Written atomically from client goroutines.
@@ -519,8 +519,8 @@ func (t *Target) growthCycle(p *Server, logger *logger.Logger) {
 	pools := t.allPools()
 
 	serverAvailable := 0
-	if t.ServerMaxConns > 0 {
-		serverAvailable = t.ServerMaxConns - t.ServerOpenConns
+	if smc := int(t.ServerMaxConns.Load()); smc > 0 {
+		serverAvailable = smc - int(t.ServerOpenConns.Load())
 	} else {
 		serverAvailable = t.MaxConnections - t.TotalOpen
 	}
@@ -815,8 +815,8 @@ func (t *Target) updateServerStats(p *Server, logger *logger.Logger) {
 		case 'Z': // ReadyForQuery
 			PutMsgBody(body)
 			if maxConns > 0 {
-				t.ServerMaxConns = maxConns
-				t.ServerOpenConns = openConns
+				t.ServerMaxConns.Store(int32(maxConns))
+				t.ServerOpenConns.Store(int32(openConns))
 				logger.Debug("Server stats updated",
 					"max_connections", maxConns,
 					"open_connections", openConns,
@@ -889,6 +889,7 @@ func (t *Target) openOne(p *Server, pool *Pool, logger *logger.Logger, reason st
 
 	backend.Pool = pool
 	pool.All = append(pool.All, backend)
+	pool.connCount.Store(int32(len(pool.All)))
 	t.TotalOpen++
 
 	select {
@@ -906,6 +907,7 @@ func (t *Target) openOne(p *Server, pool *Pool, logger *logger.Logger, reason st
 		t.TotalOpen--
 		t.AtomicTotalOpen.Store(int32(t.TotalOpen))
 		pool.All = pool.All[:len(pool.All)-1]
+		pool.connCount.Store(int32(len(pool.All)))
 	}
 }
 
