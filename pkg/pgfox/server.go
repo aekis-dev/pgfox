@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
@@ -46,6 +47,13 @@ type Server struct {
 	// concurrent callers (target growth, listen setup, reconnect) never
 	// interleave writes to the same {user}.crt/{user}.key pair on disk.
 	certGenMu sync.Map // username → *sync.Mutex
+
+	// caPool caches the parsed CA cert pool so that every new backend
+	// connection doesn't re-read and re-parse the CA from disk. Populated
+	// lazily on first use (after EnsureCerts has run at startup) and stable for
+	// the process lifetime; CA rotation requires a restart.
+	caMu   sync.RWMutex
+	caPool *x509.CertPool
 
 	GlobalStats GlobalStats
 	Context     context.Context

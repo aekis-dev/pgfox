@@ -383,9 +383,6 @@ func (c *Client) LookupInternalName(clientName string) (string, bool) {
 
 // UnmapStmtName removes the mapping for clientName and its reverse entry.
 func (c *Client) UnmapStmtName(clientName string) {
-	if hash, ok := c.stmtNameMap[clientName]; ok {
-		delete(c.stmtRevMap, hash)
-	}
 	delete(c.stmtNameMap, clientName)
 }
 

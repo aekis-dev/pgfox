@@ -63,19 +63,34 @@ func (p *Server) loadCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	return caCert, rsaKey, nil
 }
 
-// loadCACertPool returns an x509.CertPool containing only the PgFox CA.
-// Used for verify-full TLS connections to the backend.
-func (p *Server) loadCACertPool() (*x509.CertPool, error) {
+// caCertPool returns the parsed CA cert pool, loading and caching it on first
+// use. Subsequent calls hit the in-memory cache (read lock only), so new
+// backend connections avoid the per-connection disk read + PEM parse. The cache
+// is populated only on success, so a call made before the CA exists simply
+// retries next time rather than memoising the error.
+func (p *Server) caCertPool() (*x509.CertPool, error) {
+	p.caMu.RLock()
+	pool := p.caPool
+	p.caMu.RUnlock()
+	if pool != nil {
+		return pool, nil
+	}
+
+	p.caMu.Lock()
+	defer p.caMu.Unlock()
+	if p.caPool != nil {
+		return p.caPool, nil
+	}
+
 	caCertPEM, err := os.ReadFile(p.caCertPath())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read CA cert: %w", err)
 	}
-
-	pool := x509.NewCertPool()
+	pool = x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caCertPEM) {
 		return nil, fmt.Errorf("failed to parse CA cert into Pool")
 	}
-
+	p.caPool = pool
 	return pool, nil
 }
 
@@ -154,14 +169,9 @@ func (p *Server) isCertValidForCA(certPath string, requireSAN bool) bool {
 		return false
 	}
 
-	// Verify signed by current CA.
-	caCertPEM, err := os.ReadFile(p.caCertPath())
+	// Verify signed by current CA (cached pool — no per-call disk read/parse).
+	pool, err := p.caCertPool()
 	if err != nil {
-		return false
-	}
-
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caCertPEM) {
 		return false
 	}
 
@@ -271,7 +281,7 @@ func (p *Server) generateAndCacheUserCert(username string) (tls.Certificate, err
 // Always uses verify-full with client certificate authentication.
 // clientCert is the per-user certificate to present to the backend.
 func (p *Server) backendTLSConfig(host string, clientCert tls.Certificate) (*tls.Config, error) {
-	caPool, err := p.loadCACertPool()
+	caPool, err := p.caCertPool()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load CA Pool for backend TLS: %w", err)
 	}
