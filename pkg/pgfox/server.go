@@ -211,15 +211,14 @@ func (p *Server) handleClient(conn net.Conn) {
 			return
 		}
 
-		if client.IsInTransaction() {
-			clientLogger.Debug("Closing transaction backend on disconnect")
-			_ = backend.WriteMessage('X', []byte{})
-			time.Sleep(10 * time.Millisecond)
-			backend.Release()
-		} else {
-			clientLogger.Debug("Releasing backend on disconnect")
-			backend.Return()
-		}
+		// A pinned backend on disconnect is unsafe to return to the pool: it may
+		// hold an open transaction or client-specific (non-remappable) prepared
+		// statements. Send a best-effort Terminate and recycle it via Release —
+		// closing the connection itself tears down the server-side session, so
+		// no wait is needed.
+		clientLogger.Debug("Closing pinned backend on disconnect")
+		_ = backend.WriteMessage('X', []byte{})
+		backend.Release()
 	}()
 
 	if err := p.handleStartupMessage(client); err != nil {

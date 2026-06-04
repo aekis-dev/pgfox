@@ -214,7 +214,10 @@ func (c *Client) SetBackend(conn *Backend) {
 }
 
 func (c *Client) ShouldKeepBackend() bool {
-	return c.inTransaction // single-goroutine field, no lock needed
+	// Pinned for any reason (real transaction or named statements). The backend
+	// pointer is the source of truth for pinning; inTransaction tracks only a
+	// real SQL transaction.
+	return c.GetBackend() != nil
 }
 
 // --- Listen channel accessors (sharedMu) ---

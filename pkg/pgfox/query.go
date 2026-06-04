@@ -316,17 +316,12 @@ func (p *Server) executeExtendedPipeline(client *Client, pp *[]pipelineMsg) erro
 			return client.SendErrorResponse("FATAL", "53300", "too many connections")
 		}
 		if requiresPin {
-			// Non-remappable named/unnamed statement: pin immediately. NOTE:
-			// SetInTransaction(true) is reused here purely as the "backend is
-			// pinned to this client" mechanism — there may be no real SQL
-			// transaction. inTransaction doubles as the pin flag throughout
-			// (reconcileConn, simple-query routing). Logic that needs the real
-			// transaction state (e.g. deferred LISTEN/UNLISTEN) must use
-			// LastTxStatus(), not IsInTransaction(). Cleanly separating "pinned"
-			// from "in transaction" is a deliberate follow-up refactor.
+			// Non-remappable (named or unnamed) statement: pin to this backend
+			// via the backend pointer. This is a pin, not a transaction — the
+			// inTransaction flag stays false unless a real BEGIN occurs. The
+			// backend pointer (GetBackend()) is the source of truth for pinning.
 			client.SetBackend(backend)
 			backend.SetClient(client)
-			client.SetInTransaction(true)
 		}
 	}
 
@@ -531,7 +526,7 @@ func (p *Server) executeQuery(client *Client, query string) error {
 		}
 	}
 
-	pinned := client.IsInTransaction()
+	pinned := client.GetBackend() != nil
 
 	// Serve through the prepared statement cache when not in a transaction
 	// and the query was successfully parameterized.
@@ -807,24 +802,28 @@ func (p *Server) reconcileConn(
 
 	switch txStatus {
 	case 'T', 'E':
-		if !wasPinned {
+		// Real SQL transaction in progress: pin the backend (if not already)
+		// and mark the client as in a transaction.
+		if client.GetBackend() == nil {
 			logger.Debug("Transaction opened — pinning connection", "tx_status", string(txStatus))
 			client.SetBackend(backend)
 			backend.SetClient(client)
-			client.SetInTransaction(true)
 		}
+		client.SetInTransaction(true)
 
 	case 'I':
-		// A transaction reaching idle resolves any LISTEN/UNLISTEN buffered
-		// during it (applied on COMMIT, discarded otherwise). No-op if none.
+		// Transaction (if any) reached idle: the client is no longer in a
+		// transaction, though the backend may stay pinned for named statements.
+		client.SetInTransaction(false)
+		// Apply or discard any LISTEN/UNLISTEN buffered during the transaction.
 		p.resolvePendingListens(client)
 
 		if hasNamedStmts {
-			// Keep pinned — named statements live on this specific backend.
-			if !wasPinned {
+			// Keep the backend pinned — named statements live on it — but the
+			// client is not in a transaction.
+			if client.GetBackend() == nil {
 				client.SetBackend(backend)
 				backend.SetClient(client)
-				client.SetInTransaction(true)
 			}
 			logger.Debug("Keeping connection pinned for named statements",
 				"count", client.namedStmts)
@@ -832,7 +831,6 @@ func (p *Server) reconcileConn(
 			logger.Debug("Transaction closed — returning connection to Pool")
 			client.SetBackend(nil)
 			backend.SetClient(nil)
-			client.SetInTransaction(false)
 			backend.Return()
 		} else {
 			backend.Return()
@@ -841,10 +839,10 @@ func (p *Server) reconcileConn(
 	default:
 		logger.Warn("Unknown ReadyForQuery status, returning connection",
 			"status", string(txStatus))
+		client.SetInTransaction(false)
 		if wasPinned && !hasNamedStmts {
 			client.SetBackend(nil)
 			backend.SetClient(nil)
-			client.SetInTransaction(false)
 		}
 		backend.Return()
 	}
