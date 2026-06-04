@@ -316,7 +316,14 @@ func (p *Server) executeExtendedPipeline(client *Client, pp *[]pipelineMsg) erro
 			return client.SendErrorResponse("FATAL", "53300", "too many connections")
 		}
 		if requiresPin {
-			// Non-remappable named statement: pin immediately.
+			// Non-remappable named/unnamed statement: pin immediately. NOTE:
+			// SetInTransaction(true) is reused here purely as the "backend is
+			// pinned to this client" mechanism — there may be no real SQL
+			// transaction. inTransaction doubles as the pin flag throughout
+			// (reconcileConn, simple-query routing). Logic that needs the real
+			// transaction state (e.g. deferred LISTEN/UNLISTEN) must use
+			// LastTxStatus(), not IsInTransaction(). Cleanly separating "pinned"
+			// from "in transaction" is a deliberate follow-up refactor.
 			client.SetBackend(backend)
 			backend.SetClient(client)
 			client.SetInTransaction(true)

@@ -25,7 +25,7 @@ import (
 //     boundaries: backend, lastActivity, listenChannels/isListening.
 //
 // All other fields (authenticated, database, user, password, inTransaction,
-// namedStmts, connectedAt, stmtNameMap/stmtRevMap) are owned exclusively by
+// namedStmts, connectedAt, stmtNameMap) are owned exclusively by
 // the single goroutine handling this client and need no locking.
 type Client struct {
 	conn           net.Conn
@@ -49,10 +49,8 @@ type Client struct {
 	maxMessageSize int // maximum allowed PostgreSQL message body size in bytes
 
 	// stmtNameMap maps client-visible statement names to internal pgfox hashes.
-	// stmtRevMap is the reverse: hash → client name. Both are written only from
-	// the goroutine handling this client connection, so no lock is needed.
+	// Written only from the goroutine handling this client, so no lock is needed.
 	stmtNameMap map[string]string // clientName → hash
-	stmtRevMap  map[string]string // hash → clientName
 
 	// Transaction-deferred LISTEN/UNLISTEN support. PostgreSQL applies
 	// LISTEN/UNLISTEN at COMMIT and discards them on ROLLBACK; pendingListens
@@ -82,7 +80,6 @@ func NewClient(conn net.Conn, logger *logger.Logger, maxMessageSize int) *Client
 		lastActivity:   now,
 		maxMessageSize: maxMessageSize,
 		stmtNameMap:    make(map[string]string),
-		stmtRevMap:     make(map[string]string),
 		lastTxStatus:   'I',
 	}
 }
@@ -374,12 +371,7 @@ func (c *Client) Logger() *logger.Logger { return c.logger }
 // MapStmtName registers a mapping from a client-visible name to an internal
 // pgfox hash, and the reverse. Replaces any previous mapping for clientName.
 func (c *Client) MapStmtName(clientName, hash string) {
-	// Remove any previous reverse entry for this clientName.
-	if old, ok := c.stmtNameMap[clientName]; ok {
-		delete(c.stmtRevMap, old)
-	}
 	c.stmtNameMap[clientName] = hash
-	c.stmtRevMap[hash] = clientName
 }
 
 // LookupInternalName returns the internal hash for a client-visible statement
@@ -387,13 +379,6 @@ func (c *Client) MapStmtName(clientName, hash string) {
 func (c *Client) LookupInternalName(clientName string) (string, bool) {
 	hash, ok := c.stmtNameMap[clientName]
 	return hash, ok
-}
-
-// LookupClientName returns the client-visible name for an internal hash,
-// or ("", false) if not found.
-func (c *Client) LookupClientName(hash string) (string, bool) {
-	name, ok := c.stmtRevMap[hash]
-	return name, ok
 }
 
 // UnmapStmtName removes the mapping for clientName and its reverse entry.

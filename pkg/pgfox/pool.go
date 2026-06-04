@@ -42,6 +42,17 @@ type Pool struct {
 // removeFromAll removes conn from Pool.All.
 // Must be called from the target goroutine.
 func (pool *Pool) removeFromAll(conn *Backend) {
+	// Keep CachedStmt.DeployCount accurate: a connection being torn down no
+	// longer has its prepared statements deployed, so undo the RecordDeploy that
+	// happened when each was first deployed on it. Single-owner during teardown
+	// (target goroutine), so reading conn.deployedStmts here needs no lock.
+	if pool.Target != nil && pool.Target.StmtCache != nil {
+		for hash := range conn.deployedStmts {
+			if e := pool.Target.StmtCache.Get(hash); e != nil {
+				e.RecordUndeploy()
+			}
+		}
+	}
 	for i, c := range pool.All {
 		if c == conn {
 			pool.All[i] = pool.All[len(pool.All)-1]
