@@ -54,6 +54,16 @@ type Client struct {
 	stmtNameMap map[string]string // clientName → hash
 	stmtRevMap  map[string]string // hash → clientName
 
+	// Transaction-deferred LISTEN/UNLISTEN support. PostgreSQL applies
+	// LISTEN/UNLISTEN at COMMIT and discards them on ROLLBACK; pendingListens
+	// accumulates them (in order) while a transaction is open. lastTxStatus and
+	// lastCommandTag mirror the most recent ReadyForQuery status byte and
+	// CommandComplete tag written to the client, and are read when a transaction
+	// resolves to decide commit-vs-rollback. All guarded by sharedMu.
+	pendingListens []pendingListen
+	lastTxStatus   byte
+	lastCommandTag string
+
 	// msgsSent is incremented atomically for metrics. Kept here for cache
 	// locality; the owning goroutine is the sole writer so atomic is enough.
 	msgsSent int64
@@ -73,6 +83,7 @@ func NewClient(conn net.Conn, logger *logger.Logger, maxMessageSize int) *Client
 		maxMessageSize: maxMessageSize,
 		stmtNameMap:    make(map[string]string),
 		stmtRevMap:     make(map[string]string),
+		lastTxStatus:   'I',
 	}
 }
 
@@ -112,6 +123,51 @@ func (c *Client) RemoveNamedStatement() {
 	}
 }
 func (c *Client) HasNamedStatements() bool { return c.namedStmts > 0 }
+
+// --- Transaction-deferred LISTEN/UNLISTEN (sharedMu) ---
+
+// LastTxStatus returns the most recent ReadyForQuery transaction status byte
+// written to the client ('I', 'T', or 'E'). It reflects the real PostgreSQL
+// transaction state, unlike IsInTransaction which is also set for named-
+// statement pinning.
+func (c *Client) LastTxStatus() byte {
+	c.sharedMu.Lock()
+	defer c.sharedMu.Unlock()
+	return c.lastTxStatus
+}
+
+// LastCommandTag returns the most recent CommandComplete tag written to the
+// client (e.g. "COMMIT", "ROLLBACK"). Used to decide whether a transaction that
+// just reached idle committed or rolled back.
+func (c *Client) LastCommandTag() string {
+	c.sharedMu.Lock()
+	defer c.sharedMu.Unlock()
+	return c.lastCommandTag
+}
+
+// BufferListen records a LISTEN/UNLISTEN action to be applied when the current
+// transaction commits (or discarded if it rolls back).
+func (c *Client) BufferListen(kind listenKind, ch Channel) {
+	c.sharedMu.Lock()
+	c.pendingListens = append(c.pendingListens, pendingListen{kind: kind, channel: ch})
+	c.sharedMu.Unlock()
+}
+
+// HasPendingListens reports whether any LISTEN/UNLISTEN actions are buffered.
+func (c *Client) HasPendingListens() bool {
+	c.sharedMu.Lock()
+	defer c.sharedMu.Unlock()
+	return len(c.pendingListens) > 0
+}
+
+// TakePendingListens returns the buffered actions (in order) and clears the buffer.
+func (c *Client) TakePendingListens() []pendingListen {
+	c.sharedMu.Lock()
+	defer c.sharedMu.Unlock()
+	out := c.pendingListens
+	c.pendingListens = nil
+	return out
+}
 
 func (c *Client) SetInTransaction(inTx bool) {
 	c.inTransaction = inTx
@@ -245,9 +301,28 @@ func (c *Client) WriteMessage(msgType byte, body []byte) error {
 
 	c.sharedMu.Lock()
 	c.lastActivity = time.Now()
+	// Mirror transaction-relevant protocol state for deferred LISTEN/UNLISTEN.
+	switch msgType {
+	case 'C': // CommandComplete — body is the null-terminated command tag.
+		c.lastCommandTag = cString(body)
+	case 'Z': // ReadyForQuery — body[0] is the transaction status byte.
+		if len(body) > 0 {
+			c.lastTxStatus = body[0]
+		}
+	}
 	c.sharedMu.Unlock()
 
 	return nil
+}
+
+// cString returns the bytes of b up to the first NUL, as a string.
+func cString(b []byte) string {
+	for i, ch := range b {
+		if ch == 0 {
+			return string(b[:i])
+		}
+	}
+	return string(b)
 }
 
 // ReadMessage reads a PostgreSQL protocol message from the client.

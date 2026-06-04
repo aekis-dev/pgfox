@@ -621,11 +621,26 @@ func (t *Target) growthCycle(p *Server, logger *logger.Logger) {
 	}
 }
 
+// privilegedResponsive does a lightweight round-trip on the privileged
+// connection to confirm it is still usable.
+func (t *Target) privilegedResponsive(p *Server) bool {
+	if t.Backend == nil {
+		return false
+	}
+	if err := t.Backend.WriteMessage('Q', []byte("SELECT 1\x00")); err != nil {
+		return false
+	}
+	return p.drainUntilReady(t.Backend) == nil
+}
+
 // healthCheck runs on the healthTicker. Validates idle connections and replaces
 // dead ones. Also checks and replaces the privileged connection if needed.
 func (t *Target) healthCheck(p *Server, logger *logger.Logger) {
-	// Check privileged connection.
-	if t.Backend != nil && !t.Backend.IsAlive() {
+	// Check privileged connection with a real round-trip: a dead or wedged TLS
+	// session can only be detected reliably by using it (a socket-level probe
+	// cannot see through the TLS layer, and TCP keepalive only catches a dead
+	// peer, not a wedged one).
+	if t.Backend != nil && !t.privilegedResponsive(p) {
 		logger.Warn("Privileged connection dead, replacing")
 		t.Backend.Conn.Close()
 		t.TotalOpen--
@@ -658,16 +673,14 @@ func (t *Target) healthCheck(p *Server, logger *logger.Logger) {
 		for i := 0; i < poolLen; i++ {
 			select {
 			case backend := <-pool.Queue:
-				dead := !backend.IsAlive()
+				// No liveness probe: a connection that died while idle is caught
+				// lazily on next borrow (ReadMessage/WriteMessage error). The
+				// reaper only evicts on idle timeout.
 				tooOld := idleTimeout > 0 && backend.LastUsedAt().Before(cutoff)
 
-				if dead || tooOld {
-					reason := "dead"
-					if tooOld {
-						reason = "idle timeout"
-					}
+				if tooOld {
 					logger.Debug("Health check closing connection",
-						"reason", reason,
+						"reason", "idle timeout",
 						"database", pool.DbName,
 						"user", pool.Username)
 					backend.Conn.Close()

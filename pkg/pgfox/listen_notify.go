@@ -13,6 +13,22 @@ type Channel struct {
 	Name     string
 }
 
+// listenKind classifies a transaction-deferred LISTEN/UNLISTEN action.
+type listenKind int
+
+const (
+	listenKindListen listenKind = iota
+	listenKindUnlisten
+	listenKindUnlistenAll
+)
+
+// pendingListen is a LISTEN/UNLISTEN action buffered while a transaction is
+// open. PostgreSQL applies such actions at COMMIT and discards them at ROLLBACK.
+type pendingListen struct {
+	kind    listenKind
+	channel Channel
+}
+
 // Listen monitors one PostgreSQL channel for a database.
 // It owns exactly one dedicated backend connection and one goroutine.
 // All clients subscribed to this channel share the single backend connection.
@@ -417,6 +433,27 @@ func (p *Server) handleListen(client *Client, query string) error {
 		Name:     channelName,
 	}
 
+	// Transactional LISTEN: PostgreSQL defers the subscription to COMMIT and
+	// discards it on ROLLBACK. Buffer it and reply with the correct in-
+	// transaction status; resolvePendingListens applies it when the transaction
+	// ends. LastTxStatus (not IsInTransaction) is used so a backend pinned only
+	// for named statements is not mistaken for an open transaction.
+	if status := client.LastTxStatus(); status == 'T' || status == 'E' {
+		if status == 'E' {
+			if err := client.SendErrorResponse("ERROR", "25P02",
+				"current transaction is aborted, commands ignored until end of transaction block"); err != nil {
+				return err
+			}
+			return client.SendReadyForQuery('E')
+		}
+		client.BufferListen(listenKindListen, ch)
+		logger.Debug("Buffered LISTEN until commit", "channel", channelName)
+		if err := client.SendCommandComplete("LISTEN"); err != nil {
+			return err
+		}
+		return client.SendReadyForQuery('T')
+	}
+
 	l, isNew, err := p.getOrCreateListen(ch, client)
 	if err != nil {
 		logger.WithError(err).Error("Failed to set up listen monitor")
@@ -444,6 +481,28 @@ func (p *Server) handleUnlisten(client *Client, query string) error {
 
 	parts := strings.Fields(query)
 
+	// Transactional UNLISTEN: deferred to COMMIT, discarded on ROLLBACK.
+	if status := client.LastTxStatus(); status == 'T' || status == 'E' {
+		if status == 'E' {
+			if err := client.SendErrorResponse("ERROR", "25P02",
+				"current transaction is aborted, commands ignored until end of transaction block"); err != nil {
+				return err
+			}
+			return client.SendReadyForQuery('E')
+		}
+		if len(parts) >= 2 && parts[1] == "*" {
+			client.BufferListen(listenKindUnlistenAll, Channel{Database: client.GetDatabase()})
+		} else if len(parts) >= 2 {
+			channelName := strings.TrimRight(strings.Trim(parts[1], `"`), ";")
+			client.BufferListen(listenKindUnlisten, Channel{Database: client.GetDatabase(), Name: channelName})
+		}
+		logger.Debug("Buffered UNLISTEN until commit")
+		if err := client.SendCommandComplete("UNLISTEN"); err != nil {
+			return err
+		}
+		return client.SendReadyForQuery('T')
+	}
+
 	if len(parts) >= 2 && strings.ToUpper(parts[1]) == "*" {
 		channels := client.GetListenChannels()
 		for ch := range channels {
@@ -466,6 +525,53 @@ func (p *Server) handleUnlisten(client *Client, query string) error {
 		return err
 	}
 	return client.SendReadyForQuery('I')
+}
+
+// resolvePendingListens applies or discards the LISTEN/UNLISTEN actions buffered
+// during a transaction, based on its outcome. It is called when a transaction
+// reaches idle ('I'). If the transaction-ending command completed as "COMMIT"
+// the actions are applied in order; otherwise (ROLLBACK, failed COMMIT, error)
+// they are discarded — matching PostgreSQL's transactional LISTEN semantics.
+//
+// Granularity is whole-transaction: savepoint-level rollback of a LISTEN
+// (ROLLBACK TO SAVEPOINT) is not modelled — a LISTEN survives until the outer
+// transaction's outcome. This is a deliberate limitation for the pooler.
+//
+// Note: the actions are applied just after the COMMIT's ReadyForQuery has been
+// forwarded to the client, so there is a small asynchronous window before the
+// subscription is live. This is invisible in practice since notifications are
+// inherently asynchronous.
+func (p *Server) resolvePendingListens(client *Client) {
+	if !client.HasPendingListens() {
+		return
+	}
+	actions := client.TakePendingListens()
+
+	if !strings.EqualFold(client.LastCommandTag(), "COMMIT") {
+		client.Logger().Debug("Transaction did not commit — discarding buffered LISTEN/UNLISTEN",
+			"count", len(actions))
+		return
+	}
+
+	for _, a := range actions {
+		switch a.kind {
+		case listenKindListen:
+			if _, _, err := p.getOrCreateListen(a.channel, client); err != nil {
+				client.Logger().WithError(err).Warn("Failed to apply deferred LISTEN at commit",
+					"channel", a.channel.Name)
+				continue
+			}
+			client.AddListenChannel(a.channel)
+		case listenKindUnlisten:
+			p.RemoveClientFromListen(a.channel, client)
+			client.RemoveListenChannel(a.channel)
+		case listenKindUnlistenAll:
+			for ch := range client.GetListenChannels() {
+				p.RemoveClientFromListen(ch, client)
+			}
+			client.ClearListenChannels()
+		}
+	}
 }
 
 // handleNotify handles NOTIFY commands and pg_notify() function calls.

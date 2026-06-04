@@ -2,10 +2,14 @@ package tests
 
 // simple_query_test.go — tests for the simple query protocol ('Q' message).
 //
-// Covers playbook sections §2.1 (passthrough), §2.2 (stmt cache via literal
-// extraction), §2.4 (transaction pinning), and the pool concurrency scenario
-// from §5. These tests send raw 'Q' messages and verify the exact response
-// sequence pgfox produces.
+// Covers playbook §2.1 (passthrough), §2.2 (stmt cache via literal extraction),
+// §2.4 (transaction pinning), and the pool concurrency scenario from §5.
+//
+// Style: the fake backend is declarative. Each test hands addBackend a
+// backendSpec describing the queries the database knows; the pgServer engine
+// reacts to whatever pgfox sends with protocol-faithful responses. No test
+// hand-feeds a client-facing message — every byte the client sees is produced
+// by pgfox's real code.
 //
 // Playbook rows covered: T03, T04, T04b, T05, T06.
 
@@ -17,39 +21,19 @@ import (
 )
 
 // TestPlaybook_T03_SimpleSelectPassthrough verifies that a non-parameterizable
-// simple query (DDL, SET, etc.) is forwarded verbatim to the backend and its
-// response is forwarded verbatim to the client.
+// simple query (DDL) is forwarded verbatim to the backend and its response is
+// forwarded verbatim to the client.
 //
 // Playbook §2.1 — Plain passthrough query.
-//
-// Wire sequence:
-//
-//	C→P  Q { "CREATE TABLE foo (id int)\0" }
-//	P→B  Q { "CREATE TABLE foo (id int)\0" }
-//	B→P  CommandComplete { "CREATE TABLE" }
-//	B→P  ReadyForQuery { 'I' }
-//	P→C  CommandComplete { "CREATE TABLE" }
-//	P→C  ReadyForQuery { 'I' }
 func TestPlaybook_T03_SimpleSelectPassthrough(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 
-	_, fake := h.addBackend()
-
-	go func() {
-		mt, body := fake.recvMsg()
-		if mt != 'Q' {
-			t.Errorf("T03: expected Q from pgfox, got %q", mt)
-			return
-		}
-		// Verify pgfox forwarded the SQL unchanged (strip trailing null).
-		got := string(body[:len(body)-1])
-		if got != "CREATE TABLE foo (id int)" {
-			t.Errorf("T03: SQL mismatch: got %q", got)
-		}
-		fake.sendCC("CREATE TABLE")
-		fake.sendRFQ('I')
-	}()
+	fake := h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQL: "CREATE TABLE foo (id int)", Tag: "CREATE TABLE"},
+		},
+	})
 
 	c := h.connect()
 	defer c.conn.Close()
@@ -57,153 +41,104 @@ func TestPlaybook_T03_SimpleSelectPassthrough(t *testing.T) {
 	c.sendQ("CREATE TABLE foo (id int)")
 	c.expect('C') // CommandComplete — pgfox must NOT strip this
 	c.expectRFQ('I')
+
+	// pgfox must have forwarded the DDL verbatim (no parameterization).
+	if sqls := fake.SimpleQueries(); len(sqls) != 1 || sqls[0] != "CREATE TABLE foo (id int)" {
+		t.Errorf("T03: backend should have received the SQL verbatim, got %v", sqls)
+	}
 }
 
-// TestPlaybook_T04_SimpleLiteralsThroughCache verifies that a simple query
-// whose literals can be extracted is served through the statement cache:
-// pgfox rewrites it to a parameterized form, registers it as a prepared
-// statement (pfx_<hash>), and sends Parse + Bind + Execute + Sync to the
-// backend. The client receives only what a simple query response looks like
-// (RowDescription, DataRow, CommandComplete, ReadyForQuery) — never
-// ParseComplete or BindComplete.
+// TestPlaybook_T04_SimpleLiteralsThroughCache verifies that a simple query whose
+// literals can be extracted is served through the statement cache: pgfox
+// rewrites it to a parameterized form, deploys it as a prepared statement,
+// Describes the portal, executes it, and translates the extended-protocol
+// responses back into a protocol-correct simple-query response.
 //
 // Playbook §2.2 — Parameterizable DML via stmt cache (happy path).
 //
-// Wire sequence (first call, backend does not have the statement yet):
-//
-//	C→P  Q { "SELECT id FROM users WHERE id = 42\0" }
-//	P→B  P { name="pfx_<hash>", query="SELECT id FROM users WHERE id = $1" }
-//	P→B  B { stmt="pfx_<hash>", params=["42"], resultFmts=[1] }
-//	P→B  E { portal="" }
-//	P→B  S
-//	B→P  ParseComplete
-//	B→P  BindComplete
-//	B→P  RowDescription
-//	B→P  DataRow
-//	B→P  CommandComplete
-//	B→P  ReadyForQuery { 'I' }
-//	P→C  RowDescription        ← ParseComplete and BindComplete are NOT forwarded
-//	P→C  DataRow
-//	P→C  CommandComplete
-//	P→C  ReadyForQuery { 'I' }
+// The key correctness points this guards:
+//   - pgfox sends a portal Describe (Execute alone never yields RowDescription).
+//   - Result format is text (the simple-query client cannot read binary).
+//   - The client never sees ParseComplete/BindComplete/NoData.
 func TestPlaybook_T04_SimpleLiteralsThroughCache(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 
-	_, fake := h.addBackend()
-
-	go func() {
-		// pgfox must send Parse with a pfx_ prefixed statement name.
-		mt, body := fake.recvMsg()
-		if mt != 'P' {
-			t.Errorf("T04: expected Parse, got %q", mt)
-			return
-		}
-		name := parseStmtName(body)
-		if len(name) < 4 || name[:4] != "pfx_" {
-			t.Errorf("T04: Parse name should be pfx_*, got %q", name)
-		}
-		fake.sendParseComplete()
-
-		mt, _ = fake.recvMsg()
-		if mt != 'B' {
-			t.Errorf("T04: expected Bind, got %q", mt)
-		}
-		fake.sendBindComplete()
-
-		mt, _ = fake.recvMsg()
-		if mt != 'E' {
-			t.Errorf("T04: expected Execute, got %q", mt)
-		}
-
-		mt, _ = fake.recvMsg()
-		if mt != 'S' {
-			t.Errorf("T04: expected Sync, got %q", mt)
-		}
-
-		fake.sendRowDescription("id")
-		fake.sendDataRowText("42")
-		fake.sendCC("SELECT 1")
-		fake.sendRFQ('I')
-	}()
+	fake := h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQL: "SELECT id FROM users WHERE id = $1",
+				Columns: []pgCol{{Name: "id", OID: 23}},
+				Rows:    [][]string{{"42"}},
+				Tag:     "SELECT 1"},
+		},
+	})
 
 	c := h.connect()
 	defer c.conn.Close()
 
 	c.sendQ("SELECT id FROM users WHERE id = 42")
 
-	// Client must NOT receive ParseComplete ('1') or BindComplete ('2') —
-	// those are extended protocol messages invisible in simple query mode.
-	c.expect('T') // RowDescription
+	// Client must NOT receive ParseComplete ('1') or BindComplete ('2').
+	c.expect('T') // RowDescription (from the portal Describe, text format)
 	c.expect('D') // DataRow
 	c.expect('C') // CommandComplete
 	c.expectRFQ('I')
+
+	// pgfox must have deployed under a pfx_ name and Described the portal.
+	if names := fake.ParsedNames(); len(names) != 1 || !hasPfxPrefix(names[0]) {
+		t.Errorf("T04: backend Parse name should be pfx_*, got %v", names)
+	}
+	if names := fake.BoundNames(); len(names) != 1 || !hasPfxPrefix(names[0]) {
+		t.Errorf("T04: backend Bind stmt should be pfx_*, got %v", names)
+	}
+	if !fake.sawDescribePortal() {
+		t.Error("T04: pgfox did not Describe the portal — client would get no RowDescription")
+	}
+	// Result format must be text (empty = all text per the Bind spec).
+	for i, f := range fake.LastResultFormats() {
+		if f != 0 {
+			t.Errorf("T04: result format[%d] = %d, want 0 (text)", i, f)
+		}
+	}
 }
 
-// TestPlaybook_T04b_CacheHitSkipsParse verifies that on the second call with
-// the same parameterized query, pgfox does not re-send Parse to the backend
-// (HasStmt is true after the first successful deploy).
+// TestPlaybook_T04b_CacheHitSkipsParse verifies that on the second call with the
+// same canonical query, pgfox does not re-send Parse to the same backend
+// (HasStmt is true after the first deploy).
 //
-// Playbook §2.2 — Parameterizable DML via stmt cache (second call).
-// Playbook §6.2 — Deployment tracking per backend.
-//
-// Wire sequence (second call):
-//
-//	C→P  Q { "SELECT id FROM users WHERE id = 99\0" }
-//	P→B  (no Parse — backend already has pfx_<hash>)
-//	P→B  B { stmt="pfx_<hash>", params=["99"] }
-//	P→B  E
-//	P→B  S
-//	...
+// Playbook §2.2 (second call); §6.2 (deployment tracking per backend).
 func TestPlaybook_T04b_CacheHitSkipsParse(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 
-	_, fake := h.addBackend()
-	parseCount := 0
-
-	go func() {
-		for {
-			mt, _ := fake.recvMsg()
-			if mt == 0 {
-				return
-			}
-			switch mt {
-			case 'P':
-				parseCount++
-				fake.sendParseComplete()
-			case 'B':
-				fake.sendBindComplete()
-			case 'E':
-				fake.sendDataRowText("1")
-				fake.sendCC("SELECT 1")
-			case 'S':
-				fake.sendRFQ('I')
-			}
-		}
-	}()
+	fake := h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQLPrefix: "SELECT id FROM users WHERE id = $",
+				Columns: []pgCol{{Name: "id", OID: 23}},
+				Rows:    [][]string{{"1"}},
+				Tag:     "SELECT 1"},
+		},
+	})
 
 	c := h.connect()
 	defer c.conn.Close()
 
-	// First call — Parse must be sent (backend does not have the statement).
-	// returnConn automatically returns the backend to the pool after RFQ('I').
+	// First call — Parse is sent; backend returned to the pool after RFQ('I').
 	c.sendQ("SELECT id FROM users WHERE id = 42")
 	c.drainUntilRFQ()
 
-	// Second call — same canonical SQL, same hash. Parse must NOT be sent.
-	// pgfox borrows the same backend (HasStmt=true) and skips Parse.
+	// Second call — same canonical SQL, same hash; same backend reused.
 	c.sendQ("SELECT id FROM users WHERE id = 99")
 	c.drainUntilRFQ()
 
-	if parseCount != 1 {
-		t.Errorf("T04b: Parse should be sent exactly once, got %d times", parseCount)
+	if got := fake.ParseCount(); got != 1 {
+		t.Errorf("T04b: Parse should be sent exactly once, got %d", got)
 	}
 }
 
 // TestPlaybook_T05_ConcurrentSimpleQueries verifies that pgfox handles many
-// simultaneous simple queries without serialising them. Each client goroutine
-// gets its own backend connection from the pool and completes independently.
+// simultaneous simple queries without serialising them. Each client gets its
+// own backend from the pool and completes independently.
 //
 // Playbook §5 — Pool growth (demand-driven), §5.2 — Connection return.
 func TestPlaybook_T05_ConcurrentSimpleQueries(t *testing.T) {
@@ -211,31 +146,16 @@ func TestPlaybook_T05_ConcurrentSimpleQueries(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 
-	// Provide n backends — one per concurrent client.
+	// One backend per concurrent client. Each accepts any SELECT (all the
+	// "SELECT <id>" queries canonicalize to "SELECT $1").
 	for i := 0; i < n; i++ {
-		_, fake := h.addBackend()
-		go func(fb *fakeBackend) {
-			for {
-				mt, _ := fb.recvMsg()
-				if mt == 0 {
-					return
-				}
-				switch mt {
-				case 'P':
-					fb.sendParseComplete()
-				case 'B':
-					fb.sendBindComplete()
-				case 'E':
-					fb.sendDataRowText("1")
-					fb.sendCC("SELECT 1")
-				case 'S':
-					fb.sendRFQ('I')
-				case 'Q':
-					fb.sendCC("SELECT 1")
-					fb.sendRFQ('I')
-				}
-			}
-		}(fake)
+		h.addBackend(backendSpec{
+			Default: &queryRule{
+				Columns: []pgCol{{Name: "n", OID: 23}},
+				Rows:    [][]string{{"1"}},
+				Tag:     "SELECT 1",
+			},
+		})
 	}
 
 	var wg sync.WaitGroup
@@ -260,77 +180,62 @@ func TestPlaybook_T05_ConcurrentSimpleQueries(t *testing.T) {
 
 	select {
 	case <-done:
-		// All queries completed concurrently — pool is not serialising.
 	case <-time.After(5 * time.Second):
 		t.Fatal("T05: concurrent queries timed out — pool may be serialising")
 	}
 }
 
 // TestPlaybook_T06_TransactionPinning verifies the core transaction-pinning
-// invariant: once a backend returns ReadyForQuery with status 'T', all
-// subsequent queries from the same client go to the same backend until a
-// response with status 'I' (or 'E') is received.
+// invariant: once a backend returns ReadyForQuery 'T', all subsequent queries
+// from the same client go to that backend until a response with status 'I'.
+//
+// The transaction status the client observes is produced by the engine's real
+// state machine (BEGIN→T, query→stays T, COMMIT→I), not by scripted bytes.
 //
 // Playbook §2.4 — Transaction block.
-//
-// Wire sequence:
-//
-//	C→P  Q { "BEGIN\0" }        → B→P RFQ('T') → pin backend
-//	C→P  Q { "SELECT 1\0" }     → same backend
-//	C→P  Q { "COMMIT\0" }       → same backend → B→P RFQ('I') → unpin
 func TestPlaybook_T06_TransactionPinning(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 
-	_, fake := h.addBackend()
-
-	// Track every SQL that arrives at this one backend.
-	var received []string
-	go func() {
-		for {
-			mt, body := fake.recvMsg()
-			if mt == 0 {
-				return
-			}
-			if mt != 'Q' {
-				continue
-			}
-			sql := string(body[:len(body)-1])
-			received = append(received, sql)
-			switch sql {
-			case "BEGIN":
-				fake.sendCC("BEGIN")
-				fake.sendRFQ('T') // signals pgfox to pin this backend
-			case "SELECT 1":
-				fake.sendCC("SELECT 1")
-				fake.sendRFQ('T') // still in transaction
-			case "COMMIT":
-				fake.sendCC("COMMIT")
-				fake.sendRFQ('I') // signals pgfox to unpin and return to pool
-			}
-		}
-	}()
+	fake := h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQL: "BEGIN", Tag: "BEGIN", Tx: txBegin},
+			{SQL: "SELECT 1", Columns: []pgCol{{Name: "n", OID: 23}},
+				Rows: [][]string{{"1"}}, Tag: "SELECT 1"},
+			{SQL: "COMMIT", Tag: "COMMIT", Tx: txEnd},
+		},
+	})
 
 	c := h.connect()
 	defer c.conn.Close()
 
 	c.sendQ("BEGIN")
-	c.drainUntilRFQ()
-
-	c.sendQ("SELECT 1")
-	c.drainUntilRFQ()
-
-	c.sendQ("COMMIT")
-	c.drainUntilRFQ()
-
-	// All three queries must have arrived at the same (only) backend.
-	want := []string{"BEGIN", "SELECT 1", "COMMIT"}
-	if len(received) != len(want) {
-		t.Fatalf("T06: expected %d queries on backend, got %d: %v", len(want), len(received), received)
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T06: after BEGIN expected 'T', got %q", s)
 	}
-	for i, sql := range want {
-		if received[i] != sql {
-			t.Errorf("T06: query[%d] want %q, got %q", i, sql, received[i])
+	c.sendQ("SELECT 1")
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T06: in transaction expected 'T', got %q", s)
+	}
+	c.sendQ("COMMIT")
+	if s := c.drainUntilRFQ(); s != 'I' {
+		t.Fatalf("T06: after COMMIT expected 'I', got %q", s)
+	}
+
+	// All three queries must have arrived at the same (only) backend, in order.
+	want := []string{"BEGIN", "SELECT 1", "COMMIT"}
+	got := fake.SimpleQueries()
+	if len(got) != len(want) {
+		t.Fatalf("T06: expected %v on backend, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("T06: query[%d] want %q, got %q", i, want[i], got[i])
 		}
 	}
+}
+
+// hasPfxPrefix reports whether name is an internal pfx_<hash> statement name.
+func hasPfxPrefix(name string) bool {
+	return len(name) >= 4 && name[:4] == "pfx_"
 }

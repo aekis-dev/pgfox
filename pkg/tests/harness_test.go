@@ -8,9 +8,9 @@ package tests
 //                   typed send/recv helpers for building exact PostgreSQL
 //                   message sequences without a real driver.
 //
-//  2. fakeBackend — server-side wire protocol helper. Sits on the backend
-//                   side of a mockConn and lets each test control exactly
-//                   what PostgreSQL would respond with.
+//  2. pgServer    — declarative fake PostgreSQL. Sits on the backend side of
+//                   a mockConn and reacts to pgfox's messages with protocol-
+//                   faithful responses derived from a test-supplied spec.
 //
 //  3. testHarness — wires a real pgfox Server to fake backends via mockConn,
 //                   bypassing TLS and SCRAM entirely. Tests interact with
@@ -19,7 +19,7 @@ package tests
 //
 // Architecture:
 //
-//	[test client]  ←→  [pgfox Server]  ←→  [fakeBackend goroutine]
+//	[test client]  ←→  [pgfox Server]  ←→  [pgServer goroutine]
 //	  pgConn            net.Listener         mockConn
 //	  (TCP)             (real Server)        (Backend)
 //
@@ -38,11 +38,6 @@ package tests
 // reads block until data is available, matching real TCP behaviour. This lets
 // pgfox pipeline messages freely and lets the fake backend respond per-message
 // without any artificial ordering constraint.
-//
-// mockConn also implements SetReadDeadline correctly so that Backend.IsAlive()
-// works as expected: the 1ms peek times out and returns true (connection alive,
-// no data pending), exactly as it would on a real idle TCP socket.
-
 import (
 	"bufio"
 	"bytes"
@@ -153,8 +148,7 @@ func (a mockAddr) Network() string { return "mock" }
 func (a mockAddr) String() string  { return a.s }
 
 // mockConn is a net.Conn backed by two bufferedPipes — one for each direction.
-// It behaves like a real TCP connection: writes are non-blocking, reads block
-// until data arrives, and SetReadDeadline is fully supported.
+// It behaves like a real TCP connection: writes are non-blocking
 //
 // Two mockConn instances are created in pairs via newMockConnPair(). Each side
 // writes into the other side's read buffer.
@@ -167,7 +161,7 @@ type mockConn struct {
 }
 
 // newMockConnPair returns two connected mockConn instances: pgfoxSide is given
-// to pgfox's Backend, fakeSide is used by the fakeBackend in tests.
+// to pgfox's Backend, fakeSide is driven by a pgServer in tests.
 func newMockConnPair() (pgfoxSide, fakeSide *mockConn) {
 	aToB := newBufferedPipe() // pgfox writes → fake reads
 	bToA := newBufferedPipe() // fake writes → pgfox reads
@@ -415,131 +409,6 @@ func buildBindMsg(portal, stmtName string, params [][]byte) []byte {
 }
 
 // =============================================================================
-// fakeBackend — PostgreSQL server-side wire protocol helper
-// =============================================================================
-
-// fakeBackend controls the backend (PostgreSQL server) side of a mockConn.
-// Each test goroutine drives a fakeBackend to simulate specific PostgreSQL
-// response sequences. The send* methods correspond directly to PostgreSQL
-// backend message types.
-type fakeBackend struct {
-	t    *testing.T
-	conn net.Conn
-	r    *bufio.Reader
-	w    *bufio.Writer
-	mu   sync.Mutex // serialises w.Flush() calls
-}
-
-func newFakeBackend(t *testing.T, conn net.Conn) *fakeBackend {
-	return &fakeBackend{
-		t:    t,
-		conn: conn,
-		r:    bufio.NewReader(conn),
-		w:    bufio.NewWriter(conn),
-	}
-}
-
-// send writes a typed message to pgfox (the backend-to-frontend direction).
-func (fb *fakeBackend) send(msgType byte, body []byte) {
-	fb.mu.Lock()
-	defer fb.mu.Unlock()
-	buf := make([]byte, 5+len(body))
-	buf[0] = msgType
-	binary.BigEndian.PutUint32(buf[1:5], uint32(4+len(body)))
-	copy(buf[5:], body)
-	fb.w.Write(buf)
-	fb.w.Flush()
-}
-
-// recvMsg reads the next message that pgfox sent to the backend.
-// Returns (0, nil) on EOF/close — callers use this as a loop-exit signal.
-func (fb *fakeBackend) recvMsg() (byte, []byte) {
-	msgType, err := fb.r.ReadByte()
-	if err != nil {
-		if err == io.EOF {
-			return 0, nil
-		}
-		fb.t.Errorf("fakeBackend recvMsg: %v", err)
-		return 0, nil
-	}
-	lenBuf := make([]byte, 4)
-	io.ReadFull(fb.r, lenBuf)
-	length := int(binary.BigEndian.Uint32(lenBuf)) - 4
-	body := make([]byte, length)
-	if length > 0 {
-		io.ReadFull(fb.r, body)
-	}
-	return msgType, body
-}
-
-// --- Backend message senders (server → client direction) ---
-
-// sendRFQ sends ReadyForQuery ('Z') with the given transaction status byte.
-// status: 'I' = idle, 'T' = in transaction, 'E' = failed transaction.
-func (fb *fakeBackend) sendRFQ(status byte) { fb.send('Z', []byte{status}) }
-
-// sendCC sends CommandComplete ('C') with the given command tag (e.g. "SELECT 1").
-func (fb *fakeBackend) sendCC(tag string) { fb.send('C', append([]byte(tag), 0)) }
-
-// sendParseComplete sends ParseComplete ('1'). Confirms a Parse succeeded.
-func (fb *fakeBackend) sendParseComplete() { fb.send('1', nil) }
-
-// sendBindComplete sends BindComplete ('2'). Confirms a Bind succeeded.
-func (fb *fakeBackend) sendBindComplete() { fb.send('2', nil) }
-
-// sendCloseComplete sends CloseComplete ('3'). Confirms a Close succeeded.
-func (fb *fakeBackend) sendCloseComplete() { fb.send('3', nil) }
-
-// sendNoData sends NoData ('n'). Sent in response to Describe when the
-// statement produces no result columns (e.g. LISTEN, INSERT without RETURNING).
-func (fb *fakeBackend) sendNoData() { fb.send('n', nil) }
-
-// sendParameterDescription sends ParameterDescription ('t') listing the OIDs
-// of the statement's parameters. Pass nil for a zero-parameter statement.
-func (fb *fakeBackend) sendParameterDescription(oids []uint32) {
-	body := make([]byte, 2+4*len(oids))
-	binary.BigEndian.PutUint16(body[0:2], uint16(len(oids)))
-	for i, oid := range oids {
-		binary.BigEndian.PutUint32(body[2+i*4:], oid)
-	}
-	fb.send('t', body)
-}
-
-// sendRowDescription sends RowDescription ('T') describing a single int4 column.
-// This is a convenience builder; tests only need one column.
-func (fb *fakeBackend) sendRowDescription(colName string) {
-	body := []byte{0, 1} // numFields = 1
-	body = append(body, []byte(colName)...)
-	body = append(body, 0)
-	body = append(body,
-		0, 0, 0, 0, // tableOID = 0
-		0, 0, // colAttrNum = 0
-		0, 0, 0, 23, // typeOID = 23 (int4)
-		0, 4, // typeSize = 4
-		0xff, 0xff, 0xff, 0xff, // typeMod = -1
-		0, 0, // format = 0 (text)
-	)
-	fb.send('T', body)
-}
-
-// sendDataRowText sends DataRow ('D') with a single text-format column value.
-func (fb *fakeBackend) sendDataRowText(val string) {
-	valBytes := []byte(val)
-	body := make([]byte, 2+4+len(valBytes))
-	binary.BigEndian.PutUint16(body[0:2], 1) // numFields = 1
-	binary.BigEndian.PutUint32(body[2:6], uint32(len(valBytes)))
-	copy(body[6:], valBytes)
-	fb.send('D', body)
-}
-
-// sendErrorResponse sends ErrorResponse ('E') with severity=ERROR and the
-// given human-readable message. pgfox forwards this to the client unchanged.
-func (fb *fakeBackend) sendErrorResponse(msg string) {
-	body := append([]byte("SERROR\x00MERROR: "+msg+"\x00"), 0)
-	fb.send('E', body)
-}
-
-// =============================================================================
 // testHarness — integrates pgfox Server with fake backends
 // =============================================================================
 
@@ -693,13 +562,17 @@ func newHarness(t *testing.T) *testHarness {
 	}
 }
 
-// addBackend creates a mockConn-backed Backend and deposits it into the pool's
-// idle queue. Returns both ends: pgfox uses backend, and the test controls fake.
+// addBackend creates a mockConn-backed Backend, deposits it into the pool's
+// idle queue, and starts a declarative fake PostgreSQL server (pgServer) driving
+// the backend side from the supplied spec. The pgServer reacts to whatever
+// pgfox sends with protocol-faithful responses; the test only declares data and
+// rules. Returns the pgServer so the test can assert observed behaviour
+// (ParseCount, Describes, BoundNames, …).
 //
-// mockConn replaces net.Pipe() to avoid pipeline deadlocks: since writes are
-// non-blocking, pgfox can pipeline P+B+E+S freely and the fake backend can
-// respond per-message without ordering constraints.
-func (h *testHarness) addBackend() (*pgfox.Backend, *fakeBackend) {
+// mockConn (not net.Pipe) is used so writes never block: pgfox can pipeline
+// P+B+D+E+S freely and the engine responds per-message without ordering
+// constraints.
+func (h *testHarness) addBackend(spec backendSpec) *pgServer {
 	h.t.Helper()
 	pgfoxSide, fakeSide := newMockConnPair()
 	backend := pgfox.NewBackend(pgfoxSide, "testdb", "test", "testuser", 1024*1024)
@@ -707,7 +580,34 @@ func (h *testHarness) addBackend() (*pgfox.Backend, *fakeBackend) {
 	h.pool.All = append(h.pool.All, backend)
 	h.pool.Queue <- backend
 	h.target.TotalOpen++
-	return backend, newFakeBackend(h.t, fakeSide)
+
+	srv := newPGServer(h.t, fakeSide, spec)
+	go srv.run()
+	return srv
+}
+
+// addRawBackend adds a backend to the pool WITHOUT starting an engine, returning
+// the *pgfox.Backend so a test can manipulate the pool directly (e.g. drain a
+// specific backend out of the queue to force a later borrow onto another one).
+// The caller starts an engine on fakeSide itself if it needs one.
+func (h *testHarness) addRawBackend() (*pgfox.Backend, net.Conn) {
+	h.t.Helper()
+	pgfoxSide, fakeSide := newMockConnPair()
+	backend := pgfox.NewBackend(pgfoxSide, "testdb", "test", "testuser", 1024*1024)
+	backend.Pool = h.pool
+	h.pool.All = append(h.pool.All, backend)
+	h.pool.Queue <- backend
+	h.target.TotalOpen++
+	return backend, fakeSide
+}
+
+// startEngine starts a declarative pgServer on an already-created fakeSide conn
+// (companion to addRawBackend).
+func (h *testHarness) startEngine(fakeSide net.Conn, spec backendSpec) *pgServer {
+	h.t.Helper()
+	srv := newPGServer(h.t, fakeSide, spec)
+	go srv.run()
+	return srv
 }
 
 // connect dials pgfox and reads the synthetic ReadyForQuery('I') that the

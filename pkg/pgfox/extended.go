@@ -236,6 +236,22 @@ func CloseBodyTarget(body []byte) (byte, string) {
 
 // --- Describe message ---
 
+// BuildDescribePortal builds the body of a Describe ('D') message for a portal.
+//
+//	portal — portal name (empty = unnamed portal)
+//
+// Describing a portal makes the backend emit a RowDescription for a
+// row-returning statement, or NoData otherwise. pgfox uses this on the
+// simple-query cache path so it can forward a protocol-correct RowDescription
+// to the client (Execute alone never produces one).
+func BuildDescribePortal(portal string) []byte {
+	buf := make([]byte, 0, 1+len(portal)+1)
+	buf = append(buf, 'P')
+	buf = append(buf, []byte(portal)...)
+	buf = append(buf, 0)
+	return buf
+}
+
 // DescribeBodyTarget extracts the describe type ('S'=statement, 'P'=portal)
 // and name from a Describe message body.
 func DescribeBodyTarget(body []byte) (byte, string) {

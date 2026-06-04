@@ -29,6 +29,7 @@ import (
 	"bufio"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/aekis-dev/pgfox/pkg/pgfox"
 )
@@ -302,4 +303,184 @@ func TestPlaybook_T16_UnlistenRemovesClientFromMonitor(t *testing.T) {
 	c.sendQ("UNLISTEN pgfox_ul")
 	c.expect('C') // CommandComplete("UNLISTEN")
 	c.expectRFQ('I')
+}
+
+// =============================================================================
+// Transaction-deferred LISTEN/UNLISTEN (PostgreSQL-faithful semantics)
+// =============================================================================
+//
+// PostgreSQL applies LISTEN/UNLISTEN at COMMIT and discards them on ROLLBACK.
+// pgfox buffers them during a transaction and resolves them when the
+// transaction reaches idle. These tests pre-create an empty monitor so the
+// apply step (getOrCreateListen) takes the fast path without TLS/newConn.
+
+// listenClientCount returns the monitor's current subscriber count.
+func listenClientCount(l *pgfox.Listen) int {
+	l.Mu.RLock()
+	defer l.Mu.RUnlock()
+	return len(l.Clients)
+}
+
+// waitForListenCount polls until the monitor reaches want subscribers or the
+// timeout elapses. Used because the deferred apply happens asynchronously,
+// just after the COMMIT's ReadyForQuery is forwarded.
+func waitForListenCount(l *pgfox.Listen, want int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if listenClientCount(l) == want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return listenClientCount(l) == want
+}
+
+// preCreateMonitor injects an empty, goroutine-free monitor for ch so deferred
+// LISTEN application fast-paths without opening a real backend.
+func preCreateMonitor(h *testHarness, ch pgfox.Channel) *pgfox.Listen {
+	pgfoxSide, _ := newMockConnPair()
+	mb := pgfox.NewBackend(pgfoxSide, "testdb", "test", "testuser", 1024*1024)
+	mb.Pool = h.pool
+	l := &pgfox.Listen{
+		Channel: ch,
+		Backend: mb,
+		Clients: map[*pgfox.Client]bool{},
+		Done:    make(chan struct{}),
+	}
+	close(l.Done)
+	h.server.ListenersMu.Lock()
+	h.server.Listeners[ch] = l
+	h.server.ListenersMu.Unlock()
+	return l
+}
+
+// TestPlaybook_T28_DeferredListenAppliedOnCommit verifies that a LISTEN issued
+// inside a transaction is buffered (not applied, not forwarded to the pinned
+// backend) and takes effect only when the transaction COMMITs. The client sees
+// status 'T' after the LISTEN, matching PostgreSQL.
+func TestPlaybook_T28_DeferredListenAppliedOnCommit(t *testing.T) {
+	h := newHarness(t)
+	defer h.close()
+
+	fake := h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQL: "BEGIN", Tag: "BEGIN", Tx: txBegin},
+			{SQL: "COMMIT", Tag: "COMMIT", Tx: txEnd},
+		},
+	})
+	ch := pgfox.Channel{Database: "testdb", Name: "deferred"}
+	l := preCreateMonitor(h, ch)
+
+	c := h.connect()
+	defer c.conn.Close()
+
+	c.sendQ("BEGIN")
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T28: after BEGIN want 'T', got %q", s)
+	}
+
+	c.sendQ("LISTEN deferred")
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T28: LISTEN in a transaction must keep status 'T', got %q", s)
+	}
+	// Must not be subscribed yet, and must not have been forwarded to the backend.
+	if n := listenClientCount(l); n != 0 {
+		t.Errorf("T28: LISTEN must not take effect before COMMIT, subscriber count=%d", n)
+	}
+	if sq := fake.SimpleQueries(); len(sq) != 1 || sq[0] != "BEGIN" {
+		t.Errorf("T28: LISTEN must be buffered in pgfox, not sent to the backend; backend saw %v", sq)
+	}
+
+	c.sendQ("COMMIT")
+	if s := c.drainUntilRFQ(); s != 'I' {
+		t.Fatalf("T28: after COMMIT want 'I', got %q", s)
+	}
+
+	if !waitForListenCount(l, 1, time.Second) {
+		t.Errorf("T28: LISTEN must take effect at COMMIT, subscriber count=%d", listenClientCount(l))
+	}
+}
+
+// TestPlaybook_T29_DeferredListenDiscardedOnRollback verifies that a LISTEN
+// issued inside a transaction that ROLLBACKs never takes effect.
+func TestPlaybook_T29_DeferredListenDiscardedOnRollback(t *testing.T) {
+	h := newHarness(t)
+	defer h.close()
+
+	h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQL: "BEGIN", Tag: "BEGIN", Tx: txBegin},
+			{SQL: "ROLLBACK", Tag: "ROLLBACK", Tx: txEnd},
+		},
+	})
+	ch := pgfox.Channel{Database: "testdb", Name: "deferred"}
+	l := preCreateMonitor(h, ch)
+
+	c := h.connect()
+	defer c.conn.Close()
+
+	c.sendQ("BEGIN")
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T29: after BEGIN want 'T', got %q", s)
+	}
+	c.sendQ("LISTEN deferred")
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T29: LISTEN in a transaction must keep status 'T', got %q", s)
+	}
+	c.sendQ("ROLLBACK")
+	if s := c.drainUntilRFQ(); s != 'I' {
+		t.Fatalf("T29: after ROLLBACK want 'I', got %q", s)
+	}
+
+	// The subscription must be discarded — no subscriber should ever appear.
+	if waitForListenCount(l, 1, 200*time.Millisecond) {
+		t.Errorf("T29: LISTEN must be discarded on ROLLBACK, but a subscriber appeared")
+	}
+}
+
+// TestPlaybook_T30_ListenInFailedTransactionRejected verifies that a LISTEN
+// issued while the transaction is in the failed ('E') state is rejected with
+// the standard "transaction is aborted" error and status 'E', and never
+// subscribes — matching PostgreSQL.
+func TestPlaybook_T30_ListenInFailedTransactionRejected(t *testing.T) {
+	h := newHarness(t)
+	defer h.close()
+
+	h.addBackend(backendSpec{
+		Rules: []queryRule{
+			{SQL: "BEGIN", Tag: "BEGIN", Tx: txBegin},
+			{SQL: "boom", Error: &pgError{Code: "42601", Message: "syntax error at or near \"boom\"", Tx: txFail}},
+			{SQL: "ROLLBACK", Tag: "ROLLBACK", Tx: txEnd},
+		},
+	})
+	ch := pgfox.Channel{Database: "testdb", Name: "x"}
+	l := preCreateMonitor(h, ch)
+
+	c := h.connect()
+	defer c.conn.Close()
+
+	c.sendQ("BEGIN")
+	if s := c.drainUntilRFQ(); s != 'T' {
+		t.Fatalf("T30: after BEGIN want 'T', got %q", s)
+	}
+	c.sendQ("boom")
+	if s := c.drainUntilRFQ(); s != 'E' {
+		t.Fatalf("T30: after error want 'E' (failed tx), got %q", s)
+	}
+
+	// LISTEN in an aborted transaction must be rejected with an error + 'E'.
+	c.sendQ("LISTEN x")
+	c.expect('E') // ErrorResponse
+	c.expectRFQ('E')
+	if n := listenClientCount(l); n != 0 {
+		t.Errorf("T30: rejected LISTEN must not subscribe, count=%d", n)
+	}
+
+	c.sendQ("ROLLBACK")
+	if s := c.drainUntilRFQ(); s != 'I' {
+		t.Fatalf("T30: after ROLLBACK want 'I', got %q", s)
+	}
+	if waitForListenCount(l, 1, 200*time.Millisecond) {
+		t.Errorf("T30: a rejected LISTEN must never take effect")
+	}
 }

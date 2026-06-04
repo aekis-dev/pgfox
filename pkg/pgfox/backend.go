@@ -57,8 +57,6 @@ type Backend struct {
 	// successfully deployed (Parse acknowledged) on this specific connection.
 	// Single-owner while inUse; no lock needed.
 	deployedStmts map[string]bool
-
-	SkipAliveCheck bool
 }
 
 // NewBackend creates a new backend connection.
@@ -247,30 +245,6 @@ func PutMsgBody(body []byte) {
 	putMsgBody(bp)
 }
 
-// IsAlive checks if the connection is still alive via a non-blocking TCP peek.
-func (b *Backend) IsAlive() bool {
-	if b.SkipAliveCheck {
-		return true
-	}
-	if b.Conn == nil {
-		return false
-	}
-	netConn, ok := b.Conn.(net.Conn)
-	if !ok {
-		return false
-	}
-	if err := netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
-		return false
-	}
-	defer netConn.SetReadDeadline(time.Time{})
-	one := make([]byte, 1)
-	_, err := netConn.Read(one)
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		return true
-	}
-	return false
-}
-
 func (b *Backend) Peek(n int) ([]byte, error) {
 	return b.reader.Peek(n)
 }
@@ -306,11 +280,10 @@ func (b *Backend) Return() {
 	b.SetInUse(false)
 	b.SetClient(nil)
 
-	if !b.IsAlive() {
-		b.Pool.Target.CloseCh <- b
-		return
-	}
-
+	// No liveness probe here: it cost up to 1ms per return on the hot path and,
+	// worse, a raw Read could consume a pending byte off the socket (bypassing
+	// b.reader) and corrupt the stream. A connection that died while idle is
+	// detected lazily on next use (ReadMessage/WriteMessage error → Release).
 	// Direct deposit into the Pool channel — no target goroutine involvement.
 	select {
 	case b.Pool.Queue <- b:

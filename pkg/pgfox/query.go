@@ -136,9 +136,18 @@ func (p *Server) executeExtendedPipeline(client *Client, pp *[]pipelineMsg) erro
 			// LISTEN/UNLISTEN/NOTIFY even when sent via the extended protocol
 			// (e.g. asyncpg.execute("LISTEN chan") uses unnamed prepared stmts).
 			if cmd, _ := ClassifyAndParameterize(querySQL); cmd != SimpleQueryOther {
-				specialCmd = cmd
-				specialSQL = querySQL
-				break // drain the rest of the pipeline, then dispatch below
+				// NOTIFY inside a transaction must run on the pinned backend (it
+				// fires at COMMIT); intercept it only in autocommit. When pinned,
+				// fall through so it is forwarded to the pinned backend as an
+				// ordinary statement, preserving transaction semantics. LISTEN and
+				// UNLISTEN are always handled by the monitor machinery.
+				if cmd == SimpleQueryNotify && client.IsInTransaction() {
+					// fall through to the normal statement handling below
+				} else {
+					specialCmd = cmd
+					specialSQL = querySQL
+					break // drain the rest of the pipeline, then dispatch below
+				}
 			}
 
 			// The unnamed statement ("") is per-connection and implicitly replaced
@@ -505,7 +514,14 @@ func (p *Server) executeQuery(client *Client, query string) error {
 	case SimpleQueryUnlisten:
 		return p.handleUnlisten(client, query)
 	case SimpleQueryNotify:
-		return p.handleNotify(client, query)
+		// NOTIFY inside a transaction must run on the pinned backend so the
+		// notification fires at COMMIT and ReadyForQuery keeps reporting 'T'.
+		// Borrowing a one-shot backend (handleNotify) is correct only in
+		// autocommit; in a transaction we fall through to the pinned-backend
+		// path below.
+		if !client.IsInTransaction() {
+			return p.handleNotify(client, query)
+		}
 	}
 
 	pinned := client.IsInTransaction()
@@ -627,15 +643,31 @@ func (p *Server) executeAsPrepared(client *Client, originalSQL string, result *P
 		}
 	}
 
-	// Bind: text format for all params, binary format for all result columns.
+	// Bind: all params text, and request results in TEXT format.
+	//
+	// Invariant: pgfox always asks the backend for the result format the client
+	// will consume, and forwards the bytes verbatim. A simple-query client
+	// issued 'Q' and can only read text, so we request text here. (The extended
+	// protocol path forwards the client's own Bind, so binary clients there get
+	// binary.) This keeps pgfox free of any value-level type knowledge — every
+	// forward is a byte copy, never a transcode.
 	bindBody := BuildBindBody(
 		"", // unnamed portal
 		stmtName,
 		nil, // all params in text format (we extracted them as text)
 		result.Values,
-		[]int16{1}, // binary results for all columns
+		nil, // result formats: none specified = all text
 	)
 	if err := backend.WriteMessage('B', bindBody); err != nil {
+		backend.Release()
+		return client.SendErrorResponse("ERROR", "08006", "connection failure")
+	}
+
+	// Describe the unnamed portal. Execute never emits a RowDescription, but a
+	// simple-query client requires one before any DataRow. The portal Describe
+	// makes the backend send RowDescription (row-returning) or NoData (not),
+	// which forwardPreparedResponse forwards / swallows respectively.
+	if err := backend.WriteMessage('D', BuildDescribePortal("")); err != nil {
 		backend.Release()
 		return client.SendErrorResponse("ERROR", "08006", "connection failure")
 	}
@@ -675,15 +707,16 @@ func (p *Server) executeAsPrepared(client *Client, originalSQL string, result *P
 	return nil
 }
 
-// forwardPreparedResponse reads backend responses after Parse+Bind+Execute+Sync
-// and forwards them to the client, translating extended protocol messages to
-// what a simple query client expects.
+// forwardPreparedResponse reads backend responses after Parse+Bind+Describe+
+// Execute+Sync and forwards them to the client, translating extended protocol
+// messages to what a simple query client expects.
 //
 // Handles:
 //   - ParseComplete ('1')   → consumed, not forwarded; marks stmt deployed
 //   - BindComplete ('2')    → consumed, not forwarded
-//   - DataRow ('D')         → forwarded as-is (binary data from backend)
-//   - RowDescription ('T')  → forwarded as-is
+//   - NoData ('n')          → consumed, not forwarded (from the portal Describe)
+//   - RowDescription ('T')  → forwarded as-is (text format, from the Describe)
+//   - DataRow ('D')         → forwarded as-is (text data from backend)
 //   - CommandComplete ('C') → forwarded as-is
 //   - ErrorResponse ('E')   → forwarded as-is
 //   - ReadyForQuery ('Z')   → forwarded as-is, loop exits
@@ -714,6 +747,12 @@ func (p *Server) forwardPreparedResponse(
 
 		case '2': // BindComplete
 			PutMsgBody(body) // not forwarded to client
+
+		case 'n': // NoData — from the portal Describe on a non-row-returning
+			// statement (e.g. INSERT without RETURNING). Simple query protocol
+			// has no NoData message, so consume it without forwarding. The
+			// matching CommandComplete still flows through the default case.
+			PutMsgBody(body)
 
 		case 'Z': // ReadyForQuery
 			var status byte
@@ -769,6 +808,10 @@ func (p *Server) reconcileConn(
 		}
 
 	case 'I':
+		// A transaction reaching idle resolves any LISTEN/UNLISTEN buffered
+		// during it (applied on COMMIT, discarded otherwise). No-op if none.
+		p.resolvePendingListens(client)
+
 		if hasNamedStmts {
 			// Keep pinned — named statements live on this specific backend.
 			if !wasPinned {
