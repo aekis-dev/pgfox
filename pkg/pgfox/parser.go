@@ -355,16 +355,21 @@ func collectLiterals(node nodes.Node, out *[]literalValue, inLimit bool) {
 		if n == nil {
 			return
 		}
+		// Collect in SQL text order so the literal sequence matches a left-to-
+		// right rescan in findNextLiteral. FROM appears textually before WHERE;
+		// collecting it after WHERE (as before) made any query with a literal in
+		// the FROM clause (e.g. a table function like generate_series(1,5)) fail
+		// the rescan and silently bypass the prepared-statement cache.
 		collectInList(n.TargetList, out, false)
+		collectInList(n.FromClause, out, false)
 		collectLiterals(n.WhereClause, out, false)
 		collectInList(n.GroupClause, out, false)
 		collectLiterals(n.HavingClause, out, false)
 		collectInList(n.ValuesLists, out, false)
-		collectInList(n.FromClause, out, false)
-		collectLiterals(n.LimitOffset, out, true) // structural
-		collectLiterals(n.LimitCount, out, true)  // structural
 		collectLiterals(n.Larg, out, false)
 		collectLiterals(n.Rarg, out, false)
+		collectLiterals(n.LimitOffset, out, true) // structural (not emitted)
+		collectLiterals(n.LimitCount, out, true)  // structural (not emitted)
 
 	case *nodes.InsertStmt:
 		if n == nil {
