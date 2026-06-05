@@ -69,4 +69,4 @@ queries through the pool.
 
 ## License
 
-MIT — see the LICENSE file.
+AGPL v3 — see the LICENSE file.
