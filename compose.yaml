@@ -6,9 +6,23 @@ services:
       - 5432
       - 4502
     configs:
-      - source: 125ceb23-7556-4c02-af88-950a64a89e78
+      - source: pgfox_config
         target: /etc/pgfox/config.yaml
-        mode: 0755
+        mode: 0444
+      # PgFox's certificate authority. Mounted into pgfox_dir so PgFox uses
+      # THIS CA (instead of generating its own) to sign the per-user client
+      # certificates it presents to PostgreSQL. The same ca.crt must be given to
+      # PostgreSQL as ssl_ca_file — see docs/deployment.md.
+      - source: pgfox_ca_crt
+        target: /var/lib/pgfox/data/ca.crt
+        mode: 0444
+      # SECURITY: this is the CA *private key*. Swarm configs are stored in the
+      # raft log and are NOT encrypted at rest. For anything beyond local
+      # testing, move this to a Docker secret (see docs/deployment.md). It is a
+      # config here only to keep the inline-content quickstart self-contained.
+      - source: pgfox_ca_key
+        target: /var/lib/pgfox/data/ca.key
+        mode: 0400
     environment:
       - TZ=UTC
     networks:
@@ -21,8 +35,12 @@ networks:
     driver: overlay
     external: true
 
+volumes:
+  pgfox-data:
+    name: pgfox-data
+
 configs:
-  125ceb23-7556-4c02-af88-950a64a89e78:
+  pgfox_config:
     name: 125ceb23-7556-4c02-af88-950a64a89e78
     content: |
       server:
@@ -30,16 +48,64 @@ configs:
         max_connections: 1000
         connect_timeout: 10s
         idle_timeout: 10m
+
+        # Where PgFox keeps its CA and generated certs. ca.crt/ca.key are
+        # provided via the configs below; PgFox signs per-user certs into
+        # {pgfox_dir}/certs/ at runtime (regenerated on restart — they don't
+        # need to persist because PostgreSQL trusts the CA, not each cert).
+        pgfox_dir: /var/lib/pgfox/data
+
+        # Privileged role PgFox uses to read pg_authid for client SCRAM auth.
+        # Must exist on the backend with pg_read_all_auth_data (PG14+) or be a
+        # superuser. PgFox authenticates this connection with a cert (CN=odoo)
+        # it signs from the CA above.
+        pgfox_role: postgres
+
+        certs:
+          ttl: 2160h
+          organization: "PgFox"
+          organizational_unit: "PostgreSQL Users"
+          country: "US"
+
       logging:
-        level: "debug"
+        level: "info"
         format: "text"
+
       targets:
         - name: "primary_cluster"
+          # Must match a SAN in PostgreSQL's server certificate — PgFox verifies
+          # the backend hostname against the CA (verify-full).
           host: "3b528289-a9c2-4054-8bf0-7d6108ac5d54"
           port: 5432
-          ssl_mode: "prefer"
           max_connections: 50
+          connect_timeout: 20s
           priority: 1
+          rules:
+            - action: deny
+              databases:
+                - "template0"
+                - "template1"
+          parameters:
+            application_name: "pgfox"
+            timezone: "UTC"
+
       metrics:
         enabled: true
         port: 4502
+
+  pgfox_ca_crt:
+    name: pgfox_ca_crt
+    content: |
+      -----BEGIN CERTIFICATE-----
+      REPLACE_ME: paste the contents of your ca.crt here (see docs/deployment.md
+      "Step 1 — Create the CA"). Until replaced with a real CA certificate,
+      PgFox will fail to start because it cannot parse this file.
+      -----END CERTIFICATE-----
+
+  pgfox_ca_key:
+    name: pgfox_ca_key
+    content: |
+      -----BEGIN PRIVATE KEY-----
+      REPLACE_ME: paste the contents of your ca.key here. Treat this as a
+      secret. For production use a Docker secret instead of a config.
+      -----END PRIVATE KEY-----

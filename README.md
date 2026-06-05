@@ -1,5 +1,6 @@
-# <img src="docs/logo.jpg" width="256" height="256" />
-# PgFox
+# <img src="docs/logo.jpg" width="128" height="128" align="center" /> PgFox
+#
+
 
 PgFox is a transparent PostgreSQL connection pooler written in Go. It sits
 between your application and PostgreSQL and lets many client connections share a
@@ -36,6 +37,11 @@ multiplexing clients onto a small backend pool.
 
 ## Quick start
 
+**Prerequisites:** Docker; PostgreSQL **14+** (for `pg_read_all_auth_data`, used
+by the privileged role — on PG 13 and earlier that role must be a superuser);
+`openssl` if you bring your own CA; and every client role must already exist in
+PostgreSQL with a SCRAM password.
+
 ```bash
 # Build
 go build -o pgfox ./...
@@ -44,7 +50,14 @@ go build -o pgfox ./...
 ./pgfox --config config.yaml
 ```
 
-Point a client at PgFox's listen address (`:5433` in the sample config):
+> On its first run PgFox generates its certificates, but it **cannot serve
+> clients until PostgreSQL is configured to trust them**. Follow
+> [Deployment](docs/deployment.md) end to end first — it covers the shared CA
+> and the PostgreSQL `ssl`/`pg_hba.conf` setup. The steps below assume that is
+> done.
+
+Point a client at PgFox's listen address (`:5433` in the sample config; the
+Docker examples use `:5432`):
 
 ```bash
 psql "host=localhost port=5433 dbname=mydb user=myrole sslmode=disable"
@@ -52,20 +65,30 @@ psql "host=localhost port=5433 dbname=mydb user=myrole sslmode=disable"
 
 PgFox authenticates the client with SCRAM, opens (or reuses) a backend
 connection to the target PostgreSQL using a certificate for `myrole`, and routes
-queries through the pool.
+queries through the pool. (`sslmode=disable` is the client↔PgFox hop; PgFox↔
+PostgreSQL is always TLS. PgFox also accepts TLS client connections — see
+[Usage scenarios](docs/usage.md#connecting-over-tls).)
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — how pooling, prepared-statement
-  multiplexing, transactions, LISTEN/NOTIFY, and cancellation actually work.
-- [Configuration](docs/configuration.md) — every config field, with examples
-  drawn from the sample `config.yaml`.
-- [Startup & wire protocol](docs/protocol.md) — the connection, authentication,
-  and cancellation flows at the protocol level.
+New here? Start with **[Deployment](docs/deployment.md)** to get PgFox and
+PostgreSQL running together, then **[Usage scenarios](docs/usage.md)** for what
+clients can do.
+
+- [Deployment](docs/deployment.md) — running PgFox and PostgreSQL together with
+  Docker, including the shared certificate authority and the PostgreSQL-side
+  TLS/auth configuration. **Read this first.**
 - [Usage scenarios](docs/usage.md) — what happens for regular queries,
   transactions, prepared statements (asyncpg / psycopg2), LISTEN/NOTIFY, and
   cancellation.
-- [Playbook](docs/playbook.md) - a guide to understand how PgFox works under the hood.
+- [Configuration](docs/configuration.md) — every config field, with examples
+  drawn from the sample `config.yaml`.
+- [Architecture](docs/architecture.md) — how pooling, prepared-statement
+  multiplexing, transactions, LISTEN/NOTIFY, and cancellation actually work.
+- [Startup & wire protocol](docs/protocol.md) — the connection, authentication,
+  and cancellation flows at the protocol level.
+- [Playbook](docs/playbook.md) — the wire-level protocol spec, scenario by
+  scenario.
 
 ## License
 

@@ -13,6 +13,9 @@ forwarding to a PostgreSQL backend on `127.0.0.1:5432`).
 psql "host=localhost port=5433 dbname=mydb user=myrole sslmode=disable"
 ```
 
+(The port is whatever you set in `server.listen_addr` — these examples use
+`:5433`; the Docker guide uses `:5432`. Match your own config.)
+
 PgFox authenticates `myrole` with SCRAM-SHA-256 (verifying against the role's
 stored password in PostgreSQL), then services the session by borrowing backend
 connections authenticated with a certificate for `myrole`. The `dbname` and
@@ -20,6 +23,21 @@ connections authenticated with a certificate for `myrole`. The `dbname` and
 
 A `deny` rule (such as the sample's block on `template0`/`template1`) causes
 matching connections to be rejected.
+
+### Connecting over TLS
+
+The hop above uses `sslmode=disable`, which secures nothing at the transport
+level but still runs SCRAM. If you want the client↔PgFox link encrypted too,
+PgFox accepts TLS: set `server.hostname` to the host clients connect to, give
+clients the CA (`ca.crt`), and connect with a verifying SSL mode:
+
+```bash
+psql "host=pgfox.example.com port=5433 dbname=mydb user=myrole \
+      sslmode=verify-full sslrootcert=ca.crt"
+```
+
+PgFox upgrades the connection on the client's `SSLRequest` using
+`{pgfox_dir}/pgfox.crt`; clients that don't request TLS continue in plaintext.
 
 ## Regular queries (autocommit)
 

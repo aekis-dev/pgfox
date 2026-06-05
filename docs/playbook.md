@@ -60,7 +60,7 @@ C→P  SASLResponse { client-final-message }
 P→C  AuthenticationSASLFinal { server-final-message }
 P→C  AuthenticationOK
 P→C  ParameterStatus* (server_version, client_encoding, …)
-P→C  BackendKeyData { pid=0, secret=0 }
+P→C  BackendKeyData { pid=<pgfox-assigned>, secret=<random> }
 P→C  ReadyForQuery { status='I' }
 ```
 
@@ -69,8 +69,10 @@ P→C  ReadyForQuery { status='I' }
 - SCRAM-SHA-256 is performed entirely within pgfox using a stored verifier fetched
   via the privileged connection (`fetchSCRAMVerifier`). The client never has a
   direct connection to PostgreSQL during auth.
-- `BackendKeyData` sends pid=0, secret=0. pgfox does not expose real backend pids
-  to clients to prevent `pg_cancel_backend` bypassing the pooler.
+- `BackendKeyData` sends a unique, pgfox-assigned `(pid, secret)` per client --
+  not a real backend pid, and not dummy zeros. pgfox registers the pair so an
+  out-of-band CancelRequest can be mapped back to this client and forwarded to
+  whichever backend is running its query (see section 1.4).
 - ParameterStatus messages are forwarded from `target.params` (populated from the
   privileged backend's startup sequence).
 
@@ -83,9 +85,11 @@ P→C  'S'  (single byte — TLS accepted)
      [continue with startup as above]
 ```
 
-**Invariant:** pgfox always accepts SSLRequest and upgrades. Non-TLS clients
-attempting to connect when `tls.enabled=true` are rejected after the 'S' byte
-with an error.
+**Invariant:** TLS to pgfox is optional. If a client-facing certificate is
+available pgfox replies `S` and upgrades (the cert is `{pgfox_dir}/pgfox.crt`,
+CN/SAN = `server.hostname`); otherwise it replies `N` and the client continues
+in plaintext. Either way SCRAM still runs -- TLS protects the transport, it does
+not replace authentication.
 
 ### 1.3 Reconnect after pgfox restart
 
@@ -102,6 +106,50 @@ notifications until their process reconnects.
 **Test scenario:** restart pgfox with an active Listener client; verify the
 client receives a connection error and that after reconnect the listen monitor
 is re-established correctly.
+
+---
+
+### 1.4 Out-of-band query cancellation
+
+A client cancels a running query by opening a **separate** TCP connection and
+sending a CancelRequest carrying the `(pid, secret)` it received in
+`BackendKeyData`.
+
+```
+C→P  CancelRequest { code=80877102, pid=<client pid>, secret=<client secret> }
+     (brand-new connection -- no StartupMessage, no auth)
+
+P internal:
+  client = cancelKeys.lookup(pid)        (registered at login, 1.1)
+  if client == nil or client.secret != secret: ignore
+  backend = client.activeBackend()       (the backend running the in-flight query)
+  if backend == nil: ignore
+
+P→B' (new short-lived connection to the backend's target)
+P→B' CancelRequest { code=80877102, pid=backend.pid, secret=backend.secret }
+     (the BACKEND's real key, captured from its BackendKeyData at connect)
+     close
+```
+
+**pgfox decisions:**
+
+- The client's `(pid, secret)` identify the *client*, not a backend. pgfox keeps
+  a `pid -> client` registry (`cancelKeys`), populated at login and removed on
+  disconnect.
+- `activeBackend` is set while the client is awaiting a backend response and
+  cleared afterward, so a cancel targets the backend actually running the query
+  -- including autocommit queries, not only pinned transactions.
+- pgfox forwards the cancel using the backend's real `(pid, secret)`, so
+  PostgreSQL cancels the correct server process.
+
+**Invariant / known race:** cancellation is asynchronous. If the query finishes
+and the backend is returned or reused in the instant before the cancel is
+forwarded, the cancel may hit a different query or none; PostgreSQL treats a
+cancel for a no-longer-running query as a harmless no-op.
+
+**Test scenario:** run `SELECT pg_sleep(30)` and issue a cancel (psql Ctrl-C);
+verify the backend query is cancelled and the client receives
+`ERROR: canceling statement due to user request`.
 
 ---
 
@@ -126,7 +174,7 @@ P→B  (return backend to Pool via returnConn)
 
 - `ClassifyAndParameterize` returns `(SimpleQueryOther, nil)` for DDL and
   non-parameterizable queries.
-- Queue is borrowed, query forwarded verbatim, response forwarded verbatim.
+- A backend is borrowed, query forwarded verbatim, response forwarded verbatim.
 - `reconcileConn` returns backend to Pool if `txStatus='I'`.
 
 ### 2.2 Parameterizable DML via stmt cache (happy path)
@@ -729,10 +777,10 @@ message sequence, not just the end result.
 |---|----------|---------------|
 | T01 | Plain TCP startup + SCRAM | Client receives AuthenticationOK + ParameterStatus + RFQ |
 | T02 | TLS upgrade then startup | SSLRequest → 'S' → TLS → startup succeeds |
-| T03 | Simple SELECT (passthrough) | Queue receives Q; client receives correct rows |
+| T03 | Simple SELECT (passthrough) | Backend receives Q; client receives correct rows |
 | T04 | Simple SELECT with literals (stmt cache) | Parse sent once per backend; HasStmt skips on reuse |
 | T05 | 50 concurrent simple queries | All complete; Pool grows; backends returned after each |
-| T06 | BEGIN / queries / COMMIT | Queue pinned across all messages; unpinned on COMMIT |
+| T06 | BEGIN / queries / COMMIT | Backend pinned across all messages; unpinned on COMMIT |
 | T07 | Named stmt, remappable (asyncpg default) | P+D+H then B+E+S; MarkStmt called; no pin |
 | T08 | Named stmt, 2nd call reuses backend | No Parse sent; HasStmt=true; correct result |
 | T09 | Named stmt, 2nd call gets different backend | Phase 3.5 injects Parse on new backend |
@@ -747,8 +795,8 @@ message sequence, not just the end result.
 | T18 | Listen monitor reconnect | New backend opened; LISTEN re-issued; fan-out resumes |
 | T19 | pgfox restart with active listeners | Clients get EOF; must reconnect and re-LISTEN |
 | T20 | borrowConn demand signal | growthCycle fires immediately on first slow-path waiter |
-| T21 | returnConn direct path | Queue deposited in backendPool without target goroutine |
+| T21 | returnConn direct path | Backend deposited in the pool without the target goroutine |
 | T22 | Dead backend on return | closeCh receives it; totalOpen decremented; Pool grows |
-| T23 | Tx status 'E' (failed transaction) | Queue stays pinned; ROLLBACK unpins |
+| T23 | Tx status 'E' (failed transaction) | Backend stays pinned; ROLLBACK unpins |
 | T24 | 50 concurrent transactions | Each gets own backend; all commit correctly |
 | T25 | Slow + fast queries concurrently | Fast queries not blocked by slow ones |

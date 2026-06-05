@@ -66,6 +66,9 @@ metrics:
 | `query_timeout` | duration | Maximum time to wait for a complete backend response. `0s` disables it. |
 | `pgfox_dir` | string | PgFox data directory; certificate paths are derived from it (see below). |
 | `pgfox_role` | string | PostgreSQL role used for the privileged connection that reads `pg_authid`. Must have `pg_read_all_auth_data` (PG14+) or be a superuser. |
+| `hostname` | string | CN/SAN of PgFox's own client-facing TLS certificate (`{pgfox_dir}/pgfox.crt`). Must match the host clients use to reach PgFox, or their TLS verification fails. Default `localhost`. |
+| `stats_interval` | duration | How often internal pool/connection statistics are refreshed. |
+| `peak_window` | duration | Sliding window used for peak-usage tracking that informs pool-shrink decisions. |
 | `certs` | block | Certificate generation settings (see below). |
 
 A note on `max_message_size` and `query_timeout`: applications that store large
@@ -89,6 +92,16 @@ PgFox derives all certificate paths from `pgfox_dir`:
 The CA and the `pgfox_role` certificate are generated automatically if missing.
 Per-user certificates are generated on demand the first time a given role
 connects, and renewed automatically when they expire.
+
+### Client connections (optional TLS)
+
+TLS between a client and PgFox is optional. PgFox also generates a client-facing
+certificate at `{pgfox_dir}/pgfox.crt` (CN/SAN = `server.hostname`). If a client
+sends an `SSLRequest`, PgFox upgrades the connection using that certificate;
+otherwise the client continues in plaintext. Either way the client still
+authenticates with SCRAM — TLS only protects the transport. For clients to
+verify PgFox's certificate, set `server.hostname` to the host they connect to
+and distribute the CA (`ca.crt`) to them.
 
 ### `server.certs`
 
