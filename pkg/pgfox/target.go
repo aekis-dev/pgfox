@@ -94,11 +94,6 @@ type Target struct {
 	// target goroutine can append them to cachedPools without a lock.
 	PoolRegistered chan *Pool
 
-	// BackendIndex maps processID (int32) → *Backend for idle
-	// connections. Updated atomically when connections enter/leave backendPool.
-	// Allows O(1) cancel-request lookup without draining the channel.
-	BackendIndex sync.Map // int32 → *Backend
-
 	// connReady is signaled (non-blocking send) whenever a connection is
 	// returned to any Pool, waking borrowConn waiters.
 	ConnReady chan struct{}
@@ -497,7 +492,6 @@ func (t *Target) openPrivilegedConn(p *Server, logger *logger.Logger) error {
 // connReady so waiting borrowers can react (e.g. trigger growth).
 func (t *Target) handleClose(p *Server, backend *Backend, logger *logger.Logger) {
 	pool := backend.Pool
-	t.BackendIndex.Delete(backend.GetProcessID())
 	backend.Conn.Close()
 	t.TotalOpen--
 	pool.removeFromAll(backend)

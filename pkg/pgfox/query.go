@@ -458,6 +458,8 @@ func (p *Server) executeExtendedPipeline(client *Client, pp *[]pipelineMsg) erro
 // This is separate from forwardPreparedResponse because in the extended protocol
 // the client expects to receive ParseComplete and BindComplete messages.
 func (p *Server) forwardExtendedResponse(client *Client, backend *Backend, sentParseHashes []string, logger *logger.Logger) (byte, error) {
+	client.SetActiveBackend(backend)
+	defer client.SetActiveBackend(nil)
 	// sentParseHashes lists, in order, the hashes of Parse messages that were
 	// actually forwarded to the backend this pipeline. ParseComplete responses
 	// arrive in that same order; we mark each hash deployed as we see them.
@@ -729,6 +731,8 @@ func (p *Server) forwardPreparedResponse(
 	entry *CachedStmt,
 	logger *logger.Logger,
 ) (byte, error) {
+	client.SetActiveBackend(backend)
+	defer client.SetActiveBackend(nil)
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {
@@ -852,6 +856,8 @@ func (p *Server) reconcileConn(
 // PostgreSQL does NOT send ReadyForQuery after Flush — only after Sync.
 // The response to Parse+Describe+Flush ends with RowDescription('T') or NoData('n').
 func (p *Server) drainFlushResponse(client *Client, backend *Backend, sentParseHashes []string) error {
+	client.SetActiveBackend(backend)
+	defer client.SetActiveBackend(nil)
 	logger := client.Logger()
 	// ParseComplete responses arrive in the same order as the Parse messages
 	// that were sent. Mark each hash as deployed so phase 3.5 does not
@@ -896,6 +902,8 @@ func (p *Server) forwardQueryToBackend(backend *Backend, query string) error {
 //	'T' — in a transaction block
 //	'E' — in a failed transaction block
 func (p *Server) forwardCompleteBackendResponse(client *Client, backend *Backend) (byte, error) {
+	client.SetActiveBackend(backend)
+	defer client.SetActiveBackend(nil)
 	for {
 		msgType, body, err := backend.ReadMessage()
 		if err != nil {

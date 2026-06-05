@@ -62,6 +62,16 @@ type Client struct {
 	lastTxStatus   byte
 	lastCommandTag string
 
+	// Cancellation: pgfox assigns each client its own (pid, secret) and sends
+	// it as BackendKeyData. A CancelRequest carrying this pair is mapped back to
+	// this client, whose currently-executing backend is then sent a real
+	// CancelRequest. activeBackend is the backend running the client's in-flight
+	// query (set while awaiting a backend response), read from the separate
+	// goroutine that handles the incoming CancelRequest.
+	cancelPID     int32
+	cancelSecret  int32
+	activeBackend atomic.Pointer[Backend]
+
 	// msgsSent is incremented atomically for metrics. Kept here for cache
 	// locality; the owning goroutine is the sole writer so atomic is enough.
 	msgsSent int64
@@ -120,6 +130,28 @@ func (c *Client) RemoveNamedStatement() {
 	}
 }
 func (c *Client) HasNamedStatements() bool { return c.namedStmts > 0 }
+
+// --- Cancellation key + active backend ---
+
+// SetCancelKey records the pgfox-assigned cancel identifiers for this client.
+func (c *Client) SetCancelKey(pid, secret int32) {
+	c.cancelPID = pid
+	c.cancelSecret = secret
+}
+
+// CancelPID returns the client's pgfox-assigned cancel process id.
+func (c *Client) CancelPID() int32 { return c.cancelPID }
+
+// CancelSecret returns the client's pgfox-assigned cancel secret.
+func (c *Client) CancelSecret() int32 { return c.cancelSecret }
+
+// SetActiveBackend records (or clears, with nil) the backend currently running
+// this client's query. Safe to call/read across goroutines.
+func (c *Client) SetActiveBackend(b *Backend) { c.activeBackend.Store(b) }
+
+// ActiveBackend returns the backend currently running this client's query, or
+// nil if the client has no query in flight.
+func (c *Client) ActiveBackend() *Backend { return c.activeBackend.Load() }
 
 // --- Transaction-deferred LISTEN/UNLISTEN (sharedMu) ---
 

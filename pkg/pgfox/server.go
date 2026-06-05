@@ -48,6 +48,12 @@ type Server struct {
 	// interleave writes to the same {user}.crt/{user}.key pair on disk.
 	certGenMu sync.Map // username → *sync.Mutex
 
+	// cancelKeys maps a pgfox-assigned cancel pid (int32) → *Client so an
+	// out-of-band CancelRequest can be routed to the right client. nextCancelPID
+	// hands out unique, non-zero pids.
+	cancelKeys    sync.Map // int32 → *Client
+	nextCancelPID atomic.Int32
+
 	// caPool caches the parsed CA cert pool so that every new backend
 	// connection doesn't re-read and re-parse the CA from disk. Populated
 	// lazily on first use (after EnsureCerts has run at startup) and stable for
@@ -198,6 +204,7 @@ func (p *Server) handleClient(conn net.Conn) {
 
 	defer func() {
 		p.Clients.Delete(conn)
+		p.cancelKeys.Delete(client.CancelPID())
 
 		duration := time.Since(client.GetConnectedAt())
 		clientLogger.Info("Client disconnected",
@@ -502,44 +509,4 @@ func isClientGone(err error) bool {
 		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection reset by peer") ||
 		strings.Contains(msg, "use of closed network connection")
-}
-
-// findBackendByKey finds a backend connection matching processID and secretKey.
-// Used to route cancel requests.
-//
-// Active (pinned) connections are found via the clients sync.Map.
-// Idle connections are found via the per-target backendIndex sync.Map, which
-// is updated atomically when connections enter/leave the idle Pool.
-func (p *Server) findBackendByKey(processID, secretKey int32) (*Target, *Backend) {
-	// Search active client-pinned connections first (most common for cancel).
-	var foundTarget *Target
-	var foundConn *Backend
-
-	p.Clients.Range(func(_, v any) bool {
-		client := v.(*Client)
-		backend := client.GetBackend()
-		if backend != nil &&
-			backend.GetProcessID() == processID &&
-			backend.GetSecretKey() == secretKey {
-			foundTarget = backend.Pool.Target
-			foundConn = backend
-			return false // stop iteration
-		}
-		return true
-	})
-	if foundConn != nil {
-		return foundTarget, foundConn
-	}
-
-	// Search idle connections via per-target index.
-	for _, target := range p.Targets {
-		if v, ok := target.BackendIndex.Load(processID); ok {
-			conn := v.(*Backend)
-			if conn.GetSecretKey() == secretKey {
-				return target, conn
-			}
-		}
-	}
-
-	return nil, nil
 }

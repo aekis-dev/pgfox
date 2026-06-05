@@ -287,8 +287,7 @@ func (b *Backend) Return() {
 	// Direct deposit into the Pool channel — no target goroutine involvement.
 	select {
 	case b.Pool.Queue <- b:
-		// Update cancel-lookup index and wake any waiting borrowers.
-		b.Pool.Target.BackendIndex.Store(b.GetProcessID(), b)
+		// Wake any waiting borrowers.
 		b.Pool.Target.signalConnReady()
 	default:
 		// backendPool full — let target goroutine close it cleanly.

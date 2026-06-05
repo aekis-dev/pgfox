@@ -158,7 +158,18 @@ func (p *Server) authenticateClientWithBackend(client *Client, user, database st
 	if err := client.SendAuthenticationOK(); err != nil {
 		return fmt.Errorf("failed to send AuthenticationOK: %w", err)
 	}
-	if err := client.SendBackendKeyData(0, 0); err != nil {
+	// Assign this client its own cancel key and register it so an out-of-band
+	// CancelRequest can be routed back here (and on to the real backend running
+	// the in-flight query). pid is unique and non-zero; secret is random.
+	cancelPID := p.nextCancelPID.Add(1)
+	var sb [4]byte
+	if _, err := rand.Read(sb[:]); err != nil {
+		return fmt.Errorf("failed to generate cancel secret: %w", err)
+	}
+	cancelSecret := int32(binary.BigEndian.Uint32(sb[:]))
+	client.SetCancelKey(cancelPID, cancelSecret)
+	p.cancelKeys.Store(cancelPID, client)
+	if err := client.SendBackendKeyData(cancelPID, cancelSecret); err != nil {
 		return fmt.Errorf("failed to send BackendKeyData: %w", err)
 	}
 	if err := p.sendTargetParameterStatuses(client, user, target); err != nil {
@@ -446,25 +457,39 @@ func (p *Server) handleClientSCRAM(client *Client, user string, verifier *auth.S
 	return nil
 }
 
-// handleCancelRequest processes a PostgreSQL cancel request.
+// handleCancelRequest processes a PostgreSQL CancelRequest. The pid/secret
+// belong to a pgfox-assigned client key (not a backend). We map them to the
+// client, find the backend currently running its query, and forward a real
+// CancelRequest to that backend's PostgreSQL using the backend's own key.
 func (p *Server) handleCancelRequest(client *Client) error {
 	buf := make([]byte, 8)
 	if _, err := io.ReadFull(client.reader, buf); err != nil {
 		return fmt.Errorf("failed to read cancel data: %w", err)
 	}
+	pid := int32(binary.BigEndian.Uint32(buf[0:4]))
+	secret := int32(binary.BigEndian.Uint32(buf[4:8]))
 
-	processID := int32(buf[0])<<24 | int32(buf[1])<<16 | int32(buf[2])<<8 | int32(buf[3])
-	secretKey := int32(buf[4])<<24 | int32(buf[5])<<16 | int32(buf[6])<<8 | int32(buf[7])
+	p.Logger.Debug("Cancel request received", "client_pid", pid)
 
-	p.Logger.Debug("Cancel request received", "process_id", processID)
-
-	cancelTarget, backend := p.findBackendByKey(processID, secretKey)
-	if backend == nil {
-		p.Logger.Debug("Cancel: no matching backend", "process_id", processID)
+	v, ok := p.cancelKeys.Load(pid)
+	if !ok {
+		p.Logger.Debug("Cancel: unknown key", "client_pid", pid)
+		return nil
+	}
+	target := v.(*Client)
+	if target.CancelSecret() != secret {
+		p.Logger.Debug("Cancel: secret mismatch", "client_pid", pid)
 		return nil
 	}
 
-	addr := fmt.Sprintf("%s:%d", cancelTarget.Host, cancelTarget.Port)
+	backend := target.ActiveBackend()
+	if backend == nil {
+		p.Logger.Debug("Cancel: client has no in-flight query", "client_pid", pid)
+		return nil
+	}
+
+	t := backend.Pool.Target
+	addr := fmt.Sprintf("%s:%d", t.Host, t.Port)
 	cancelConn, err := net.DialTimeout("tcp", addr, p.Config.Server.ConnectTimeout)
 	if err != nil {
 		p.Logger.WithError(err).Warn("Cancel: failed to reach backend")
@@ -472,18 +497,21 @@ func (p *Server) handleCancelRequest(client *Client) error {
 	}
 	defer cancelConn.Close()
 
+	// Forward a CancelRequest carrying the BACKEND's real key (captured from its
+	// BackendKeyData when the backend connected).
 	msg := make([]byte, 16)
 	binary.BigEndian.PutUint32(msg[0:4], 16)
 	binary.BigEndian.PutUint32(msg[4:8], CancelRequestCode)
-	binary.BigEndian.PutUint32(msg[8:12], uint32(processID))
-	binary.BigEndian.PutUint32(msg[12:16], uint32(secretKey))
+	binary.BigEndian.PutUint32(msg[8:12], uint32(backend.GetProcessID()))
+	binary.BigEndian.PutUint32(msg[12:16], uint32(backend.GetSecretKey()))
 
 	if _, err := cancelConn.Write(msg); err != nil {
 		p.Logger.WithError(err).Warn("Cancel: failed to send")
 		return nil
 	}
 
-	p.Logger.Debug("Cancel forwarded", "process_id", processID, "backend", addr)
+	p.Logger.Debug("Cancel forwarded to backend",
+		"client_pid", pid, "backend_pid", backend.GetProcessID(), "backend", addr)
 	return nil
 }
 
