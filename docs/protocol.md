@@ -10,21 +10,23 @@ ways from a naive proxy.
 A client connects to PgFox and speaks the PostgreSQL frontend/backend protocol
 (version 3.0). The exchange looks like this:
 
-```
-Client                         PgFox                         PostgreSQL
-  |                              |                                |
-  |---- StartupMessage --------->|                                |
-  |                              |-- read role verifier --------->|  (privileged
-  |                              |<------------------ pg_authid ---|   connection)
-  |<--- AuthenticationSASL ------|   (SCRAM-SHA-256)               |
-  |---- SASLInitialResponse ---->|                                |
-  |<--- AuthenticationSASLContinue                                |
-  |---- SASLResponse ----------->|                                |
-  |<--- AuthenticationSASLFinal -|                                |
-  |<--- AuthenticationOk --------|                                |
-  |<--- BackendKeyData ----------|   (PgFox-assigned pid+secret)   |
-  |<--- ParameterStatus (xN) ----|   (forwarded from the backend)  |
-  |<--- ReadyForQuery (I) -------|                                |
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as PgFox
+    participant PG as PostgreSQL
+    C->>P: StartupMessage
+    P->>PG: read role verifier (privileged connection)
+    PG-->>P: pg_authid row
+    P->>C: AuthenticationSASL (SCRAM-SHA-256)
+    C->>P: SASLInitialResponse
+    P->>C: AuthenticationSASLContinue
+    C->>P: SASLResponse
+    P->>C: AuthenticationSASLFinal
+    P->>C: AuthenticationOk
+    P->>C: BackendKeyData (PgFox-assigned pid + secret)
+    P->>C: ParameterStatus xN (forwarded from backend)
+    P->>C: ReadyForQuery (I)
 ```
 
 ### Reading the startup message

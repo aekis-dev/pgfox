@@ -1,6 +1,4 @@
 # <img src="docs/logo.jpg" width="128" height="128" align="center" /> PgFox
-#
-
 
 PgFox is a transparent PostgreSQL connection pooler written in Go. It sits
 between your application and PostgreSQL and lets many client connections share a
@@ -12,11 +10,10 @@ efficiency, PgFox keeps full PostgreSQL semantics — transactions, prepared
 statements, LISTEN/NOTIFY, and query cancellation all work — while still
 multiplexing clients onto a small backend pool.
 
-```
-┌─────────────┐        ┌─────────────┐        ┌─────────────┐
-│   Client    │◄──────►│   PgFox     │◄──────►│ PostgreSQL  │
-│ (Odoo, etc.)│  SCRAM │   pooler    │  TLS   │   backend   │
-└─────────────┘        └─────────────┘  cert  └─────────────┘
+```mermaid
+flowchart LR
+    Client["Client<br/>(Odoo, etc.)"] <-->|SCRAM| PgFox["PgFox<br/>pooler"]
+    PgFox <-->|"TLS (client cert)"| Postgres["PostgreSQL<br/>backend"]
 ```
 
 ## What makes it transparent

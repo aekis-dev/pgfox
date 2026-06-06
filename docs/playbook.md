@@ -51,6 +51,26 @@ Message codes follow the PostgreSQL wire protocol:
 
 ### 1.1 Plain TCP connection
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as pgfox
+    participant PG as PostgreSQL
+    C->>P: StartupMessage {user, database, ...}
+    P->>PG: fetch SCRAM verifier (privileged connection)
+    P->>C: AuthenticationSASL [SCRAM-SHA-256]
+    C->>P: SASLInitialResponse
+    P->>C: AuthenticationSASLContinue
+    C->>P: SASLResponse
+    P->>C: AuthenticationSASLFinal
+    P->>C: AuthenticationOK
+    P->>C: ParameterStatus (server_version, ...)
+    P->>C: BackendKeyData {pid, secret} (pgfox-assigned)
+    P->>C: ReadyForQuery {I}
+```
+
+Detailed message trace:
+
 ```
 C→P  StartupMessage { protocol=196608, params={user, database, ...} }
 P→C  AuthenticationSASL { mechanisms=["SCRAM-SHA-256"] }
@@ -114,6 +134,19 @@ is re-established correctly.
 A client cancels a running query by opening a **separate** TCP connection and
 sending a CancelRequest carrying the `(pid, secret)` it received in
 `BackendKeyData`.
+
+```mermaid
+sequenceDiagram
+    participant C as Client (new conn)
+    participant P as pgfox
+    participant PG as PostgreSQL
+    C->>P: CancelRequest {pid, secret}
+    Note over P: pid maps to a client in cancelKeys;<br/>verify secret; take client.activeBackend()
+    P->>PG: CancelRequest {backend.pid, backend.secret}
+    Note over PG: cancels the server process<br/>(no-op if the query already finished)
+```
+
+Detailed message trace:
 
 ```
 C→P  CancelRequest { code=80877102, pid=<client pid>, secret=<client secret> }
@@ -578,6 +611,16 @@ produced by pgfox without touching the Pool.
 ### 4.3 Notification fan-out
 
 When PostgreSQL sends a notification to the listen monitor's dedicated backend:
+
+```mermaid
+flowchart LR
+    PG[("PostgreSQL")] -->|"A {channel, payload}<br/>on the monitor backend"| L["pgfox listen monitor<br/>l.fanOut()"]
+    L -->|"WriteMessage(A)"| A["Client A"]
+    L -->|"WriteMessage(A)"| B["Client B"]
+    L -->|"WriteMessage(A)"| Cc["Client C"]
+```
+
+Detailed message trace:
 
 ```
 B→P  A { pid, channel="my_channel", payload="hello" } (on B_listen)

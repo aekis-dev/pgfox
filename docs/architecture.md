@@ -55,11 +55,19 @@ the pool as soon as the backend reports it is idle again (a `ReadyForQuery` with
 status `I`). The client is never tied to a specific backend, so a handful of
 backends can serve many clients.
 
-```
-Client: SELECT * FROM users
-  PgFox: borrow backend → forward → stream rows back → return backend to pool
-Client: INSERT INTO logs ...
-  PgFox: borrow (possibly different) backend → forward → return to pool
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as PgFox
+    participant Pool as Backend pool
+    C->>P: SELECT * FROM users
+    P->>Pool: borrow idle backend
+    P-->>C: stream rows back
+    P->>Pool: return backend (ReadyForQuery I)
+    C->>P: INSERT INTO logs ...
+    P->>Pool: borrow (possibly different) backend
+    P-->>C: result
+    P->>Pool: return backend
 ```
 
 ### Transactions
@@ -71,10 +79,17 @@ While the status is `T` or `E`, the same backend stays assigned to the client;
 when it returns to `I` (after `COMMIT` or `ROLLBACK`), the backend is unpinned
 and returned to the pool.
 
-```
-Client: BEGIN              → borrow + pin backend
-Client: UPDATE users ...   → reuse the pinned backend
-Client: COMMIT             → unpin, return backend to pool
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as PgFox
+    participant Pool as Backend pool
+    C->>P: BEGIN
+    P->>Pool: borrow + pin backend
+    C->>P: UPDATE users ...
+    P->>P: reuse the pinned backend
+    C->>P: COMMIT
+    P->>Pool: unpin, return backend to pool
 ```
 
 Pinning is keyed off the actual transaction status, so it is exactly as
@@ -114,11 +129,12 @@ Instead, for each channel it maintains a single shared monitor connection to the
 backend and fans incoming notifications out to every subscribed client over that
 client's own socket.
 
-```
-Backend channel "orders"  ── one monitor connection ──┐
-                                                       ├─► Client A (subscribed)
-        NOTIFY orders ──► monitor reads it, fans out ──┼─► Client B (subscribed)
-                                                       └─► Client C (subscribed)
+```mermaid
+flowchart LR
+    PG[("PostgreSQL<br/>NOTIFY orders")] -->|"single shared<br/>monitor connection"| M["PgFox<br/>channel monitor"]
+    M -->|fan-out| A["Client A"]
+    M -->|fan-out| B["Client B"]
+    M -->|fan-out| C["Client C"]
 ```
 
 - **LISTEN** registers the client as a subscriber to the channel's monitor

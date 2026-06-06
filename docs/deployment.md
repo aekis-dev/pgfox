@@ -13,19 +13,16 @@ document is the "how".
 PgFox and PostgreSQL share a single certificate authority (CA). Everything else
 follows from that.
 
-```
-                 +----------------------------- one CA -----------------------------+
-                 |  ca.crt (public)                         ca.key (private)         |
-                 +---------------+----------------------------------+----------------+
-                                 | signs                            | signs
-         +-----------------------v----------+        +--------------v--------------+
-         | PgFox                            |  TLS   | PostgreSQL                  |
-         |  - signs a client cert per role  |------->|  - server cert (signed by   |
-         |    (CN = role), presents it      |        |    the CA, SAN = host PgFox |
-         |  - trusts the backend via ca.crt |        |    dials)                   |
-         +----------------------------------+        |  - ssl_ca_file = ca.crt     |
-                                                      |  - pg_hba: hostssl ... cert |
-                                                      +-----------------------------+
+```mermaid
+flowchart TB
+    subgraph ca["One CA"]
+        direction LR
+        crt["ca.crt (public)"]
+        key["ca.key (private)"]
+    end
+    ca -->|"signs a client cert<br/>per role (CN = role)"| PgFox
+    ca -->|"signs the server cert<br/>(SAN = host PgFox dials)"| PG
+    PgFox["PgFox<br/>presents client cert (CN = role)<br/>trusts backend via ca.crt"] -->|TLS| PG["PostgreSQL<br/>ssl_ca_file = ca.crt<br/>pg_hba: hostssl ... cert"]
 ```
 
 Two consequences worth keeping in mind:
