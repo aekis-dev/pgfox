@@ -137,13 +137,14 @@ sending a CancelRequest carrying the `(pid, secret)` it received in
 
 ```mermaid
 sequenceDiagram
-    participant C as Client (new conn)
+    participant C as Client
     participant P as pgfox
     participant PG as PostgreSQL
     C->>P: CancelRequest {pid, secret}
-    Note over P: pid maps to a client in cancelKeys;<br/>verify secret; take client.activeBackend()
+    Note over P: look up client by pid, verify secret
+    Note over P: take the backend running its query
     P->>PG: CancelRequest {backend.pid, backend.secret}
-    Note over PG: cancels the server process<br/>(no-op if the query already finished)
+    Note over PG: cancels the server process
 ```
 
 Detailed message trace:
